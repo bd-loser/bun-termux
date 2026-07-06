@@ -123,54 +123,62 @@ jobs:
           echo "=== Building Bun for aarch64-linux-android ==="
           echo "NDK: $ANDROID_NDK_ROOT"
           echo "Bun: $(bun --version)"
-          echo "LDFLAGS: $LDFLAGS"
           echo "Start: $(date)"
 
-          # Verify libc++_static.a exists in the sysroot
-          NDK_SYSROOT="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
-          LIBCXX_STATIC=$(find "$NDK_SYSROOT" -name "libc++_static.a" -path "*aarch64*" | head -1)
-          LIBCXXABI=$(find "$NDK_SYSROOT" -name "libc++abi.a" -path "*aarch64*" | head -1)
-          echo "libc++_static.a: $LIBCXX_STATIC"
-          echo "libc++abi.a: $LIBCXXABI"
-
-          # If not in sysroot, check the NDK's sources/cxx-stl dir
-          if [ -z "$LIBCXX_STATIC" ]; then
-            LIBCXX_STATIC=$(find "$ANDROID_NDK_ROOT" -name "libc++_static.a" -path "*arm64*" | head -1)
-            LIBCXXABI=$(find "$ANDROID_NDK_ROOT" -name "libc++abi.a" -path "*arm64*" | head -1)
-            echo "From cxx-stl:"
-            echo "  libc++_static.a: $LIBCXX_STATIC"
-            echo "  libc++abi.a: $LIBCXXABI"
-          fi
-
-          # Build for android target — produces a Bionic-linked binary that
-          # runs natively on Termux via /system/bin/linker64.
+          # Build for android target — produces a Bionic-linked binary.
+          # The build may fail at the 'strip' step because the system's
+          # GNU strip doesn't understand Android ELF format. That's OK —
+          # the binary (bun-profile) is already built by that point.
+          # We use `|| true` to ignore the strip failure and handle it
+          # in the next step (using NDK's llvm-strip).
           bun scripts/build.ts \
             --profile=release \
             --abi=android \
             --arch=aarch64 \
-            --build-dir=build/release-android 2>&1 | tail -100
+            --build-dir=build/release-android 2>&1 | tail -100 || true
 
           echo "End: $(date)"
+          echo ""
+          echo "=== Checking for built binary (bun-profile or bun) ==="
+          find build -name "bun*" -type f 2>/dev/null | head -10
 
       - name: Find and verify the built binary
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup_ndk.outputs.ndk-path }}
         run: |
           echo "=== Looking for built binary ==="
-          find /tmp/bun-src/build -name "bun" -type f 2>/dev/null | head -10
-          find /tmp/bun-src -maxdepth 3 -name "bun" -type f -executable 2>/dev/null | head -10
+          find /tmp/bun-src/build -name "bun*" -type f 2>/dev/null | head -10
 
+          BUN_BIN=""
+          # Try stripped version first
           BUN_BIN=$(find /tmp/bun-src/build -name "bun" -type f 2>/dev/null | head -1)
+          if [ -z "$BUN_BIN" ]; then
+            # Fall back to unstripped bun-profile
+            BUN_BIN=$(find /tmp/bun-src/build -name "bun-profile" -type f 2>/dev/null | head -1)
+            if [ -n "$BUN_BIN" ]; then
+              echo "Using unstripped bun-profile (strip step failed — using GNU strip on Android ELF)"
+            fi
+          fi
+
           if [ -z "$BUN_BIN" ]; then
             echo "ERROR: Bun binary not found in build output"
             echo "=== Build directory contents ==="
-            ls -la /tmp/bun-src/build/ 2>/dev/null || echo "No build dir"
-            find /tmp/bun-src/build -maxdepth 3 -type f -name "*.o" 2>/dev/null | wc -l
-            echo "Object files count above — if 0, zig compile failed"
+            ls -la /tmp/bun-src/build/release-android/ 2>/dev/null || echo "No build dir"
+            find /tmp/bun-src/build -maxdepth 3 -type f -name "bun*" 2>/dev/null
             exit 1
           fi
           echo "Found: $BUN_BIN"
           file "$BUN_BIN"
           ls -lh "$BUN_BIN"
           cp "$BUN_BIN" /tmp/bun-patched
+
+          # Strip with NDK's llvm-strip (understands Android ELF format)
+          NDK_STRIP="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          if [ -x "$NDK_STRIP" ]; then
+            echo "Stripping with NDK llvm-strip..."
+            "$NDK_STRIP" --strip-all /tmp/bun-patched || true
+            ls -lh /tmp/bun-patched
+          fi
 
       - name: Verify the binary is Android-native
         run: |
