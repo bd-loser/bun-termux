@@ -110,7 +110,7 @@ jobs:
           file runtime/bun
           echo "Binary size: $(stat -c%s runtime/bun) bytes"
 
-      - name: Build DEB package (bypass Makefile — Ubuntu has no Termux bash)
+      - name: Build DEB package
         env:
           VERSION: ${{ steps.ver.outputs.version }}
           ARCH: aarch64
@@ -120,23 +120,18 @@ jobs:
           ROOT=$(mktemp -d)
           TMPUSR="$ROOT/data/data/com.termux/files/usr"
           mkdir -p "$ROOT/DEBIAN" "$TMPUSR/bin" "$TMPUSR/lib/bun-termux"
-
-          # Install the Bun binary
           install -m755 runtime/bun "$TMPUSR/lib/bun-termux/bun"
-
-          # Create the launcher script
+          # Launcher script (heredoc content is at column 0 after YAML strips common indent)
           cat > "$TMPUSR/bin/bun" <<'LAUNCHER'
           #!/data/data/com.termux/files/usr/bin/bash
           exec /data/data/com.termux/files/usr/lib/bun-termux/bun "$@"
           LAUNCHER
-          # Strip leading whitespace from heredoc
-          sed -i 's/^[[:space:]]*//' "$TMPUSR/bin/bun"
           chmod 755 "$TMPUSR/bin/bun"
-
-          # Install the network-fix script
+          # Network fix script
           install -m755 scripts/fix-bun-network.sh "$TMPUSR/bin/bun-fix-network"
-
-          # Write control file
+          # Control file — continuation lines start with ONE space (Debian format).
+          # YAML strips the common 10-space indent from all lines in this block,
+          # leaving 0 spaces for field lines and 1 space for continuation lines.
           cat > "$ROOT/DEBIAN/control" <<EOF
           Package: bun
           Version: $VERSION
@@ -150,21 +145,14 @@ jobs:
            caused by Bun's c-ares DNS resolver on Termux.
           Depends: bash, ncurses, curl
           EOF
-          sed -i 's/^[[:space:]]*//' "$ROOT/DEBIAN/control"
           echo "Installed-Size: $(du -sk "$ROOT" | cut -f1)" >> "$ROOT/DEBIAN/control"
-
           # Install postinst
           install -m755 packaging/deb/DEBIAN/postinst "$ROOT/DEBIAN/postinst"
-
           # Set perms
           chmod 755 "$ROOT" "$ROOT/DEBIAN"
-
-          # Build the deb
+          # Build
           dpkg-deb --build "$ROOT" "dist/bun_${VERSION}_${ARCH}.deb"
-
-          # Cleanup
           rm -rf "$ROOT"
-
           echo ""
           echo "=== Built: dist/bun_${VERSION}_${ARCH}.deb ==="
           ls -la dist/
@@ -244,25 +232,20 @@ jobs:
           ROOT=$(mktemp -d)
           TMPUSR="$ROOT/data/data/com.termux/files/usr"
           mkdir -p "$TMPUSR/bin" "$TMPUSR/lib/bun-termux"
-
           # Download Bun binary
           mkdir -p /tmp/bun-dl
           curl -fL "https://github.com/oven-sh/bun/releases/download/bun-v${VERSION}/bun-linux-${ARCH}-android.zip" -o /tmp/bun-dl/bun.zip
           unzip -o /tmp/bun-dl/bun.zip -d /tmp/bun-dl/extracted >/dev/null
           BUN_BIN=$(find /tmp/bun-dl/extracted -name bun -type f | head -1)
           install -m755 "$BUN_BIN" "$TMPUSR/lib/bun-termux/bun"
-
           # Launcher
           cat > "$TMPUSR/bin/bun" <<'LAUNCHER'
           #!/data/data/com.termux/files/usr/bin/bash
           exec /data/data/com.termux/files/usr/lib/bun-termux/bun "$@"
           LAUNCHER
-          sed -i 's/^[[:space:]]*//' "$TMPUSR/bin/bun"
           chmod 755 "$TMPUSR/bin/bun"
-
           # Network fix script
           install -m755 scripts/fix-bun-network.sh "$TMPUSR/bin/bun-fix-network"
-
           # .PKGINFO
           cat > "$ROOT/.PKGINFO" <<EOF
           pkgname = bun
@@ -275,16 +258,13 @@ jobs:
           arch = $ARCH
           license = MIT
           EOF
-          sed -i 's/^[[:space:]]*//' "$ROOT/.PKGINFO"
-
           # .INSTALL
           install -m755 packaging/deb/DEBIAN/postinst "$ROOT/.INSTALL"
-
+          # Build tarball
           cd "$ROOT"
           tar -cJf "$GITHUB_WORKSPACE/dist/bun-$VERSION-1-$ARCH.pkg.tar.xz" .PKGINFO .INSTALL data/
           cd "$GITHUB_WORKSPACE"
           rm -rf "$ROOT"
-
           echo ""
           echo "=== Built: dist/bun-$VERSION-1-$ARCH.pkg.tar.xz ==="
           ls -la dist/
@@ -306,7 +286,6 @@ jobs:
   release:
     needs: [build-deb, build-pacman, check-latest]
     runs-on: ubuntu-latest
-    # Release when: manually dispatched with version, OR scheduled run detected new version
     if: >-
       ${{
         (github.event_name == 'workflow_dispatch' && github.event.inputs.version != '') ||
