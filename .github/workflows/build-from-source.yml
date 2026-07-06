@@ -73,8 +73,8 @@ jobs:
           bash scripts/apply-android-patches.sh /tmp/bun-src
           echo ""
           echo "=== Verify patches ==="
-          grep -n "ANDROID_SELINUX_FIX_PATCH" /tmp/bun-src/src/resolver/resolver.rs
-          grep -n "ANDROID_SELINUX_FIX_PATCH" /tmp/bun-src/src/runtime/cli/run_command.rs
+          grep -n "ANDROID_SELINUX_FIX_PATCH" /tmp/bun-src/src/bun.zig
+          grep -n "ANDROID_SELINUX_FIX_PATCH" /tmp/bun-src/src/cli/run_command.zig
 
       - name: Install Bun for bootstrapping
         env:
