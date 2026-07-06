@@ -61,6 +61,8 @@ typedef int (*symlinkat_fn)(const char *, int, const char *);
 typedef int (*symlink_fn)(const char *, const char *);
 typedef int (*renameat_fn)(int, const char *, int, const char *);
 typedef int (*renameat2_fn)(int, const char *, int, const char *, unsigned int);
+typedef int (*openat_fn)(int, const char *, int, ...);
+typedef int (*open_fn)(const char *, int, ...);
 
 static linkat_fn real_linkat = NULL;
 static link_fn real_link = NULL;
@@ -68,6 +70,8 @@ static symlinkat_fn real_symlinkat = NULL;
 static symlink_fn real_symlink = NULL;
 static renameat_fn real_renameat = NULL;
 static renameat2_fn real_renameat2 = NULL;
+static openat_fn real_openat = NULL;
+static open_fn real_open = NULL;
 
 static void init_real(void) {
     if (real_linkat) return;
@@ -77,6 +81,8 @@ static void init_real(void) {
     real_symlink = (symlink_fn)dlsym(RTLD_NEXT, "symlink");
     real_renameat = (renameat_fn)dlsym(RTLD_NEXT, "renameat");
     real_renameat2 = (renameat2_fn)dlsym(RTLD_NEXT, "renameat2");
+    real_openat = (openat_fn)dlsym(RTLD_NEXT, "openat");
+    real_open = (open_fn)dlsym(RTLD_NEXT, "open");
 }
 
 /* ─── Copy helpers ──────────────────────────────────────────────────────── */
@@ -295,6 +301,127 @@ int renameat2(int olddirfd, const char *oldpath,
         unlink(src);
     }
     return 0;
+}
+
+/* ─── openat interceptor for O_DIRECTORY paths ────────────────────────────
+ *
+ * Bun's resolver opens the current directory (and node_modules dirs) with
+ * openat(dir, path, O_DIRECTORY|O_RDONLY|O_CLOEXEC|O_NOFOLLOW).
+ *
+ * On Android SELinux (untrusted_app_27+), this sometimes returns EACCES
+ * even when the process owns the directory and `opendir()` (which uses
+ * O_DIRECTORY without O_NOFOLLOW) succeeds. The likely cause is O_NOFOLLOW
+ * interaction with SELinux policy.
+ *
+ * Fallback: retry without O_NOFOLLOW. If still EACCES, retry without
+ * O_DIRECTORY (returns a regular fd that still works with fstat/readdir).
+ */
+typedef int (*openat_fn)(int, const char *, int, ...);
+
+int openat(int dirfd, const char *path, int flags, ...) {
+    init_real();
+    if (!real_openat) { errno = ENOSYS; return -1; }
+
+    /* Extract mode if O_CREAT is set */
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = va_arg(ap, mode_t);
+        va_end(ap);
+    }
+
+    int rc;
+    if (flags & O_CREAT) {
+        rc = real_openat(dirfd, path, flags, mode);
+    } else {
+        rc = real_openat(dirfd, path, flags);
+    }
+    if (rc >= 0) return rc;
+    if (errno != EACCES) return -1;
+
+    /* EACCES — try without O_NOFOLLOW first */
+    if (flags & O_NOFOLLOW) {
+        int new_flags = flags & ~O_NOFOLLOW;
+        debug_log("[bun-fix] openat EACCES — retry without O_NOFOLLOW: %s\n",
+                  path ? path : "(null)");
+        if (flags & O_CREAT) {
+            rc = real_openat(dirfd, path, new_flags, mode);
+        } else {
+            rc = real_openat(dirfd, path, new_flags);
+        }
+        if (rc >= 0) return rc;
+        if (errno != EACCES) return -1;
+    }
+
+    /* Still EACCES — try without O_DIRECTORY (just open as regular file) */
+    if (flags & O_DIRECTORY) {
+        int new_flags = flags & ~(O_DIRECTORY | O_NOFOLLOW);
+        debug_log("[bun-fix] openat EACCES — retry without O_DIRECTORY: %s\n",
+                  path ? path : "(null)");
+        if (flags & O_CREAT) {
+            rc = real_openat(dirfd, path, new_flags, mode);
+        } else {
+            rc = real_openat(dirfd, path, new_flags);
+        }
+        if (rc >= 0) return rc;
+    }
+
+    /* All fallbacks failed — return last error */
+    return -1;
+}
+
+/* Also intercept open() (some Bun paths may use it directly) */
+typedef int (*open_fn)(const char *, int, ...);
+
+int open(const char *path, int flags, ...) {
+    init_real();
+    if (!real_open) { errno = ENOSYS; return -1; }
+
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = va_arg(ap, mode_t);
+        va_end(ap);
+    }
+
+    int rc;
+    if (flags & O_CREAT) {
+        rc = real_open(path, flags, mode);
+    } else {
+        rc = real_open(path, flags);
+    }
+    if (rc >= 0) return rc;
+    if (errno != EACCES) return -1;
+
+    /* Same fallbacks as openat */
+    if (flags & O_NOFOLLOW) {
+        int new_flags = flags & ~O_NOFOLLOW;
+        debug_log("[bun-fix] open EACCES — retry without O_NOFOLLOW: %s\n",
+                  path ? path : "(null)");
+        if (flags & O_CREAT) {
+            rc = real_open(path, new_flags, mode);
+        } else {
+            rc = real_open(path, new_flags);
+        }
+        if (rc >= 0) return rc;
+        if (errno != EACCES) return -1;
+    }
+
+    if (flags & O_DIRECTORY) {
+        int new_flags = flags & ~(O_DIRECTORY | O_NOFOLLOW);
+        debug_log("[bun-fix] open EACCES — retry without O_DIRECTORY: %s\n",
+                  path ? path : "(null)");
+        if (flags & O_CREAT) {
+            rc = real_open(path, new_flags, mode);
+        } else {
+            rc = real_open(path, new_flags);
+        }
+        if (rc >= 0) return rc;
+    }
+
+    return -1;
 }
 
 /* ─── Init — log that we're loaded ──────────────────────────────────────── */
