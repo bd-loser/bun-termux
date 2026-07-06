@@ -82,28 +82,13 @@ static void init_real(void) {
 /* ─── Copy helpers ──────────────────────────────────────────────────────── */
 
 /* Copy regular file contents from src_fd to dst_fd (already open) */
-static int copy_fd_to_fd(int src_fd, int dst_fd, const char *src_path) {
+static int copy_fd_to_fd(int src_fd, int dst_fd) {
     struct stat st;
     if (fstat(src_fd, &st) < 0) return -1;
 
-    /* Try copy_file_range first (most efficient on modern kernels) */
-    off_t off_in = 0, off_out = 0;
-    size_t remaining = st.st_size;
-    while (remaining > 0) {
-        ssize_t n = copy_file_range(src_fd, &off_in, dst_fd, &off_out,
-                                     remaining, 0);
-        if (n < 0) {
-            if (errno == EXDEV || errno == ENOSYS) break; /* fall back to sendfile */
-            return -1;
-        }
-        if (n == 0) break;
-        remaining -= n;
-    }
-    if (remaining == 0) return 0;
-
-    /* Fall back to sendfile (works for regular files) */
+    /* Try sendfile first (works for regular files, available on Android) */
     off_t off = 0;
-    remaining = st.st_size;
+    size_t remaining = st.st_size;
     while (remaining > 0) {
         ssize_t n = sendfile(dst_fd, src_fd, &off, remaining);
         if (n < 0) {
@@ -115,7 +100,7 @@ static int copy_fd_to_fd(int src_fd, int dst_fd, const char *src_path) {
     }
     if (remaining == 0) return 0;
 
-    /* Last-resort: read/write loop */
+    /* Fallback: read/write loop (always works) */
     char buf[65536];
     lseek(src_fd, 0, SEEK_SET);
     lseek(dst_fd, 0, SEEK_SET);
@@ -164,7 +149,7 @@ static int copy_file(const char *src, const char *dst) {
         return -1;
     }
 
-    int rc = copy_fd_to_fd(src_fd, dst_fd, src);
+    int rc = copy_fd_to_fd(src_fd, dst_fd);
     close(src_fd);
     if (rc < 0) {
         close(dst_fd);
