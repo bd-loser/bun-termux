@@ -63,6 +63,8 @@ typedef int (*renameat_fn)(int, const char *, int, const char *);
 typedef int (*renameat2_fn)(int, const char *, int, const char *, unsigned int);
 typedef int (*openat_fn)(int, const char *, int, ...);
 typedef int (*open_fn)(const char *, int, ...);
+typedef char *(*getcwd_fn)(char *, size_t);
+typedef int (*faccessat_fn)(int, const char *, int, int);
 
 static linkat_fn real_linkat = NULL;
 static link_fn real_link = NULL;
@@ -72,6 +74,8 @@ static renameat_fn real_renameat = NULL;
 static renameat2_fn real_renameat2 = NULL;
 static openat_fn real_openat = NULL;
 static open_fn real_open = NULL;
+static getcwd_fn real_getcwd = NULL;
+static faccessat_fn real_faccessat = NULL;
 
 static void init_real(void) {
     if (real_linkat) return;
@@ -83,6 +87,8 @@ static void init_real(void) {
     real_renameat2 = (renameat2_fn)dlsym(RTLD_NEXT, "renameat2");
     real_openat = (openat_fn)dlsym(RTLD_NEXT, "openat");
     real_open = (open_fn)dlsym(RTLD_NEXT, "open");
+    real_getcwd = (getcwd_fn)dlsym(RTLD_NEXT, "getcwd");
+    real_faccessat = (faccessat_fn)dlsym(RTLD_NEXT, "faccessat");
 }
 
 /* ─── Copy helpers ──────────────────────────────────────────────────────── */
@@ -419,6 +425,75 @@ int open(const char *path, int flags, ...) {
             rc = real_open(path, new_flags);
         }
         if (rc >= 0) return rc;
+    }
+
+    return -1;
+}
+
+/* ─── getcwd interceptor ──────────────────────────────────────────────────
+ *
+ * Some Android SELinux contexts block getcwd() on paths that traverse
+ * certain directories. If getcwd fails with EACCES, fall back to:
+ *   1. readlink("/proc/self/cwd") — usually works when getcwd doesn't
+ *   2. PWD environment variable (may be stale but better than nothing)
+ */
+typedef char *(*getcwd_fn)(char *, size_t);
+
+char *getcwd(char *buf, size_t size) {
+    init_real();
+    if (!real_getcwd) { errno = ENOSYS; return NULL; }
+
+    char *rc = real_getcwd(buf, size);
+    if (rc != NULL) return rc;
+    if (errno != EACCES) return NULL;
+
+    debug_log("[bun-fix] getcwd EACCES — trying /proc/self/cwd\n");
+
+    /* Fallback 1: readlink /proc/self/cwd */
+    char proc_buf[4096];
+    ssize_t n = readlink("/proc/self/cwd", proc_buf, sizeof(proc_buf) - 1);
+    if (n > 0) {
+        proc_buf[n] = '\0';
+        size_t needed = n + 1;
+        if (size < needed) { errno = ERANGE; return NULL; }
+        memcpy(buf, proc_buf, needed);
+        debug_log("[bun-fix] getcwd fallback OK: %s\n", buf);
+        return buf;
+    }
+
+    /* Fallback 2: PWD env var */
+    const char *pwd = getenv("PWD");
+    if (pwd && *pwd) {
+        size_t needed = strlen(pwd) + 1;
+        if (size < needed) { errno = ERANGE; return NULL; }
+        memcpy(buf, pwd, needed);
+        debug_log("[bun-fix] getcwd fallback (PWD): %s\n", buf);
+        return buf;
+    }
+
+    /* All fallbacks failed */
+    return NULL;
+}
+
+/* ─── faccessat interceptor (Bun may check accessibility first) ─────────── */
+typedef int (*faccessat_fn)(int, const char *, int, int);
+
+int faccessat(int dirfd, const char *path, int mode, int flags) {
+    init_real();
+    if (!real_faccessat) { errno = ENOSYS; return -1; }
+
+    int rc = real_faccessat(dirfd, path, mode, flags);
+    if (rc == 0) return 0;
+    if (errno != EACCES) return -1;
+
+    /* EACCES — retry without AT_EACCESS flag (some Android versions
+       reject AT_EACCESS for untrusted apps) */
+    if (flags & AT_EACCESS) {
+        int new_flags = flags & ~AT_EACCESS;
+        debug_log("[bun-fix] faccessat EACCES — retry without AT_EACCESS: %s\n",
+                  path ? path : "(null)");
+        rc = real_faccessat(dirfd, path, mode, new_flags);
+        if (rc == 0) return 0;
     }
 
     return -1;
