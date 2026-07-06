@@ -257,19 +257,25 @@ if [ -f "$ENCODING_TABLES" ]; then
     fi
 fi
 
-# ─── Patch 7: Fix dangling reference warnings in BunTestModule.h and NodeProcessModule.h ─
-# clang 18 is stricter about temporary objects bound to local references.
+# ─── Patch 7: Fix dangling reference warnings (clang 18 stricter than 21) ─
 # The pattern `for (auto& x : obj.releaseData()->propertyNameVector())` creates
 # a temporary from releaseData() that's destroyed at end of full-expression,
 # leaving the reference dangling. Fix by storing releaseData() in a local.
-for HEADER in src/jsc/modules/BunTestModule.h src/jsc/modules/NodeProcessModule.h; do
-    if [ -f "$HEADER" ]; then
-        if grep -q "properties.releaseData()->propertyNameVector()" "$HEADER" 2>/dev/null; then
-            echo "  [patch] $HEADER: fix dangling reference (clang 18 stricter)"
-            # Replace: for (auto& X : properties.releaseData()->propertyNameVector())
-            # With:    auto _data = properties.releaseData(); for (auto& X : _data->propertyNameVector())
-            sed -i 's|for (auto& \([a-zA-Z]*\) : properties.releaseData()->propertyNameVector())|auto _releaseData = properties.releaseData(); for (auto\& \1 : _releaseData->propertyNameVector())|g' "$HEADER"
-            echo "  [ok] fixed dangling reference"
+# Search ALL .cpp and .h files for this pattern and patch them.
+echo "  [patch] searching for dangling reference pattern in all source files..."
+PATCHED_FILES=0
+while IFS= read -r -d '' FILE; do
+    if grep -q "properties.releaseData()->propertyNameVector()" "$FILE" 2>/dev/null; then
+        # Check if already patched
+        if grep -q "_releaseData = properties.releaseData()" "$FILE" 2>/dev/null; then
+            continue
         fi
+        echo "    [patch] $FILE"
+        # Replace: for (auto& X : properties.releaseData()->propertyNameVector())
+        # With:    auto _releaseData = properties.releaseData(); for (auto& X : _releaseData->propertyNameVector())
+        # Use perl for non-greedy matching and to handle the `auto&` capture
+        perl -i -pe 's/for \(auto& (\w+) : properties\.releaseData\(\)->propertyNameVector\(\)\)/auto _releaseData = properties.releaseData(); for (auto\& $1 : _releaseData->propertyNameVector())/g' "$FILE"
+        PATCHED_FILES=$((PATCHED_FILES + 1))
     fi
-done
+done < <(find src -type f \( -name "*.cpp" -o -name "*.h" \) -print0)
+echo "  [ok] patched $PATCHED_FILES files with dangling reference fix"
