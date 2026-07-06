@@ -88,9 +88,9 @@ new2 = """pub fn openDirAbsolute(path_: []const u8) !std.fs.Dir {
     else blk: {
         const result = sys.openA(path_, O.DIRECTORY | O.CLOEXEC | O.RDONLY, 0);
         if (result == .err and result.err.getErrno() == .ACCES) {
-            break :blk sys.openA(path_, O.CLOEXEC | O.RDONLY, 0).unwrap();
+            break :blk try sys.openA(path_, O.CLOEXEC | O.RDONLY, 0).unwrap();
         }
-        break :blk result.unwrap();
+        break :blk try result.unwrap();
     };
 
     return fd.stdDir();
@@ -119,9 +119,9 @@ new3 = """pub fn openDirAbsoluteNotForDeletingOrRenaming(path_: []const u8) !std
     else blk: {
         const result = sys.openA(path_, O.DIRECTORY | O.CLOEXEC | O.RDONLY, 0);
         if (result == .err and result.err.getErrno() == .ACCES) {
-            break :blk sys.openA(path_, O.CLOEXEC | O.RDONLY, 0).unwrap();
+            break :blk try sys.openA(path_, O.CLOEXEC | O.RDONLY, 0).unwrap();
         }
-        break :blk result.unwrap();
+        break :blk try result.unwrap();
     };
 
     return fd.stdDir();
