@@ -1,20 +1,16 @@
 #!/usr/bin/env bash
 # apply-android-patches.sh — patches Bun source to fix Android SELinux issues
 #
-# For Bun v1.3.14 (Zig codebase — the Rust rewrite is in main, not v1.3.14)
+# For Bun v1.3.14 (Zig codebase)
 #
 # What this patches:
 #   1. src/bun.zig: openDirForIteration() and openDirAbsolute()
-#      — When openat() returns EACCES (Android SELinux blocks it on / and /data/),
-#        retry without O_DIRECTORY. The fd won't support readdir (ENOTDIR),
-#        so the resolver treats the directory as empty — which is correct
-#        since / and /data/ don't contain package.json anyway.
+#      — When openat() returns EACCES, retry without O_DIRECTORY.
+#        Safe on all platforms (only triggers on EACCES).
 #
 #   2. src/cli/run_command.zig: CouldntReadCurrentDirectory error path
-#      — When readDirInfo fails on Android, fall back to using "." as the
-#        path (which uses cwd), instead of failing fatally.
-#
-# These patches make Bun work natively on Termux without proot or root.
+#      — When readDirInfo returns null, retry with "." (cwd).
+#        Safe on all platforms (only triggers when walk fails).
 
 set -euo pipefail
 
@@ -55,16 +51,14 @@ new1 = """pub fn openDirForIteration(dir: FD, path_: []const u8) sys.Maybe(FD) {
     // untrusted_app contexts. When EACCES is returned, retry without O_DIRECTORY.
     // The resulting fd won't support readdir (ENOTDIR), so the resolver treats
     // the directory as empty — correct for / and /data/ which don't contain
-    // package.json or node_modules.
+    // package.json or node_modules. Safe on all platforms (only triggers on EACCES).
     if (comptime Environment.isWindows) {
         return sys.openDirAtWindowsA(dir, path_, .{ .iterable = true, .can_rename_or_delete = false, .read_only = true });
     }
     const result = sys.openatA(dir, path_, O.DIRECTORY | O.CLOEXEC | O.RDONLY, 0);
-    if (comptime Environment.isAndroid) {
-        if (result == .err and result.err == .EACCES) {
-            // Retry without O_DIRECTORY
-            return sys.openatA(dir, path_, O.CLOEXEC | O.RDONLY, 0);
-        }
+    if (result == .err and result.err.getErrno() == .EACCES) {
+        // Retry without O_DIRECTORY — returns a regular fd that works with fstat
+        return sys.openatA(dir, path_, O.CLOEXEC | O.RDONLY, 0);
     }
     return result;
 }"""
@@ -92,10 +86,8 @@ new2 = """pub fn openDirAbsolute(path_: []const u8) !std.fs.Dir {
         try sys.openDirAtWindowsA(invalid_fd, path_, .{ .iterable = true, .can_rename_or_delete = true, .read_only = true }).unwrap()
     else blk: {
         const result = sys.openA(path_, O.DIRECTORY | O.CLOEXEC | O.RDONLY, 0);
-        if (comptime Environment.isAndroid) {
-            if (result == .err and result.err == .EACCES) {
-                break :blk sys.openA(path_, O.CLOEXEC | O.RDONLY, 0).unwrap();
-            }
+        if (result == .err and result.err.getErrno() == .EACCES) {
+            break :blk sys.openA(path_, O.CLOEXEC | O.RDONLY, 0).unwrap();
         }
         break :blk result.unwrap();
     };
@@ -125,10 +117,8 @@ new3 = """pub fn openDirAbsoluteNotForDeletingOrRenaming(path_: []const u8) !std
         try sys.openDirAtWindowsA(invalid_fd, path_, .{ .iterable = true, .can_rename_or_delete = false, .read_only = true }).unwrap()
     else blk: {
         const result = sys.openA(path_, O.DIRECTORY | O.CLOEXEC | O.RDONLY, 0);
-        if (comptime Environment.isAndroid) {
-            if (result == .err and result.err == .EACCES) {
-                break :blk sys.openA(path_, O.CLOEXEC | O.RDONLY, 0).unwrap();
-            }
+        if (result == .err and result.err.getErrno() == .EACCES) {
+            break :blk sys.openA(path_, O.CLOEXEC | O.RDONLY, 0).unwrap();
         }
         break :blk result.unwrap();
     };
@@ -163,41 +153,6 @@ else
 with open("src/cli/run_command.zig", "r") as f:
     content = f.read()
 
-# Patch the readDirInfo error path — on Android, when it fails on the
-# top_level_dir (which is the result of the directory walk), retry with "."
-# (current directory) which bypasses the walk.
-old = """        const root_dir_info = this_transpiler.resolver.readDirInfo(this_transpiler.fs.top_level_dir) catch |err| {
-            if (!log_errors) return error.CouldntReadCurrentDirectory;
-            // SAFETY: `ctx.log` set in `create_context_data` (single-
-            // threaded CLI startup), process-lifetime.
-            let _ = ctx.log() catch {};
-            const log = ctx.log() catch {
-                Output.prettyErrorln("<r><red>error<r><d>:<r> <b>{s}<r> loading directory {f}", .{ @errorName(err), bun.fmt.QuotedFormatter{ .text = this_transpiler.fs.top_level_dir } });
-                Output.flush();
-                return error.CouldntReadCurrentDirectory;
-            };
-            log.print(Output.errorWriter()) catch {};
-            Output.prettyErrorln("<r><red>error<r><d>:<r> <b>{s}<r> loading directory {f}", .{ @errorName(err), bun.fmt.QuotedFormatter{ .text = this_transpiler.fs.top_level_dir } });
-            Output.flush();
-            return error.CouldntReadCurrentDirectory;
-        };
-
-        if (root_dir_info == null) {
-            // SAFETY: see above.
-            let _ = ctx.log() catch {};
-            Output.prettyErrorln("error loading current directory", .{});
-            Output.flush();
-            return error.CouldntReadCurrentDirectory;
-        }"""
-
-# We need to look at the actual code first
-PYEOF
-
-    # Use a simpler approach — find the orelse block and add Android fallback
-    python3 <<'PYEOF'
-with open("src/cli/run_command.zig", "r") as f:
-    content = f.read()
-
 # The actual v1.3.14 code uses orelse:
 old = """        const root_dir_info = this_transpiler.resolver.readDirInfo(this_transpiler.fs.top_level_dir) catch |err| {
             if (!log_errors) return error.CouldntReadCurrentDirectory;
@@ -216,6 +171,7 @@ new = """        // ANDROID_SELINUX_FIX_PATCH
         // On Android, the directory walk may fail to open ancestors
         // (/ and /data/) due to SELinux. When readDirInfo returns null
         // (directory walk found nothing), fall back to using cwd directly.
+        // Safe on all platforms — only triggers when the walk returns null.
         const root_dir_info = this_transpiler.resolver.readDirInfo(this_transpiler.fs.top_level_dir) catch |err| {
             if (!log_errors) return error.CouldntReadCurrentDirectory;
             ctx.log.print(Output.errorWriter()) catch {};
@@ -223,12 +179,10 @@ new = """        // ANDROID_SELINUX_FIX_PATCH
             Output.flush();
             return err;
         } orelse blk: {
-            if (comptime @import("builtin").os.tag == .android) {
-                // Retry with "." (current directory) — this bypasses the walk
-                if (this_transpiler.resolver.readDirInfo(".")) |cwd_info| {
-                    break :blk cwd_info;
-                } else |_| {}
-            }
+            // Retry with "." (current directory) — bypasses the directory walk
+            if (this_transpiler.resolver.readDirInfo(".")) |cwd_info| {
+                break :blk cwd_info;
+            } else |_| {}
             ctx.log.print(Output.errorWriter()) catch {};
             Output.prettyErrorln("error loading current directory", .{});
             Output.flush();
@@ -237,7 +191,7 @@ new = """        // ANDROID_SELINUX_FIX_PATCH
 
 if old in content:
     content = content.replace(old, new, 1)
-    print("  [ok] patched readDirInfo orelse with Android fallback")
+    print("  [ok] patched readDirInfo orelse with cwd fallback")
 else:
     print("  [warn] could not find readDirInfo pattern — may have changed")
 
