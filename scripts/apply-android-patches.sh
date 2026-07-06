@@ -239,8 +239,6 @@ else
 fi
 
 # ─── Patch 5: scripts/build/flags.ts — remove clang 19+ warning flags ────
-# (already patched by Patch 3, but also need to remove -Wno-character-conversion
-# which NDK clang 18 doesn't recognize)
 if [ -f "scripts/build/flags.ts" ]; then
     if grep -q "Wno-character-conversion" "scripts/build/flags.ts" 2>/dev/null; then
         echo "  [patch] scripts/build/flags.ts: remove -Wno-character-conversion (clang 19+ only)"
@@ -248,3 +246,30 @@ if [ -f "scripts/build/flags.ts" ]; then
         echo "  [ok] removed -Wno-character-conversion"
     fi
 fi
+
+# ─── Patch 6: src/jsc/bindings/EncodingTables.h — remove pragma for unknown warning ─
+ENCODING_TABLES="src/jsc/bindings/EncodingTables.h"
+if [ -f "$ENCODING_TABLES" ]; then
+    if grep -q 'clang diagnostic ignored "-Wcharacter-conversion"' "$ENCODING_TABLES" 2>/dev/null; then
+        echo "  [patch] $ENCODING_TABLES: remove -Wcharacter-conversion pragma (clang 19+ only)"
+        sed -i '/clang diagnostic ignored "-Wcharacter-conversion"/d' "$ENCODING_TABLES"
+        echo "  [ok] removed pragma"
+    fi
+fi
+
+# ─── Patch 7: Fix dangling reference warnings in BunTestModule.h and NodeProcessModule.h ─
+# clang 18 is stricter about temporary objects bound to local references.
+# The pattern `for (auto& x : obj.releaseData()->propertyNameVector())` creates
+# a temporary from releaseData() that's destroyed at end of full-expression,
+# leaving the reference dangling. Fix by storing releaseData() in a local.
+for HEADER in src/jsc/modules/BunTestModule.h src/jsc/modules/NodeProcessModule.h; do
+    if [ -f "$HEADER" ]; then
+        if grep -q "properties.releaseData()->propertyNameVector()" "$HEADER" 2>/dev/null; then
+            echo "  [patch] $HEADER: fix dangling reference (clang 18 stricter)"
+            # Replace: for (auto& X : properties.releaseData()->propertyNameVector())
+            # With:    auto _data = properties.releaseData(); for (auto& X : _data->propertyNameVector())
+            sed -i 's|for (auto& \([a-zA-Z]*\) : properties.releaseData()->propertyNameVector())|auto _releaseData = properties.releaseData(); for (auto\& \1 : _releaseData->propertyNameVector())|g' "$HEADER"
+            echo "  [ok] fixed dangling reference"
+        fi
+    fi
+done
