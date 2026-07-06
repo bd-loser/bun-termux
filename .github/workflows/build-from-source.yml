@@ -39,7 +39,28 @@ jobs:
             libssl-dev libcurl4-openssl-dev \
             golang-go ruby-full \
             xz-utils unzip jq python3 \
-            ccache
+            ccache \
+            lsb-release software-properties-common gnupg
+
+      - name: Install LLVM 21 (Bun requires exactly 21.1.x)
+        run: |
+          # Bun's build system enforces LLVM 21.1.0-21.1.99
+          # Add the official LLVM apt repository
+          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] http://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-21 main" | sudo tee /etc/apt/sources.list.d/llvm.list
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            llvm-21 \
+            clang-21 \
+            lld-21 \
+            libclang-21-dev \
+            libpolly-21-dev
+          # Set as default
+          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-21 100
+          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-21 100
+          sudo update-alternatives --install /usr/bin/llvm-config llvm-config /usr/bin/llvm-config-21 100
+          sudo update-alternatives --install /usr/bin/lld lld /usr/bin/lld-21 100
+          clang --version
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
