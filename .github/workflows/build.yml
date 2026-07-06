@@ -177,21 +177,48 @@ jobs:
           install -m755 runtime/bun "$TMPUSR/lib/bun-termux/bun"
           # Install the LD_PRELOAD shim
           install -m755 dist/libbun-android-fix.so "$TMPUSR/lib/bun-termux/libbun-android-fix.so"
-          # Launcher script — LD_PRELOADs the Android filesystem fix shim
+          # Launcher script — uses proot to fix Android SELinux restrictions
+          # that block openat() on / and /data/ (Bun walks up the directory
+          # tree to find the project root, and EACCES on / or /data/ is fatal).
+          # Also LD_PRELOADs the shim for additional filesystem fixes.
           cat > "$TMPUSR/bin/bun" <<'LAUNCHER'
           #!/data/data/com.termux/files/usr/bin/bash
-          # LD_PRELOAD the Android filesystem fix shim
-          # (intercepts linkat/link/symlinkat/renameat that fail with EACCES
-          #  on Android SELinux and falls back to copy_file_range)
+          # Bun on Android: the runtime walks up the directory tree to find
+          # the project root, calling openat(/, O_DIRECTORY) at each level.
+          # Android SELinux blocks openat() on / and /data/ with EACCES,
+          # causing 'CouldntReadCurrentDirectory'. proot intercepts syscalls
+          # at the kernel level (where LD_PRELOAD can't) and remaps them.
+          #
+          # If proot is installed, use it. Otherwise fall back to direct exec
+          # with the LD_PRELOAD shim (which handles installer hardlinks but
+          # not the runtime directory walk).
           SHIM="/data/data/com.termux/files/usr/lib/bun-termux/libbun-android-fix.so"
-          if [ -f "$SHIM" ]; then
-            if [ -z "$LD_PRELOAD" ]; then
-              export LD_PRELOAD="$SHIM"
-            else
-              export LD_PRELOAD="$SHIM:$LD_PRELOAD"
-            fi
+          BUN_BIN="/data/data/com.termux/files/usr/lib/bun-termux/bun"
+          if [ -z "$LD_PRELOAD" ]; then
+            [ -f "$SHIM" ] && export LD_PRELOAD="$SHIM"
+          else
+            [ -f "$SHIM" ] && export LD_PRELOAD="$SHIM:$LD_PRELOAD"
           fi
-          exec /data/data/com.termux/files/usr/lib/bun-termux/bun "$@"
+          # Use proot if available AND not already inside proot/chroot
+          if [ -z "$TERMUX_CHROOT" ] && command -v proot >/dev/null 2>&1; then
+            export TERMUX_CHROOT=1
+            exec proot \
+              --root=/data/data/com.termux/files \
+              --rootfs=/data/data/com.termux/files \
+              --cwd="$(pwd)" \
+              --bind=/dev \
+              --bind=/proc \
+              --bind=/sys \
+              --bind=/system \
+              --bind=/apex \
+              --bind=/vendor \
+              --bind=/data/data/com.termux/files \
+              --bind=/storage \
+              --link2symlink \
+              "$BUN_BIN" "$@"
+          else
+            exec "$BUN_BIN" "$@"
+          fi
           LAUNCHER
           chmod 755 "$TMPUSR/bin/bun"
           # Network fix script
@@ -210,7 +237,7 @@ jobs:
            libbun-android-fix.so LD_PRELOAD shim that fixes EACCES errors
            caused by Android SELinux blocking linkat()/symlinkat() syscalls
            during 'bun install'.
-          Depends: bash, ncurses, curl
+          Depends: bash, ncurses, curl, proot
           EOF
           echo "Installed-Size: $(du -sk "$ROOT" | cut -f1)" >> "$ROOT/DEBIAN/control"
           # Install postinst
