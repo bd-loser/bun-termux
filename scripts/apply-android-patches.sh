@@ -230,15 +230,21 @@ else
         echo "  [skip] $TOOLS_TS already patched"
     else
         echo "  [patch] $TOOLS_TS: lower clang version requirement to 18 (NDK r27c)"
-        # Bun requires clang 21.1.x, but NDK r27c ships clang 18.
-        # Using NDK's clang for everything ensures ABI consistency:
-        # both Bun's C++ code and WebKit prebuilt use std::__ndk1 namespace.
-        # Mixing LLVM 21 (std::__1) with WebKit (__ndk1) causes link failures.
         sed -i 's/export const LLVM_VERSION = "21.1.8";/export const LLVM_VERSION = "18.0.3"; \/\/ ANDROID_SELINUX_FIX_PATCH: NDK r27c clang/' "$TOOLS_TS"
         sed -i 's/const LLVM_MAJOR = "21";/const LLVM_MAJOR = "18"; \/\/ ANDROID_SELINUX_FIX_PATCH/' "$TOOLS_TS"
         sed -i 's/const LLVM_MINOR = "1";/const LLVM_MINOR = "0"; \/\/ ANDROID_SELINUX_FIX_PATCH/' "$TOOLS_TS"
-        # Add NDK clang path to search paths (after existing paths)
         sed -i 's|paths.push(`/usr/lib/llvm-${LLVM_MAJOR}.${LLVM_MINOR}.0/bin`);|paths.push(`/usr/lib/llvm-${LLVM_MAJOR}.${LLVM_MINOR}.0/bin`);\n    // ANDROID_SELINUX_FIX_PATCH: NDK clang\n    paths.push(`${process.env.ANDROID_NDK_HOME \|\| process.env.ANDROID_NDK_ROOT \|\| "/opt/android-ndk"}/toolchains/llvm/prebuilt/linux-x86_64/bin`);|' "$TOOLS_TS"
         echo "  [ok] patched tools.ts — clang 18 + NDK search path"
+    fi
+fi
+
+# ─── Patch 5: scripts/build/flags.ts — remove clang 19+ warning flags ────
+# (already patched by Patch 3, but also need to remove -Wno-character-conversion
+# which NDK clang 18 doesn't recognize)
+if [ -f "scripts/build/flags.ts" ]; then
+    if grep -q "Wno-character-conversion" "scripts/build/flags.ts" 2>/dev/null; then
+        echo "  [patch] scripts/build/flags.ts: remove -Wno-character-conversion (clang 19+ only)"
+        sed -i '/"-Wno-character-conversion",/d' "scripts/build/flags.ts"
+        echo "  [ok] removed -Wno-character-conversion"
     fi
 fi
