@@ -128,10 +128,25 @@ jobs:
           fi
 
           # Also symlink to LLVM 21's main lib dir (where clang looks for -lc++)
+          # AND replace LLVM 21's own libc++_static.a with NDK's (which has __ndk1 symbols)
           LLVM_MAIN_LIB="/usr/lib/llvm-21/lib"
           if [ -n "$NDK_LIBCXX_DIR" ]; then
-            sudo ln -sf "$NDK_LIBCXX_DIR/libc++_static.a" "$LLVM_MAIN_LIB/libc++_static.a" 2>/dev/null || true
-            sudo ln -sf "$NDK_LIBCXX_DIR/libc++abi.a" "$LLVM_MAIN_LIB/libc++abi.a" 2>/dev/null || true
+            # Find LLVM 21's existing libc++_static.a and back it up, then symlink NDK's
+            LLVM_LIBCXX_STATIC=$(find "$LLVM_MAIN_LIB" -name "libc++_static.a" 2>/dev/null | head -1)
+            if [ -n "$LLVM_LIBCXX_STATIC" ]; then
+              echo "Backing up LLVM 21's libc++_static.a and replacing with NDK's"
+              sudo mv "$LLVM_LIBCXX_STATIC" "${LLVM_LIBCXX_STATIC}.bak" 2>/dev/null || true
+              sudo ln -sf "$NDK_LIBCXX_DIR/libc++_static.a" "$LLVM_LIBCXX_STATIC"
+            fi
+            # Same for libc++abi.a
+            LLVM_LIBCXXABI=$(find "$LLVM_MAIN_LIB" -name "libc++abi.a" 2>/dev/null | head -1)
+            if [ -n "$LLVM_LIBCXXABI" ]; then
+              sudo mv "$LLVM_LIBCXXABI" "${LLVM_LIBCXXABI}.bak" 2>/dev/null || true
+              sudo ln -sf "$NDK_LIBCXX_DIR/libc++abi.a" "$LLVM_LIBCXXABI" 2>/dev/null || true
+            fi
+            if [ -n "$NDK_LIBCXXABI_DIR" ]; then
+              sudo ln -sf "$NDK_LIBCXXABI_DIR/libc++abi.a" "$LLVM_LIBCXXABI" 2>/dev/null || true
+            fi
           fi
 
           # Also add the NDK's lib dir to the link path via LDFLAGS
@@ -192,18 +207,34 @@ jobs:
           ANDROID_NDK_ROOT: ${{ steps.setup_ndk.outputs.ndk-path }}
           ANDROID_NDK_HOME: ${{ steps.setup_ndk.outputs.ndk-path }}
           CCACHE_DIR: /tmp/ccache
+          LDFLAGS: "-L${{ steps.setup_ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/28"
         run: |
           mkdir -p /tmp/ccache
           cd /tmp/bun-src
           echo "=== Building Bun for aarch64-linux-android ==="
           echo "NDK: $ANDROID_NDK_ROOT"
           echo "Bun: $(bun --version)"
+          echo "LDFLAGS: $LDFLAGS"
           echo "Start: $(date)"
 
+          # Verify libc++_static.a exists in the sysroot
+          NDK_SYSROOT="$ANDROID_NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+          LIBCXX_STATIC=$(find "$NDK_SYSROOT" -name "libc++_static.a" -path "*aarch64*" | head -1)
+          LIBCXXABI=$(find "$NDK_SYSROOT" -name "libc++abi.a" -path "*aarch64*" | head -1)
+          echo "libc++_static.a: $LIBCXX_STATIC"
+          echo "libc++abi.a: $LIBCXXABI"
+
+          # If not in sysroot, check the NDK's sources/cxx-stl dir
+          if [ -z "$LIBCXX_STATIC" ]; then
+            LIBCXX_STATIC=$(find "$ANDROID_NDK_ROOT" -name "libc++_static.a" -path "*arm64*" | head -1)
+            LIBCXXABI=$(find "$ANDROID_NDK_ROOT" -name "libc++abi.a" -path "*arm64*" | head -1)
+            echo "From cxx-stl:"
+            echo "  libc++_static.a: $LIBCXX_STATIC"
+            echo "  libc++abi.a: $LIBCXXABI"
+          fi
+
           # Build for android target — produces a Bionic-linked binary that
-          # runs natively on Termux via /system/bin/linker64. The android
-          # target sets crossTarget automatically, so clang gets --target=
-          # and --sysroot= from the NDK.
+          # runs natively on Termux via /system/bin/linker64.
           bun scripts/build.ts \
             --profile=release \
             --abi=android \
