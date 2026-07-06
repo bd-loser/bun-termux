@@ -19,7 +19,7 @@ permissions:
 jobs:
   build-from-source:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - name: Checkout this repo (for patch scripts)
         uses: actions/checkout@v4
@@ -91,23 +91,6 @@ jobs:
           # Just verify it will work
           echo "Zig will be installed by Bun's build system"
 
-      - name: Configure Android cross-build
-        env:
-          ANDROID_NDK_ROOT: ${{ steps.setup_ndk.outputs.ndk-path }}
-          ANDROID_NDK_HOME: ${{ steps.setup_ndk.outputs.ndk-path }}
-        run: |
-          cd /tmp/bun-src
-          echo "=== Configuring Android aarch64 build ==="
-          echo "NDK: $ANDROID_NDK_ROOT"
-          echo "Bun: $(bun --version)"
-
-          # Bun's build system uses a TypeScript-based configure script
-          # The --abi=android flag triggers Android cross-compilation
-          bun run build:compile -- --abi=android --arch=aarch64 \
-            --android-ndk="$ANDROID_NDK_ROOT" \
-            --android-api-level=28 \
-            --profile=release 2>&1 | tail -30 || true
-
       - name: Build Bun for Android aarch64
         env:
           ANDROID_NDK_ROOT: ${{ steps.setup_ndk.outputs.ndk-path }}
@@ -116,29 +99,36 @@ jobs:
         run: |
           mkdir -p /tmp/ccache
           cd /tmp/bun-src
-          echo "=== Building Bun for Android aarch64 (this takes 30-60 min) ==="
+          echo "=== Building Bun for Android aarch64 ==="
+          echo "NDK: $ANDROID_NDK_ROOT"
+          echo "Bun: $(bun --version)"
           echo "Start: $(date)"
 
-          # Try the build — Bun uses cmake + ninja under the hood
-          # The build target is controlled by the configure step above
-          cmake --build build --config Release -j$(nproc) 2>&1 | tail -50 || {
-            echo "=== CMake build failed, trying alternative ==="
-            # Fall back to bun's own build script
-            bun run build -- --abi=android --arch=aarch64 --profile=release 2>&1 | tail -50
-          }
+          # Bun's build system: bun scripts/build.ts --profile=release --abi=android
+          # The --abi=android flag triggers cross-compilation for Android
+          bun scripts/build.ts \
+            --profile=release \
+            --abi=android \
+            --arch=aarch64 \
+            --build-dir=build/release-android 2>&1 | tail -100
 
           echo "End: $(date)"
 
       - name: Find and verify the built binary
         run: |
           echo "=== Looking for built binary ==="
-          find /tmp/bun-src/build -name "bun" -type f -executable 2>/dev/null | head -10
-          find /tmp/bun-src -name "bun-android*" -type f 2>/dev/null | head -10
-          BUN_BIN=$(find /tmp/bun-src/build -name "bun" -type f -executable 2>/dev/null | head -1)
+          # Bun's build outputs to build/<profile>/bun or build/bun
+          find /tmp/bun-src/build -name "bun" -type f 2>/dev/null | head -10
+          find /tmp/bun-src/build -name "bun-android*" -type f 2>/dev/null | head -10
+          find /tmp/bun-src -maxdepth 3 -name "bun" -type f -executable 2>/dev/null | head -10
+
+          BUN_BIN=$(find /tmp/bun-src/build -name "bun" -type f 2>/dev/null | head -1)
           if [ -z "$BUN_BIN" ]; then
             echo "ERROR: Bun binary not found in build output"
             echo "=== Build directory contents ==="
+            ls -la /tmp/bun-src/build/ 2>/dev/null || echo "No build dir"
             find /tmp/bun-src/build -type f 2>/dev/null | head -30
+            echo "=== Last 50 lines of build output ==="
             exit 1
           fi
           echo "Found: $BUN_BIN"
