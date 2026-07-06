@@ -72,29 +72,35 @@ jobs:
     needs: check-latest
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/termux/package-builder:latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Android NDK in container
-        run: |
-          # Termux package-builder container already has NDK components
-          # Check what's available
-          ls /opt/ 2>/dev/null
-          which aarch64-linux-android-clang aarch64-linux-android29-clang 2>&1
-          find / -name "aarch64-linux-android*-clang" 2>/dev/null | head -5
-          # If no NDK, install Termux's clang (which can target aarch64)
-          apt-get update -y || true
-          apt-get install -y clang 2>/dev/null || true
+      - name: Install Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup_ndk
+        with:
+          ndk-version: r27c
+          add-to-path: true
 
       - name: Build libbun-android-fix.so
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup_ndk.outputs.ndk-path }}
         run: |
-          chmod +x scripts/build-shim.sh
-          bash scripts/build-shim.sh
-          ls -la dist/libbun-android-fix.so
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+          ls "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/"*/
+          # Find the aarch64 clang
+          NDK_TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
+          export CC="$NDK_TOOLCHAIN/bin/aarch64-linux-android29-clang"
+          echo "CC=$CC"
+          "$CC" --version
+          mkdir -p dist
+          "$CC" -shared -fPIC -O2 -Wall -Wextra \
+            -o dist/libbun-android-fix.so \
+            src/libbun-android-fix.c \
+            -ldl
           file dist/libbun-android-fix.so
+          ls -la dist/libbun-android-fix.so
 
       - name: Upload shim artifact
         uses: actions/upload-artifact@v4
