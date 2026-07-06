@@ -179,7 +179,7 @@ new = """        // ANDROID_SELINUX_FIX_PATCH
                 // Walk threw an error (likely EACCES on / or /data/).
                 // Try cwd as fallback.
                 if (this_transpiler.resolver.readDirInfo(".") catch null) |cwd_info| {
-                    break :blk cwd_info;
+                    if (cwd_info) |info| break :blk info;
                 }
                 if (!log_errors) return error.CouldntReadCurrentDirectory;
                 ctx.log.print(Output.errorWriter()) catch {};
@@ -191,7 +191,7 @@ new = """        // ANDROID_SELINUX_FIX_PATCH
             if (result) |info| break :blk info;
             // result is null (walk completed but found nothing) — try cwd
             if (this_transpiler.resolver.readDirInfo(".") catch null) |cwd_info| {
-                break :blk cwd_info;
+                if (cwd_info) |info| break :blk info;
             }
             ctx.log.print(Output.errorWriter()) catch {};
             Output.prettyErrorln("error loading current directory", .{});
