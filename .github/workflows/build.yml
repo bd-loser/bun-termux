@@ -153,7 +153,11 @@ jobs:
           # Set perms
           chmod 755 "$ROOT" "$ROOT/DEBIAN"
           # Build
-          dpkg-deb --build "$ROOT" "dist/bun_${VERSION}_${ARCH}.deb"
+          # --root-owner-group normalizes ownership to root:root so that
+          # dpkg -i on Termux remaps files to the installing user.
+          # Without this, files keep the CI runner's uid (1001) which
+          # doesn't exist on Termux and causes EACCES during bun install.
+          dpkg-deb --build --root-owner-group "$ROOT" "dist/bun_${VERSION}_${ARCH}.deb"
           rm -rf "$ROOT"
           echo ""
           echo "=== Built: dist/bun_${VERSION}_${ARCH}.deb ==="
