@@ -43,8 +43,10 @@ jobs:
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
-        with:
-          targets: aarch64-unknown-linux-android
+        # Note: we don't install the aarch64-unknown-linux-android target
+        # because Rust doesn't distribute rust-std for Android nightlies.
+        # Bun's build system uses Zig for cross-compilation, not Rust's
+        # own cross-compile, so the host Rust toolchain is sufficient.
 
       - name: Install Android NDK
         uses: nttld/setup-ndk@v1
@@ -189,16 +191,27 @@ jobs:
           path: dist/
         continue-on-error: true
 
+      - name: Install Android NDK (for shim build if needed)
+        uses: nttld/setup-ndk@v1
+        id: setup_ndk
+        with:
+          ndk-version: r27c
+
       - name: Build shim if not downloaded
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup_ndk.outputs.ndk-path }}
         run: |
           if [ ! -f dist/libbun-android-fix.so ]; then
             echo "Shim not found, building it..."
-            # Install NDK and build shim
-            uses: nttld/setup-ndk@v1
-            with:
-              ndk-version: r27c
+            NDK_TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
+            CC="$NDK_TOOLCHAIN/bin/aarch64-linux-android29-clang"
+            mkdir -p dist
+            "$CC" -shared -fPIC -O2 -Wall -Wextra \
+              -o dist/libbun-android-fix.so \
+              src/libbun-android-fix.c \
+              -ldl
+            file dist/libbun-android-fix.so
           fi
-        continue-on-error: true
 
       - name: Build DEB package (no proot needed!)
         env:
