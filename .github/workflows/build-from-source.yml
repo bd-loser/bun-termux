@@ -77,17 +77,17 @@ jobs:
           add-to-path: true
 
       - name: Link NDK builtins to LLVM 21 lib dir (fixes link error)
+        env:
+          NDK_ROOT: ${{ steps.setup_ndk.outputs.ndk-path }}
         run: |
           # The linker looks for libclang_rt.builtins.a in LLVM 21's lib dir:
           #   /usr/lib/llvm-21/lib/clang/21/lib/aarch64-unknown-linux-android28/
           # But that file only exists in the NDK under a version-specific path.
           # Find it and symlink to where LLVM 21 expects it.
-          NDK_ROOT="${ANDROID_NDK_ROOT:-/opt/hostedtoolcache/ndk/r27c/x64}"
           echo "NDK root: $NDK_ROOT"
           echo ""
           echo "=== Searching for libclang_rt.builtins.a in NDK ==="
-          # Search recursively — the path varies by NDK clang version (18, 19, etc.)
-          find "$NDK_ROOT" -name "libclang_rt.builtins.a" 2>/dev/null
+          find "$NDK_ROOT" -name "libclang_rt.builtins.a" 2>/dev/null || true
           echo ""
           # Find the aarch64 builtins dir
           NDK_BUILTINS_DIR=$(find "$NDK_ROOT" -name "libclang_rt.builtins.a" -path "*aarch64*" -exec dirname {} \; 2>/dev/null | head -1)
@@ -96,7 +96,9 @@ jobs:
           if [ -z "$NDK_BUILTINS_DIR" ]; then
             echo "ERROR: Could not find libclang_rt.builtins.a for aarch64 in NDK"
             echo "=== Listing NDK clang dirs ==="
-            find "$NDK_ROOT" -type d -name "clang" 2>/dev/null | head -5
+            find "$NDK_ROOT" -type d -name "clang" 2>/dev/null | head -5 || true
+            echo "=== Searching whole filesystem ==="
+            find / -name "libclang_rt.builtins.a" -path "*aarch64*" 2>/dev/null | head -5 || true
             exit 1
           fi
 
