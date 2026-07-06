@@ -76,6 +76,33 @@ jobs:
           ndk-version: r27c
           add-to-path: true
 
+      - name: Link NDK builtins to LLVM 21 lib dir (fixes link error)
+        run: |
+          # The linker looks for libclang_rt.builtins.a in LLVM 21's lib dir:
+          #   /usr/lib/llvm-21/lib/clang/21/lib/aarch64-unknown-linux-android28/
+          # But that file only exists in the NDK:
+          #   <ndk>/lib/clang/18/lib/linux/aarch64/
+          # Create a symlink so the linker can find it.
+          NDK_LIB="/opt/hostedtoolcache/ndk/r27c/x64/toolchains/llvm/prebuilt/linux-x86_64/lib/clang"
+          LLVM_LIB="/usr/lib/llvm-21/lib/clang/21/lib"
+
+          # Find the NDK's builtins (NDK r27c uses clang 18)
+          NDK_BUILTINS_DIR=$(find "$NDK_LIB" -path "*/linux/aarch64" -name "libclang_rt.builtins.a" -exec dirname {} \; | head -1)
+          echo "NDK builtins dir: $NDK_BUILTINS_DIR"
+
+          # Create the target dir LLVM 21 expects
+          TARGET_DIR="$LLVM_LIB/aarch64-unknown-linux-android28"
+          sudo mkdir -p "$TARGET_DIR"
+
+          # Symlink all .a files from the NDK
+          sudo ln -sf "$NDK_BUILTINS_DIR"/*.a "$TARGET_DIR/"
+
+          echo "=== Verify symlinks ==="
+          ls -la "$TARGET_DIR/"
+          echo ""
+          echo "=== libclang_rt.builtins.a exists? ==="
+          ls -la "$TARGET_DIR/libclang_rt.builtins.a"
+
       - name: Clone Bun source
         env:
           BUN_VERSION: ${{ github.event.inputs.version || '1.3.14' }}
