@@ -172,14 +172,14 @@ new = """        // ANDROID_SELINUX_FIX_PATCH
         // On Android, the directory walk may fail to open ancestors
         // (/ and /data/) due to SELinux. Both the catch (error thrown)
         // and orelse (null returned) cases fall back to cwd (".").
-        // readDirInfo returns !?*DirInfo — we unwrap to *DirInfo (non-optional).
+        // readDirInfo returns !?*DirInfo; the if-unwrap gives *DirInfo.
         const root_dir_info: *DirInfo = blk: {
             // First try the normal top_level_dir
             const result = this_transpiler.resolver.readDirInfo(this_transpiler.fs.top_level_dir) catch |err| {
                 // Walk threw an error (likely EACCES on / or /data/).
                 // Try cwd as fallback.
                 if (this_transpiler.resolver.readDirInfo(".") catch null) |cwd_info| {
-                    if (cwd_info) |info| break :blk info;
+                    break :blk cwd_info;
                 }
                 if (!log_errors) return error.CouldntReadCurrentDirectory;
                 ctx.log.print(Output.errorWriter()) catch {};
@@ -191,7 +191,7 @@ new = """        // ANDROID_SELINUX_FIX_PATCH
             if (result) |info| break :blk info;
             // result is null (walk completed but found nothing) — try cwd
             if (this_transpiler.resolver.readDirInfo(".") catch null) |cwd_info| {
-                if (cwd_info) |info| break :blk info;
+                break :blk cwd_info;
             }
             ctx.log.print(Output.errorWriter()) catch {};
             Output.prettyErrorln("error loading current directory", .{});
