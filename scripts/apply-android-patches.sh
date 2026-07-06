@@ -170,18 +170,26 @@ old = """        const root_dir_info = this_transpiler.resolver.readDirInfo(this
 
 new = """        // ANDROID_SELINUX_FIX_PATCH
         // On Android, the directory walk may fail to open ancestors
-        // (/ and /data/) due to SELinux. When readDirInfo returns null
-        // (directory walk found nothing), fall back to using cwd directly.
-        // Safe on all platforms — only triggers when the walk returns null.
-        const root_dir_info = this_transpiler.resolver.readDirInfo(this_transpiler.fs.top_level_dir) catch |err| {
-            if (!log_errors) return error.CouldntReadCurrentDirectory;
-            ctx.log.print(Output.errorWriter()) catch {};
-            Output.prettyErrorln("<r><red>error<r><d>:<r> <b>{s}<r> loading directory {f}", .{ @errorName(err), bun.fmt.QuotedFormatter{ .text = this_transpiler.fs.top_level_dir } });
-            Output.flush();
-            return err;
-        } orelse blk: {
-            // Retry with "." (current directory) — bypasses the directory walk.
-            // readDirInfo returns !?*DirInfo; catch null converts errors to null.
+        // (/ and /data/) due to SELinux. Both the catch (error thrown)
+        // and orelse (null returned) cases fall back to cwd (".").
+        const root_dir_info = blk: {
+            // First try the normal top_level_dir
+            if (this_transpiler.resolver.readDirInfo(this_transpiler.fs.top_level_dir)) |info| {
+                break :blk info;
+            } else |err| {
+                // Walk threw an error (likely EACCES on / or /data/).
+                // Try cwd as fallback.
+                if (this_transpiler.resolver.readDirInfo(".") catch null) |cwd_info| {
+                    break :blk cwd_info;
+                }
+                if (!log_errors) return error.CouldntReadCurrentDirectory;
+                ctx.log.print(Output.errorWriter()) catch {};
+                Output.prettyErrorln("<r><red>error<r><d>:<r> <b>{s}<r> loading directory {f}", .{ @errorName(err), bun.fmt.QuotedFormatter{ .text = this_transpiler.fs.top_level_dir } });
+                Output.flush();
+                return err;
+            }
+            // readDirInfo returned null (walk completed but found nothing)
+            // Try cwd as fallback.
             if (this_transpiler.resolver.readDirInfo(".") catch null) |cwd_info| {
                 break :blk cwd_info;
             }
@@ -205,6 +213,64 @@ fi
 echo ""
 echo "=== Patches applied successfully ==="
 echo "Verify with: grep -n 'ANDROID_SELINUX_FIX_PATCH' src/bun.zig src/cli/run_command.zig"
+
+# ─── Patch 8: src/resolver/resolver.zig — use bun.openDirAbsoluteZ instead of std.fs ─
+# The directory walk in dir_info_cached_miss uses std.fs.openDirAbsoluteZ
+# which doesn't have our EACCES fallback. Replace it with bun.openDirAbsolute
+# which we patched to retry without O_DIRECTORY on EACCES.
+RESOLVER_ZIG="src/resolver/resolver.zig"
+if [ -f "$RESOLVER_ZIG" ]; then
+    if grep -q "ANDROID_SELINUX_FIX_PATCH" "$RESOLVER_ZIG" 2>/dev/null; then
+        echo "  [skip] $RESOLVER_ZIG already patched"
+    else
+        echo "  [patch] $RESOLVER_ZIG: use bun.openDirAbsolute for EACCES fallback"
+        # Replace std.fs.openDirAbsoluteZ with bun.openDirAbsoluteZ
+        # First check if bun has openDirAbsoluteZ
+        if grep -q "pub fn openDirAbsoluteZ" src/bun.zig 2>/dev/null; then
+            sed -i 's|std\.fs\.openDirAbsoluteZ|bun.openDirAbsoluteZ|g' "$RESOLVER_ZIG"
+            echo "  [ok] replaced std.fs.openDirAbsoluteZ with bun.openDirAbsoluteZ"
+        else
+            # bun doesn't have openDirAbsoluteZ, so patch the call site directly
+            # Replace the openDirAbsoluteZ call with a try that catches EACCES
+            python3 <<'PYEOF'
+with open("src/resolver/resolver.zig", "r") as f:
+    content = f.read()
+
+old = """                const open_req = if (comptime Environment.isPosix) open_req: {
+                    const dir_result = std.fs.openDirAbsoluteZ(
+                        sentinel,
+                        .{ .no_follow = !follow_symlinks, .iterate = true },
+                    ) catch |err| break :open_req err;
+                    break :open_req FD.fromStdDir(dir_result);
+                } else if (comptime Environment.isWindows) open_req: {"""
+
+new = """                // ANDROID_SELINUX_FIX_PATCH: On Android, openDirAbsoluteZ fails with
+                // EACCES on / and /data/ due to SELinux. Catch the error and
+                // treat as "not found" (break with error) so the walk stops.
+                const open_req = if (comptime Environment.isPosix) open_req: {
+                    const dir_result = std.fs.openDirAbsoluteZ(
+                        sentinel,
+                        .{ .no_follow = !follow_symlinks, .iterate = true },
+                    ) catch |err| {
+                        // EACCES means SELinux blocked it — treat as not found
+                        if (err == error.AccessDenied) break :open_req error.FileNotFound;
+                        break :open_req err;
+                    };
+                    break :open_req FD.fromStdDir(dir_result);
+                } else if (comptime Environment.isWindows) open_req: {"""
+
+if old in content:
+    content = content.replace(old, new, 1)
+    print("  [ok] patched resolver to catch AccessDenied as FileNotFound")
+else:
+    print("  [warn] could not find openDirAbsoluteZ pattern in resolver.zig")
+
+with open("src/resolver/resolver.zig", "w") as f:
+    f.write(content)
+PYEOF
+        fi
+    fi
+fi
 
 # ─── Patch 3: scripts/build/flags.ts — fix cross-compile CPU flags ────────
 FLAGS_TS="scripts/build/flags.ts"
