@@ -1,0 +1,283 @@
+name: Build Bun Termux
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'packaging/**'
+      - 'scripts/**'
+      - 'Makefile'
+      - '.github/workflows/build.yml'
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Override version (e.g., 1.3.15)'
+        required: false
+        default: ''
+  schedule:
+    # Check for new Bun releases daily at 09:00 UTC
+    - cron: '0 9 * * *'
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  check-latest:
+    runs-on: ubuntu-latest
+    outputs:
+      latest: ${{ steps.check.outputs.latest }}
+      current: ${{ steps.check.outputs.current }}
+      should_bump: ${{ steps.check.outputs.should_bump }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check latest Bun release
+        id: check
+        run: |
+          LATEST=$(curl -s https://api.github.com/repos/oven-sh/bun/releases/latest | jq -r .tag_name | sed 's/bun-v//')
+          CURRENT=$(grep '^PKGVER ?=' Makefile | awk '{print $3}')
+          echo "Latest upstream: $LATEST"
+          echo "Current repo:    $CURRENT"
+          echo "latest=$LATEST" >> $GITHUB_OUTPUT
+          echo "current=$CURRENT" >> $GITHUB_OUTPUT
+          if [ "$LATEST" != "$CURRENT" ] && [ -n "$LATEST" ]; then
+            echo "should_bump=true" >> $GITHUB_OUTPUT
+            echo "New version detected: $LATEST (current: $CURRENT)"
+          else
+            echo "should_bump=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Auto-bump version on schedule
+        if: github.event_name == 'schedule' && steps.check.outputs.should_bump == 'true'
+        run: |
+          LATEST=${{ steps.check.outputs.latest }}
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          sed -i "s/^PKGVER ?=.*/PKGVER ?= $LATEST/" Makefile
+          # Also update PKGBUILD files
+          sed -i "s/^pkgver=.*/pkgver=$LATEST/" packaging/pacman/PKGBUILD 2>/dev/null || true
+          sed -i "s/^pkgver=.*/pkgver=$LATEST/" packaging/pacman/PKGBUILD.aarch64 2>/dev/null || true
+          git add Makefile packaging/pacman/PKGBUILD*
+          git commit -m "chore: bump Bun to v$LATEST"
+          git push
+          echo "Pushed version bump to $LATEST"
+
+  build-pacman:
+    needs: check-latest
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/termux/package-builder:latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use override version or latest
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${{ needs.check-latest.outputs.latest }}"
+          fi
+          echo "Building version: $VERSION"
+          sed -i "s/^pkgver=.*/pkgver=$VERSION/" packaging/pacman/PKGBUILD 2>/dev/null || true
+          sed -i "s/^pkgver=.*/pkgver=$VERSION/" packaging/pacman/PKGBUILD.aarch64 2>/dev/null || true
+          sed -i "s/^PKGVER ?=.*/PKGVER ?= $VERSION/" Makefile
+          echo "##[set-output name=version;]$VERSION"
+        id: version
+
+      - name: Verify Makefile tabs
+        run: |
+          if grep -nP '^\t' Makefile >/dev/null; then
+            echo "Makefile tabs OK"
+          else
+            echo "Makefile missing tabs! Aborting."
+            exit 1
+          fi
+
+      - name: Build pacman package
+        run: |
+          cd packaging/pacman
+          makepkg -f --noconfirm
+
+      - name: List packages
+        run: |
+          ls -la packaging/pacman/*.pkg.* || echo "No packages found"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bun-pacman-aarch64
+          path: packaging/pacman/*.pkg.*
+          retention-days: 30
+
+  build-deb:
+    needs: check-latest
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/termux/package-builder:latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          apt-get update || true
+          apt-get install -y curl unzip dpkg-dev jq || true
+
+      - name: Use override version or latest
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${{ needs.check-latest.outputs.latest }}"
+          fi
+          echo "Building version: $VERSION"
+          sed -i "s/^PKGVER ?=.*/PKGVER ?= $VERSION/" Makefile
+          echo "##[set-output name=version;]$VERSION"
+        id: version
+
+      - name: Verify Makefile tabs
+        run: |
+          if grep -nP '^\t' Makefile >/dev/null; then
+            echo "Makefile tabs OK"
+          else
+            echo "Makefile missing tabs! Aborting."
+            exit 1
+          fi
+
+      - name: Download Bun Android binary
+        env:
+          BUN_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p runtime
+          echo "Downloading Bun v${BUN_VERSION} for android-aarch64..."
+          curl -fL "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-aarch64-android.zip" -o /tmp/bun.zip
+          unzip -o /tmp/bun.zip -d /tmp/bun-extract
+          BUN_BIN=$(find /tmp/bun-extract -name "bun" -type f | head -1)
+          if [ -z "$BUN_BIN" ]; then
+            echo "ERROR: bun binary not found in zip"
+            ls -la /tmp/bun-extract/
+            exit 1
+          fi
+          cp "$BUN_BIN" runtime/bun
+          chmod +x runtime/bun
+          file runtime/bun
+          echo "Binary size: $(stat -c%s runtime/bun) bytes"
+
+      - name: Build DEB package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          make deb PKGVER=$VERSION
+
+      - name: Verify DEB contents
+        run: |
+          echo "=== DEB contents ==="
+          ls -la dist/*.deb
+          echo ""
+          echo "=== DEB file listing ==="
+          dpkg-deb -c dist/*.deb | head -20
+          echo ""
+          echo "=== Control file ==="
+          dpkg-deb -I dist/*.deb
+          echo ""
+          echo "=== postinst script ==="
+          dpkg-deb -e dist/*.deb /tmp/extracted-control
+          cat /tmp/extracted-control/postinst
+
+      - name: List packages
+        run: |
+          ls -la dist/*.deb || echo "No packages found"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bun-deb-aarch64
+          path: dist/*.deb
+          retention-days: 30
+
+  release:
+    needs: [build-pacman, build-deb, check-latest]
+    runs-on: ubuntu-latest
+    # Release when: manually dispatched with version, OR scheduled run detected new version
+    if: >-
+      ${{
+        (github.event_name == 'workflow_dispatch' && github.event.inputs.version != '') ||
+        (github.event_name == 'schedule' && needs.check-latest.outputs.should_bump == 'true')
+      }}
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine version
+        id: ver
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${{ needs.check-latest.outputs.latest }}"
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Download pacman artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bun-pacman-aarch64
+          path: dist/
+        continue-on-error: true
+
+      - name: Download deb artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bun-deb-aarch64
+          path: dist/
+        continue-on-error: true
+
+      - name: List release files
+        run: |
+          ls -la dist/
+
+      - name: Create or update release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.version }}
+          name: Bun for Termux v${{ steps.ver.outputs.version }}
+          files: dist/*
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          body: |
+            # Bun for Termux v${{ steps.ver.outputs.version }}
+
+            Android-native Bun runtime packaged for Termux. **No glibc, no wrapper, no grun.**
+
+            ## Installation
+
+            ```bash
+            # Download the .deb from assets below, then:
+            dpkg -i bun_${{ steps.ver.outputs.version }}_aarch64.deb
+            ```
+
+            If `bun install` fails with `ConnectionRefused`, run:
+
+            ```bash
+            bun-fix-network
+            ```
+
+            ## What's new
+
+            - Bundles `bun-fix-network` script for automatic DNS/proxy workaround
+            - `postinst` detects network issues and prints instructions
+            - Built from upstream Bun v${{ steps.ver.outputs.version }} (android-aarch64)

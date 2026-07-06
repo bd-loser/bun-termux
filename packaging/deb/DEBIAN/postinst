@@ -1,0 +1,52 @@
+#!/data/data/com.termux/files/usr/bin/bash
+# postinst — runs after `dpkg -i bun_*.deb` on Termux
+# This is invoked by dpkg as the install user (u0_aXXX), not as root.
+
+set -e
+
+PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+FIX_SCRIPT="$PREFIX/bin/bun-fix-network"
+
+echo ""
+echo "┌─────────────────────────────────────────────────────────────┐"
+echo "│  Bun for Termux installed                                    │"
+echo "└─────────────────────────────────────────────────────────────┘"
+echo ""
+echo "  Version : $(bun --version 2>/dev/null || echo 'unknown')"
+echo "  Binary  : $PREFIX/lib/bun-termux/bun"
+echo "  Launcher: $PREFIX/bin/bun"
+echo ""
+
+# Detect whether /etc/resolv.conf exists. If not, Bun's c-ares resolver
+# will fall back to 8.8.8.8 — which is blocked on many APAC carriers.
+# This is a heuristic; bun-fix-network will do the real test.
+NEEDS_FIX=0
+if [ ! -f /etc/resolv.conf ]; then
+    NEEDS_FIX=1
+fi
+
+# Quick connectivity test using curl (which uses Android's resolver)
+if ! curl -sI --max-time 5 https://registry.npmjs.org/@types/bun >/dev/null 2>&1; then
+    NEEDS_FIX=1
+fi
+
+if [ "$NEEDS_FIX" = "1" ]; then
+    echo "  ⚠  Your network may block Bun's DNS resolver."
+    echo "     If 'bun install' fails with 'ConnectionRefused', run:"
+    echo ""
+    echo "         bun-fix-network"
+    echo ""
+    echo "     This sets up a local tinyproxy + HTTPS_PROXY automatically."
+    echo ""
+else
+    echo "  ✓  Network looks healthy. Try: bun install"
+    echo ""
+fi
+
+echo "  Useful commands:"
+echo "    bun --version"
+echo "    bun install"
+echo "    bun-fix-network    (auto-fix network issues if they appear)"
+echo ""
+
+exit 0

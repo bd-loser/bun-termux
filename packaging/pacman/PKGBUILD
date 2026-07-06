@@ -1,0 +1,67 @@
+# PKGBUILD for Bun on Termux
+# Uses native Android Bun binary for Termux packaging
+pkgname=bun
+pkgver=1.3.9
+pkgrel=3
+pkgdesc='Bun runtime for Termux (native Android)'
+arch=('aarch64')
+url='https://github.com/oven-sh/bun'
+license=('MIT')
+options=('!strip' '!debug')
+
+depends=('bash' 'ncurses')
+makedepends=('unzip')
+optdepends=()
+
+_bunver="${pkgver}"
+source=("https://github.com/oven-sh/bun/releases/download/bun-v${_bunver}/bun-linux-aarch64-android.zip")
+sha256sums=('SKIP')
+
+prepare() {
+    msg "Preparing bun v${_bunver}..."
+    cd "$srcdir"
+    unzip -o "bun-linux-aarch64-android.zip" || true
+}
+
+build() {
+    msg "Building bun package..."
+
+    local prefix="${PREFIX:-/data/data/com.termux/files/usr}"
+    mkdir -p "$pkgdir$prefix/lib/bun"
+    mkdir -p "$pkgdir$prefix/bin"
+
+    # Install bun binary (native Android binary, no wrapper)
+    if [[ -f "$srcdir/bun-linux-aarch64/bun" ]]; then
+        install -m755 "$srcdir/bun-linux-aarch64/bun" "$pkgdir$prefix/lib/bun/bun"
+    elif [[ -f "$srcdir/bun" ]]; then
+        install -m755 "$srcdir/bun" "$pkgdir$prefix/lib/bun/bun"
+    else
+        error "Bun binary not found in source"
+        return 1
+    fi
+
+    # Create launcher script
+    cat > "$pkgdir$prefix/bin/bun" <<'LAUNCHER'
+#!/usr/bin/env bash
+set -euo pipefail
+PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+BUN_BIN="$PREFIX/lib/bun/bun"
+if [[ ! -x "$BUN_BIN" ]]; then
+    echo "Error: Bun runtime not found at $BUN_BIN" >&2
+    exit 1
+fi
+exec grun "$BUN_BIN" "$@"
+LAUNCHER
+    chmod 755 "$pkgdir$prefix/bin/bun"
+}
+
+package() {
+    true
+}
+
+post_install() {
+    echo ""
+    echo "Bun for Termux installed!"
+    echo "Usage: bun --version"
+    echo ""
+}

@@ -1,0 +1,235 @@
+name: armv7 Bun Termux migration
+
+on:
+  workflow_dispatch:
+    inputs:
+      bun_version:
+        description: Bun version tag for source build attempts
+        required: true
+        default: "1.2.20"
+      run_native_armv7:
+        description: Run native armv7 fallback job (requires self-hosted armv7 runner)
+        required: false
+        default: "false"
+  push:
+    branches: [main, master]
+    paths:
+      - '.github/workflows/armv7.yml'
+      - 'scripts/ci/**'
+      - 'docs/armv7-**'
+
+jobs:
+  detect-native-runner:
+    runs-on: ubuntu-latest
+    outputs:
+      native_available: ${{ steps.detect.outputs.native_available }}
+      matched_runner: ${{ steps.detect.outputs.matched_runner }}
+    steps:
+      - name: Detect available self-hosted armv7 runner
+        id: detect
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          repo = os.environ['REPO']
+          runners = json.loads(
+              subprocess.check_output(
+                  ['gh', 'api', f'repos/{repo}/actions/runners'],
+                  text=True,
+              )
+          ).get('runners', [])
+
+          def has_labels(r, wanted):
+              labels = {x.get('name') for x in r.get('labels', [])}
+              return wanted.issubset(labels)
+
+          wanted = {'self-hosted', 'linux', 'armv7'}
+          matched = [
+              r for r in runners
+              if r.get('status') == 'online' and (not r.get('busy')) and has_labels(r, wanted)
+          ]
+
+          native_available = 'true' if matched else 'false'
+          matched_runner = matched[0].get('name', '') if matched else ''
+
+          github_output = os.environ['GITHUB_OUTPUT']
+          with open(github_output, 'a', encoding='utf-8') as f:
+              f.write(f'native_available={native_available}\n')
+              f.write(f'matched_runner={matched_runner}\n')
+
+          print(json.dumps({
+              'native_available': native_available,
+              'matched_runner': matched_runner,
+              'matched_count': len(matched),
+          }))
+          PY
+
+  armv7-cross-prebuild:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare output directories
+        run: |
+          set -euo pipefail
+          mkdir -p out/assets out/logs out/status out/toolchain out/pkgfile-template
+
+      - name: Install cross toolchain and emulation
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-arm-linux-gnueabihf g++-arm-linux-gnueabihf \
+            binutils-arm-linux-gnueabihf libc6-dev-armhf-cross \
+            qemu-user-static file jq zip unzip curl ca-certificates \
+            nodejs npm python3
+          arm-linux-gnueabihf-gcc --version | head -n1 | tee out/toolchain/gcc-version.txt
+          qemu-arm-static --version | head -n1 | tee out/toolchain/qemu-version.txt
+
+      - name: Install host bun
+        run: |
+          set -euo pipefail
+          curl -fsSL https://bun.sh/install | bash
+          "$HOME/.bun/bin/bun" --version | tee out/toolchain/bun-host-version.txt
+
+      - name: Attempt bun armv7 binary build (host compile target probe)
+        env:
+          BUN_VERSION: ${{ github.event.inputs.bun_version || '1.2.20' }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          chmod +x scripts/ci/build-bun-armv7.sh
+          scripts/ci/build-bun-armv7.sh "$BUN_VERSION" out > out/logs/build-bun-armv7.log 2>&1
+
+      - name: Attempt bun armv7 source build (cross-first matrix)
+        env:
+          BUN_VERSION: ${{ github.event.inputs.bun_version || '1.2.20' }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          chmod +x scripts/ci/build-bun-armv7-source.sh
+          scripts/ci/build-bun-armv7-source.sh "$BUN_VERSION" out > out/logs/build-bun-armv7-source.log 2>&1
+
+      - name: Summarize Bun armv7 attempt status
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          out = Path('out')
+          assets = sorted([str(p.relative_to(out)) for p in (out/'assets').rglob('*') if p.is_file()])
+
+          def read_json(path):
+              p = Path(path)
+              if not p.exists():
+                  return None
+              try:
+                  return json.loads(p.read_text())
+              except Exception:
+                  return None
+
+          bun_target = read_json('out/status/bun-target-support.json') or {}
+          bun_source = read_json('out/status/bun-source-build-status.json') or {}
+
+          status = {
+            'bun_armv7_bin_present': any('bun' in p and 'armv7' in p for p in assets),
+            'bun_target_supported': bool(bun_target.get('supported')),
+            'bun_source_status': bun_source.get('status'),
+            'assets': assets,
+          }
+          (out/'status'/'build-attempt-status.json').write_text(json.dumps(status, indent=2) + '\n')
+
+          native_required = (not status['bun_armv7_bin_present']) and (not status['bun_target_supported']) and (status['bun_source_status'] != 'success')
+          decision = {
+            'native_required': native_required,
+            'next_path': 'native-armv7-runner' if native_required else 'continue-cross-build',
+            'reasons': [
+              'bun compile target unsupported' if not status['bun_target_supported'] else '',
+              'bun source cross-build did not yield armv7 binary' if status['bun_source_status'] != 'success' else ''
+            ],
+            'signals': status,
+          }
+          decision['reasons'] = [r for r in decision['reasons'] if r]
+          (out/'status'/'next-build-path.json').write_text(json.dumps(decision, indent=2) + '\n')
+          print(json.dumps(decision, indent=2))
+          PY
+
+      - name: Remove work directory from artifact
+        run: |
+          set -euo pipefail
+          rm -rf out/work
+
+      - name: Write package templates
+        run: |
+          set -euo pipefail
+          cat > out/pkgfile-template/PKGBUILD.armv7l.template <<'PKG'
+          pkgname=bun
+          pkgver=__BUN_VERSION__
+          pkgrel=1
+          arch=('armv7l')
+          depends=('glibc-runner' 'bash' 'ncurses')
+          source=('bun-linux-armv7-__BUN_VERSION__.tar.gz')
+          sha256sums=('__SHA256__')
+          PKG
+
+      - name: Generate manifest and checksums
+        env:
+          BUN_VERSION: ${{ github.event.inputs.bun_version || '1.2.20' }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          items=[]
+          for p in sorted(Path('out').rglob('*')):
+              if p.is_file():
+                  items.append({'path': str(p.relative_to('out')), 'size': p.stat().st_size, 'sha256': hashlib.sha256(p.read_bytes()).hexdigest()})
+          manifest={
+            'kind': 'bun-armv7-migration',
+            'target': 'linux-armv7',
+            'bun_version': os.environ.get('BUN_VERSION'),
+            'git_sha': os.environ.get('GITHUB_SHA',''),
+            'contains_final_termux_runtime': False,
+            'items': items,
+          }
+          Path('out/manifest.json').write_text(json.dumps(manifest, indent=2)+'\n')
+          PY
+          (cd out && find . -type f | sort | xargs sha256sum > checksums.txt)
+
+      - name: Upload armv7 cross artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bun-armv7-cross-prebuild
+          path: out/
+          retention-days: 30
+
+  armv7-native-fallback:
+    needs: [detect-native-runner, armv7-cross-prebuild]
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_native_armv7 == 'true' && needs.detect-native-runner.outputs.native_available == 'true' }}
+    runs-on: [self-hosted, linux, armv7]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare output directories
+        run: |
+          set -euo pipefail
+          mkdir -p out-native
+      - name: Attempt Bun native armv7 source build
+        env:
+          BUN_VERSION: ${{ github.event.inputs.bun_version || '1.2.20' }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          chmod +x scripts/ci/build-bun-armv7-native.sh
+          scripts/ci/build-bun-armv7-native.sh "$BUN_VERSION" out-native > out-native/build-bun-armv7-native-wrapper.log 2>&1
+      - name: Upload armv7 native artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bun-armv7-native-fallback
+          path: out-native/
+          retention-days: 30

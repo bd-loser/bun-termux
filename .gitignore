@@ -1,0 +1,11 @@
+# Build artifacts
+artifacts/
+runtime/
+packages/
+*.deb
+*.pkg.tar.*
+
+# Large files (downloaded by CI)
+*.tar.gz
+*.zip
+packaging/dpkg/work/

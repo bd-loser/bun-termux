@@ -1,0 +1,94 @@
+# PKGBUILD for Bun on Termux
+pkgname=bun
+pkgver=1.3.9
+pkgrel=2
+pkgdesc='Bun runtime for Termux (glibc-runner wrapper) - Updated packaging'
+arch=('aarch64')
+url='https://github.com/oven-sh/bun'
+license=('MIT')
+options=('!strip' '!debug')
+
+depends=('glibc-runner' 'bash' 'ncurses')
+makedepends=()
+optdepends=()
+
+source=()
+sha256sums=()
+
+# Use environment variable for source location (sensitive info separation)
+_bun_source="${BUN_SOURCE:-${PWD}/../../sources/bun}"
+_bun_runtime="${BUN_RUNTIME:-${PWD}/../../runtime/bun}"
+
+prepare() {
+    msg "Preparing bun build..."
+    
+    # If source directory exists, ensure it's ready
+    if [[ -d "$_bun_source" ]]; then
+        msg2 "Bun source directory found at $_bun_source"
+    else
+        warning "Bun source directory not found at $_bun_source"
+        warning "Set BUN_SOURCE environment variable or place sources in sources/bun/"
+    fi
+}
+
+build() {
+    msg "Building bun wrapper..."
+    
+    local prefix="${PREFIX:-/data/data/com.termux/files/usr}"
+    mkdir -p "$pkgdir$prefix/lib/bun"
+    mkdir -p "$pkgdir$prefix/bin"
+    
+    # Copy source if available (for development/debug)
+    if [[ -d "$_bun_source" ]]; then
+        msg2 "Copying source from $_bun_source"
+        mkdir -p "$pkgdir$prefix/share/bun/source"
+        rsync -a --exclude='.git' --exclude='node_modules' \
+            "$_bun_source/" "$pkgdir$prefix/share/bun/source/" 2>/dev/null || \
+        cp -a "$_bun_source/." "$pkgdir$prefix/share/bun/source/"
+    fi
+    
+    # Install runtime binary
+    if [[ -f "$_bun_runtime" ]]; then
+        install -m755 "$_bun_runtime" "$pkgdir$prefix/lib/bun/bun"
+        msg2 "Runtime installed from $_bun_runtime"
+    else
+        warning "Runtime not found at $_bun_runtime"
+        warning "Set BUN_RUNTIME environment variable or place binary in runtime/"
+        # Create dummy binary for packaging
+        cat > "$pkgdir$prefix/lib/bun/bun" <<'DUMMY'
+#!/usr/bin/env bash
+echo "Bun runtime not installed. Please set BUN_RUNTIME or run build scripts."
+exit 1
+DUMMY
+        chmod 755 "$pkgdir$prefix/lib/bun/bun"
+    fi
+    
+    # Create launcher wrapper
+    cat > "$pkgdir$prefix/bin/bun" <<'LAUNCHER'
+#!/usr/bin/env bash
+set -euo pipefail
+
+PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+BUN_BIN="$PREFIX/lib/bun/bun"
+
+if [[ ! -x "$BUN_BIN" ]]; then
+    echo "Error: Bun runtime not found at $BUN_BIN" >&2
+    exit 1
+fi
+
+exec grun "$BUN_BIN" "$@"
+LAUNCHER
+    chmod 755 "$pkgdir$prefix/bin/bun"
+}
+
+package() {
+    true
+}
+
+post_install() {
+    echo ""
+    echo "Bun for Termux installed!"
+    echo ""
+    echo "Usage: bun --version"
+    echo ""
+}
