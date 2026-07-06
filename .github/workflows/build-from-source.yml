@@ -113,24 +113,28 @@ jobs:
           # Just verify it will work
           echo "Zig will be installed by Bun's build system"
 
-      - name: Build Bun for aarch64-linux-musl (static binary, runs natively on Termux)
+      - name: Build Bun for aarch64-linux-android (native Bionic binary)
         env:
+          ANDROID_NDK_ROOT: ${{ steps.setup_ndk.outputs.ndk-path }}
+          ANDROID_NDK_HOME: ${{ steps.setup_ndk.outputs.ndk-path }}
           CCACHE_DIR: /tmp/ccache
         run: |
           mkdir -p /tmp/ccache
           cd /tmp/bun-src
-          echo "=== Building Bun for aarch64-linux-musl ==="
+          echo "=== Building Bun for aarch64-linux-android ==="
+          echo "NDK: $ANDROID_NDK_ROOT"
           echo "Bun: $(bun --version)"
           echo "Start: $(date)"
 
-          # Build for musl target — produces a static binary that runs on
-          # Termux without grun/proot. The SELinux patches in the source
-          # fix the openat() EACCES issue regardless of target ABI.
+          # Build for android target — produces a Bionic-linked binary that
+          # runs natively on Termux via /system/bin/linker64. The android
+          # target sets crossTarget automatically, so clang gets --target=
+          # and --sysroot= from the NDK.
           bun scripts/build.ts \
             --profile=release \
-            --abi=musl \
+            --abi=android \
             --arch=aarch64 \
-            --build-dir=build/release-musl 2>&1 | tail -100
+            --build-dir=build/release-android 2>&1 | tail -100
 
           echo "End: $(date)"
 
@@ -154,16 +158,16 @@ jobs:
           ls -lh "$BUN_BIN"
           cp "$BUN_BIN" /tmp/bun-patched
 
-      - name: Verify the binary is aarch64 musl-static
+      - name: Verify the binary is Android-native
         run: |
           file /tmp/bun-patched
-          # Should show: ELF 64-bit LSB executable, ARM aarch64, statically linked
+          # Should show: ELF 64-bit LSB pie executable, ARM aarch64, interpreter /system/bin/linker64
           if ! file /tmp/bun-patched | grep -q "aarch64"; then
             echo "ERROR: Binary is not aarch64"
             exit 1
           fi
           echo "=== Binary verification passed ==="
-          echo "Musl-static binaries run natively on Termux (no grun/proot needed)"
+          echo "Native Android (Bionic) binary — runs on Termux via /system/bin/linker64"
 
       - name: Upload patched binary artifact
         uses: actions/upload-artifact@v4
