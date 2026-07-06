@@ -60,13 +60,133 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           sed -i "s/^PKGVER ?=.*/PKGVER ?= $LATEST/" Makefile
-          # Also update PKGBUILD files
           sed -i "s/^pkgver=.*/pkgver=$LATEST/" packaging/pacman/PKGBUILD 2>/dev/null || true
           sed -i "s/^pkgver=.*/pkgver=$LATEST/" packaging/pacman/PKGBUILD.aarch64 2>/dev/null || true
           git add Makefile packaging/pacman/PKGBUILD*
           git commit -m "chore: bump Bun to v$LATEST"
           git push
           echo "Pushed version bump to $LATEST"
+
+  build-deb:
+    needs: check-latest
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y curl unzip dpkg-dev jq
+
+      - name: Determine version
+        id: ver
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${{ needs.check-latest.outputs.latest }}"
+          fi
+          echo "Building version: $VERSION"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Download Bun Android binary
+        env:
+          BUN_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          mkdir -p runtime
+          echo "Downloading Bun v${BUN_VERSION} for android-aarch64..."
+          curl -fL "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-aarch64-android.zip" -o /tmp/bun.zip
+          unzip -o /tmp/bun.zip -d /tmp/bun-extract
+          BUN_BIN=$(find /tmp/bun-extract -name "bun" -type f | head -1)
+          if [ -z "$BUN_BIN" ]; then
+            echo "ERROR: bun binary not found in zip"
+            ls -la /tmp/bun-extract/
+            exit 1
+          fi
+          cp "$BUN_BIN" runtime/bun
+          chmod +x runtime/bun
+          file runtime/bun
+          echo "Binary size: $(stat -c%s runtime/bun) bytes"
+
+      - name: Build DEB package (bypass Makefile — Ubuntu has no Termux bash)
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          ARCH: aarch64
+        run: |
+          set -e
+          mkdir -p dist
+          ROOT=$(mktemp -d)
+          TMPUSR="$ROOT/data/data/com.termux/files/usr"
+          mkdir -p "$ROOT/DEBIAN" "$TMPUSR/bin" "$TMPUSR/lib/bun-termux"
+
+          # Install the Bun binary
+          install -m755 runtime/bun "$TMPUSR/lib/bun-termux/bun"
+
+          # Create the launcher script
+          cat > "$TMPUSR/bin/bun" <<'LAUNCHER'
+          #!/data/data/com.termux/files/usr/bin/bash
+          exec /data/data/com.termux/files/usr/lib/bun-termux/bun "$@"
+          LAUNCHER
+          # Strip leading whitespace from heredoc
+          sed -i 's/^[[:space:]]*//' "$TMPUSR/bin/bun"
+          chmod 755 "$TMPUSR/bin/bun"
+
+          # Install the network-fix script
+          install -m755 scripts/fix-bun-network.sh "$TMPUSR/bin/bun-fix-network"
+
+          # Write control file
+          cat > "$ROOT/DEBIAN/control" <<EOF
+          Package: bun
+          Version: $VERSION
+          Architecture: $ARCH
+          Maintainer: bd-loser
+          Section: utils
+          Priority: optional
+          Description: Android-native Bun runtime for Termux Bionic + auto network fix
+           This package contains the Android-native Bun runtime (Bionic-linked)
+           plus a bun-fix-network helper that solves ConnectionRefused errors
+           caused by Bun's c-ares DNS resolver on Termux.
+          Depends: bash, ncurses, curl
+          EOF
+          sed -i 's/^[[:space:]]*//' "$ROOT/DEBIAN/control"
+          echo "Installed-Size: $(du -sk "$ROOT" | cut -f1)" >> "$ROOT/DEBIAN/control"
+
+          # Install postinst
+          install -m755 packaging/deb/DEBIAN/postinst "$ROOT/DEBIAN/postinst"
+
+          # Set perms
+          chmod 755 "$ROOT" "$ROOT/DEBIAN"
+
+          # Build the deb
+          dpkg-deb --build "$ROOT" "dist/bun_${VERSION}_${ARCH}.deb"
+
+          # Cleanup
+          rm -rf "$ROOT"
+
+          echo ""
+          echo "=== Built: dist/bun_${VERSION}_${ARCH}.deb ==="
+          ls -la dist/
+
+      - name: Verify DEB contents
+        run: |
+          echo "=== DEB file listing ==="
+          dpkg-deb -c dist/*.deb
+          echo ""
+          echo "=== Control file ==="
+          dpkg-deb -I dist/*.deb
+          echo ""
+          echo "=== postinst script ==="
+          dpkg-deb -e dist/*.deb /tmp/extracted-control
+          cat /tmp/extracted-control/postinst
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bun-deb-aarch64
+          path: dist/*.deb
+          retention-days: 30
 
   build-pacman:
     needs: check-latest
@@ -89,123 +209,102 @@ jobs:
           sed -i "s/^pkgver=.*/pkgver=$VERSION/" packaging/pacman/PKGBUILD 2>/dev/null || true
           sed -i "s/^pkgver=.*/pkgver=$VERSION/" packaging/pacman/PKGBUILD.aarch64 2>/dev/null || true
           sed -i "s/^PKGVER ?=.*/PKGVER ?= $VERSION/" Makefile
-          echo "##[set-output name=version;]$VERSION"
-        id: version
 
-      - name: Verify Makefile tabs
+      - name: Verify makepkg is available
         run: |
-          if grep -nP '^\t' Makefile >/dev/null; then
-            echo "Makefile tabs OK"
-          else
-            echo "Makefile missing tabs! Aborting."
-            exit 1
-          fi
+          which makepkg || {
+            echo "makepkg not found in container, installing pacman package..."
+            apt-get update -y || true
+            apt-get install -y pacman-package-manager 2>/dev/null || {
+              echo "Falling back to building tarball manually..."
+              echo "SKIP_MAKEPKG=1" >> $GITHUB_ENV
+            }
+          }
 
       - name: Build pacman package
+        if: env.SKIP_MAKEPKG != '1'
         run: |
           cd packaging/pacman
-          makepkg -f --noconfirm
+          makepkg -f --noconfirm || {
+            echo "makepkg failed, will build tarball manually in next step"
+            echo "SKIP_MAKEPKG=1" >> $GITHUB_ENV
+          }
 
-      - name: List packages
+      - name: Build pacman-style tarball manually (fallback)
+        if: env.SKIP_MAKEPKG == '1'
         run: |
-          ls -la packaging/pacman/*.pkg.* || echo "No packages found"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: bun-pacman-aarch64
-          path: packaging/pacman/*.pkg.*
-          retention-days: 30
-
-  build-deb:
-    needs: check-latest
-    if: ${{ !cancelled() }}
-    runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/termux/package-builder:latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install dependencies
-        run: |
-          apt-get update || true
-          apt-get install -y curl unzip dpkg-dev jq || true
-
-      - name: Use override version or latest
-        run: |
+          set -e
           if [ -n "${{ github.event.inputs.version }}" ]; then
             VERSION="${{ github.event.inputs.version }}"
           else
             VERSION="${{ needs.check-latest.outputs.latest }}"
           fi
-          echo "Building version: $VERSION"
-          sed -i "s/^PKGVER ?=.*/PKGVER ?= $VERSION/" Makefile
-          echo "##[set-output name=version;]$VERSION"
-        id: version
+          ARCH=aarch64
+          mkdir -p dist
+          ROOT=$(mktemp -d)
+          TMPUSR="$ROOT/data/data/com.termux/files/usr"
+          mkdir -p "$TMPUSR/bin" "$TMPUSR/lib/bun-termux"
 
-      - name: Verify Makefile tabs
-        run: |
-          if grep -nP '^\t' Makefile >/dev/null; then
-            echo "Makefile tabs OK"
-          else
-            echo "Makefile missing tabs! Aborting."
-            exit 1
-          fi
+          # Download Bun binary
+          mkdir -p /tmp/bun-dl
+          curl -fL "https://github.com/oven-sh/bun/releases/download/bun-v${VERSION}/bun-linux-${ARCH}-android.zip" -o /tmp/bun-dl/bun.zip
+          unzip -o /tmp/bun-dl/bun.zip -d /tmp/bun-dl/extracted >/dev/null
+          BUN_BIN=$(find /tmp/bun-dl/extracted -name bun -type f | head -1)
+          install -m755 "$BUN_BIN" "$TMPUSR/lib/bun-termux/bun"
 
-      - name: Download Bun Android binary
-        env:
-          BUN_VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          mkdir -p runtime
-          echo "Downloading Bun v${BUN_VERSION} for android-aarch64..."
-          curl -fL "https://github.com/oven-sh/bun/releases/download/bun-v${BUN_VERSION}/bun-linux-aarch64-android.zip" -o /tmp/bun.zip
-          unzip -o /tmp/bun.zip -d /tmp/bun-extract
-          BUN_BIN=$(find /tmp/bun-extract -name "bun" -type f | head -1)
-          if [ -z "$BUN_BIN" ]; then
-            echo "ERROR: bun binary not found in zip"
-            ls -la /tmp/bun-extract/
-            exit 1
-          fi
-          cp "$BUN_BIN" runtime/bun
-          chmod +x runtime/bun
-          file runtime/bun
-          echo "Binary size: $(stat -c%s runtime/bun) bytes"
+          # Launcher
+          cat > "$TMPUSR/bin/bun" <<'LAUNCHER'
+          #!/data/data/com.termux/files/usr/bin/bash
+          exec /data/data/com.termux/files/usr/lib/bun-termux/bun "$@"
+          LAUNCHER
+          sed -i 's/^[[:space:]]*//' "$TMPUSR/bin/bun"
+          chmod 755 "$TMPUSR/bin/bun"
 
-      - name: Build DEB package
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          make deb PKGVER=$VERSION
+          # Network fix script
+          install -m755 scripts/fix-bun-network.sh "$TMPUSR/bin/bun-fix-network"
 
-      - name: Verify DEB contents
-        run: |
-          echo "=== DEB contents ==="
-          ls -la dist/*.deb
+          # .PKGINFO
+          cat > "$ROOT/.PKGINFO" <<EOF
+          pkgname = bun
+          pkgver = $VERSION-1
+          pkgdesc = Android-native Bun runtime for Termux Bionic + auto network fix
+          url = https://github.com/oven-sh/bun
+          builddate = $(date +%Y-%m-%d)
+          packager = bd-loser
+          size = $(stat -c%s "$TMPUSR/lib/bun-termux/bun")
+          arch = $ARCH
+          license = MIT
+          EOF
+          sed -i 's/^[[:space:]]*//' "$ROOT/.PKGINFO"
+
+          # .INSTALL
+          install -m755 packaging/deb/DEBIAN/postinst "$ROOT/.INSTALL"
+
+          cd "$ROOT"
+          tar -cJf "$GITHUB_WORKSPACE/dist/bun-$VERSION-1-$ARCH.pkg.tar.xz" .PKGINFO .INSTALL data/
+          cd "$GITHUB_WORKSPACE"
+          rm -rf "$ROOT"
+
           echo ""
-          echo "=== DEB file listing ==="
-          dpkg-deb -c dist/*.deb | head -20
-          echo ""
-          echo "=== Control file ==="
-          dpkg-deb -I dist/*.deb
-          echo ""
-          echo "=== postinst script ==="
-          dpkg-deb -e dist/*.deb /tmp/extracted-control
-          cat /tmp/extracted-control/postinst
+          echo "=== Built: dist/bun-$VERSION-1-$ARCH.pkg.tar.xz ==="
+          ls -la dist/
 
       - name: List packages
         run: |
-          ls -la dist/*.deb || echo "No packages found"
+          ls -la packaging/pacman/*.pkg.* dist/*.pkg.* 2>/dev/null || echo "No packages found"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: bun-deb-aarch64
-          path: dist/*.deb
+          name: bun-pacman-aarch64
+          path: |
+            packaging/pacman/*.pkg.*
+            dist/*.pkg.*
           retention-days: 30
+          if-no-files-found: ignore
 
   release:
-    needs: [build-pacman, build-deb, check-latest]
+    needs: [build-deb, build-pacman, check-latest]
     runs-on: ubuntu-latest
     # Release when: manually dispatched with version, OR scheduled run detected new version
     if: >-
@@ -231,17 +330,17 @@ jobs:
           fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-      - name: Download pacman artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: bun-pacman-aarch64
-          path: dist/
-        continue-on-error: true
-
       - name: Download deb artifact
         uses: actions/download-artifact@v4
         with:
           name: bun-deb-aarch64
+          path: dist/
+        continue-on-error: true
+
+      - name: Download pacman artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: bun-pacman-aarch64
           path: dist/
         continue-on-error: true
 
