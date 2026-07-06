@@ -39,131 +39,39 @@ jobs:
             libssl-dev libcurl4-openssl-dev \
             golang-go ruby-full \
             xz-utils unzip jq python3 \
-            ccache \
-            lsb-release software-properties-common gnupg
-
-      - name: Install LLVM 21 (Bun requires exactly 21.1.x)
-        run: |
-          # Bun's build system enforces LLVM 21.1.0-21.1.99
-          # Add the official LLVM apt repository
-          wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo gpg --dearmor -o /usr/share/keyrings/llvm-archive-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/llvm-archive-keyring.gpg] http://apt.llvm.org/$(lsb_release -cs)/ llvm-toolchain-$(lsb_release -cs)-21 main" | sudo tee /etc/apt/sources.list.d/llvm.list
-          sudo apt-get update -y
-          sudo apt-get install -y \
-            llvm-21 \
-            clang-21 \
-            lld-21 \
-            libclang-21-dev \
-            libpolly-21-dev
-          # Set as default
-          sudo update-alternatives --install /usr/bin/clang clang /usr/bin/clang-21 100
-          sudo update-alternatives --install /usr/bin/clang++ clang++ /usr/bin/clang++-21 100
-          sudo update-alternatives --install /usr/bin/llvm-config llvm-config /usr/bin/llvm-config-21 100
-          sudo update-alternatives --install /usr/bin/lld lld /usr/bin/lld-21 100
-          clang --version
+            ccache
 
       - name: Install Rust nightly
         uses: dtolnay/rust-toolchain@nightly
-        # Note: we don't install the aarch64-unknown-linux-android target
-        # because Rust doesn't distribute rust-std for Android nightlies.
-        # Bun's build system uses Zig for cross-compilation, not Rust's
-        # own cross-compile, so the host Rust toolchain is sufficient.
 
-      - name: Install Android NDK (kept for shim build)
+      - name: Install Android NDK (provides clang 18 for cross-compilation)
         uses: nttld/setup-ndk@v1
         id: setup_ndk
         with:
           ndk-version: r27c
           add-to-path: true
 
-      - name: Link NDK builtins + libc++ to LLVM 21 lib dir (fixes link errors)
+      - name: Make NDK clang the default (patches tools.ts to accept v18)
         env:
           NDK_ROOT: ${{ steps.setup_ndk.outputs.ndk-path }}
         run: |
-          # Two link issues to fix:
-          # 1. libclang_rt.builtins.a — LLVM 21 doesn't have Android builtins
-          # 2. libc++_static.a + libc++abi.a — WebKit prebuilt uses __ndk1 ABI
-          #    (NDK's libc++), but LLVM 21's clang++ looks in its own lib dir
-          echo "NDK root: $NDK_ROOT"
-          echo ""
-
-          # ─── Fix 1: libclang_rt.builtins.a ────────────────────────────────
-          echo "=== Searching for libclang_rt.builtins.a in NDK ==="
-          find "$NDK_ROOT" -name "libclang_rt.builtins.a" 2>/dev/null || true
-          NDK_BUILTINS_DIR=$(find "$NDK_ROOT" -name "libclang_rt.builtins.a" -path "*aarch64*" -exec dirname {} \; 2>/dev/null | head -1)
-          echo "NDK aarch64 builtins dir: $NDK_BUILTINS_DIR"
-
-          # ─── Fix 2: libc++_static.a + libc++abi.a ─────────────────────────
-          echo ""
-          echo "=== Searching for libc++_static.a in NDK ==="
-          find "$NDK_ROOT" -name "libc++_static.a" 2>/dev/null || true
-          NDK_LIBCXX_DIR=$(find "$NDK_ROOT" -name "libc++_static.a" -path "*arm64*" -exec dirname {} \; 2>/dev/null | head -1)
-          echo "NDK libc++ dir: $NDK_LIBCXX_DIR"
-
-          echo ""
-          echo "=== Searching for libc++abi.a in NDK ==="
-          find "$NDK_ROOT" -name "libc++abi.a" 2>/dev/null || true
-          NDK_LIBCXXABI_DIR=$(find "$NDK_ROOT" -name "libc++abi.a" -path "*arm64*" -exec dirname {} \; 2>/dev/null | head -1)
-          echo "NDK libc++abi dir: $NDK_LIBCXXABI_DIR"
-
-          # ─── Symlink everything to LLVM 21's lib dir ─────────────────────
-          LLVM_LIB="/usr/lib/llvm-21/lib/clang/21/lib"
-          TARGET_DIR="$LLVM_LIB/aarch64-unknown-linux-android28"
-          sudo mkdir -p "$TARGET_DIR"
-
-          # Symlink builtins
-          if [ -n "$NDK_BUILTINS_DIR" ]; then
-            for f in "$NDK_BUILTINS_DIR"/*.a; do
-              sudo ln -sf "$f" "$TARGET_DIR/$(basename "$f")"
-            done
-          fi
-
-          # Symlink libc++_static.a and libc++abi.a
-          if [ -n "$NDK_LIBCXX_DIR" ]; then
-            sudo ln -sf "$NDK_LIBCXX_DIR/libc++_static.a" "$TARGET_DIR/libc++_static.a"
-            sudo ln -sf "$NDK_LIBCXX_DIR/libc++abi.a" "$TARGET_DIR/libc++abi.a" 2>/dev/null || true
-          fi
-          if [ -n "$NDK_LIBCXXABI_DIR" ]; then
-            sudo ln -sf "$NDK_LIBCXXABI_DIR/libc++abi.a" "$TARGET_DIR/libc++abi.a" 2>/dev/null || true
-          fi
-
-          # Also symlink to LLVM 21's main lib dir (where clang looks for -lc++)
-          # AND replace LLVM 21's own libc++_static.a with NDK's (which has __ndk1 symbols)
-          LLVM_MAIN_LIB="/usr/lib/llvm-21/lib"
-          if [ -n "$NDK_LIBCXX_DIR" ]; then
-            # Find LLVM 21's existing libc++_static.a and back it up, then symlink NDK's
-            LLVM_LIBCXX_STATIC=$(find "$LLVM_MAIN_LIB" -name "libc++_static.a" 2>/dev/null | head -1)
-            if [ -n "$LLVM_LIBCXX_STATIC" ]; then
-              echo "Backing up LLVM 21's libc++_static.a and replacing with NDK's"
-              sudo mv "$LLVM_LIBCXX_STATIC" "${LLVM_LIBCXX_STATIC}.bak" 2>/dev/null || true
-              sudo ln -sf "$NDK_LIBCXX_DIR/libc++_static.a" "$LLVM_LIBCXX_STATIC"
-            fi
-            # Same for libc++abi.a
-            LLVM_LIBCXXABI=$(find "$LLVM_MAIN_LIB" -name "libc++abi.a" 2>/dev/null | head -1)
-            if [ -n "$LLVM_LIBCXXABI" ]; then
-              sudo mv "$LLVM_LIBCXXABI" "${LLVM_LIBCXXABI}.bak" 2>/dev/null || true
-              sudo ln -sf "$NDK_LIBCXX_DIR/libc++abi.a" "$LLVM_LIBCXXABI" 2>/dev/null || true
-            fi
-            if [ -n "$NDK_LIBCXXABI_DIR" ]; then
-              sudo ln -sf "$NDK_LIBCXXABI_DIR/libc++abi.a" "$LLVM_LIBCXXABI" 2>/dev/null || true
-            fi
-          fi
-
-          # Also add the NDK's lib dir to the link path via LDFLAGS
-          # The NDK's libc++ is in the sysroot at usr/lib/aarch64-linux-android/28/
-          NDK_SYSROOT_LIB="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/28"
-          echo ""
-          echo "=== NDK sysroot lib dir ==="
-          ls -la "$NDK_SYSROOT_LIB/" 2>/dev/null | head -10 || echo "Not found at $NDK_SYSROOT_LIB"
-
-          echo ""
-          echo "=== Verify all symlinks ==="
-          ls -la "$TARGET_DIR/"
-          echo ""
-          echo "=== Key files exist? ==="
-          ls -la "$TARGET_DIR/libclang_rt.builtins.a" 2>/dev/null || echo "MISSING: builtins"
-          ls -la "$TARGET_DIR/libc++_static.a" 2>/dev/null || echo "MISSING: libc++_static"
-          ls -la "$TARGET_DIR/libc++abi.a" 2>/dev/null || echo "MISSING: libc++abi"
+          # The patches/tools.ts patch lowers the clang version requirement
+          # from 21.1.x to 18.0.x and adds the NDK's bin dir to search paths.
+          # Make NDK clang available as 'clang' and 'clang++' on PATH.
+          NDK_BIN="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          echo "NDK bin: $NDK_BIN"
+          ls "$NDK_BIN/" | grep -E "^clang" | head -5
+          # The NDK ships aarch64-linux-android28-clang and clang (host)
+          # Symlink NDK's host clang to /usr/local/bin
+          sudo ln -sf "$NDK_BIN/clang" /usr/local/bin/clang
+          sudo ln -sf "$NDK_BIN/clang++" /usr/local/bin/clang++
+          sudo ln -sf "$NDK_BIN/llvm-ar" /usr/local/bin/llvm-ar
+          sudo ln -sf "$NDK_BIN/llvm-ranlib" /usr/local/bin/llvm-ranlib
+          sudo ln -sf "$NDK_BIN/ld.lld" /usr/local/bin/ld.lld
+          sudo ln -sf "$NDK_BIN/llvm-strip" /usr/local/bin/llvm-strip
+          # Verify
+          clang --version
+          clang++ --version
 
       - name: Clone Bun source
         env:
@@ -186,6 +94,7 @@ jobs:
           grep -n "ANDROID_SELINUX_FIX_PATCH" /tmp/bun-src/src/bun.zig
           grep -n "ANDROID_SELINUX_FIX_PATCH" /tmp/bun-src/src/cli/run_command.zig
           grep -n "ANDROID_SELINUX_FIX_PATCH" /tmp/bun-src/scripts/build/flags.ts
+          grep -n "ANDROID_SELINUX_FIX_PATCH" /tmp/bun-src/scripts/build/tools.ts
 
       - name: Install Bun for bootstrapping
         env:

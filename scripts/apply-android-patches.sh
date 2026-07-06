@@ -215,12 +215,30 @@ else
         echo "  [skip] $FLAGS_TS already patched"
     else
         echo "  [patch] $FLAGS_TS: fix cross-compile CPU flags"
-        # Replace 'armv8-a+crc' with 'armv8-a' and remove mtune for cross-compile
-        # The +crc feature syntax isn't recognized by clang when cross-compiling
-        # from x86_64 to aarch64. Using plain armv8-a works universally.
         sed -i 's/"-march=armv8-a+crc"/"-march=armv8-a"/g' "$FLAGS_TS"
-        # Also add marker
         sed -i '1i // ANDROID_SELINUX_FIX_PATCH: simplified march flags for cross-compile' "$FLAGS_TS"
         echo "  [ok] patched flags.ts — removed +crc feature flag"
+    fi
+fi
+
+# ─── Patch 4: scripts/build/tools.ts — allow NDK clang 18 (ABI fix) ──────
+TOOLS_TS="scripts/build/tools.ts"
+if [ ! -f "$TOOLS_TS" ]; then
+    echo "  [warn] $TOOLS_TS not found (skipping clang version patch)"
+else
+    if grep -q "ANDROID_SELINUX_FIX_PATCH" "$TOOLS_TS" 2>/dev/null; then
+        echo "  [skip] $TOOLS_TS already patched"
+    else
+        echo "  [patch] $TOOLS_TS: lower clang version requirement to 18 (NDK r27c)"
+        # Bun requires clang 21.1.x, but NDK r27c ships clang 18.
+        # Using NDK's clang for everything ensures ABI consistency:
+        # both Bun's C++ code and WebKit prebuilt use std::__ndk1 namespace.
+        # Mixing LLVM 21 (std::__1) with WebKit (__ndk1) causes link failures.
+        sed -i 's/export const LLVM_VERSION = "21.1.8";/export const LLVM_VERSION = "18.0.3"; \/\/ ANDROID_SELINUX_FIX_PATCH: NDK r27c clang/' "$TOOLS_TS"
+        sed -i 's/const LLVM_MAJOR = "21";/const LLVM_MAJOR = "18"; \/\/ ANDROID_SELINUX_FIX_PATCH/' "$TOOLS_TS"
+        sed -i 's/const LLVM_MINOR = "1";/const LLVM_MINOR = "0"; \/\/ ANDROID_SELINUX_FIX_PATCH/' "$TOOLS_TS"
+        # Add NDK clang path to search paths (after existing paths)
+        sed -i 's|paths.push(`/usr/lib/llvm-${LLVM_MAJOR}.${LLVM_MINOR}.0/bin`);|paths.push(`/usr/lib/llvm-${LLVM_MAJOR}.${LLVM_MINOR}.0/bin`);\n    // ANDROID_SELINUX_FIX_PATCH: NDK clang\n    paths.push(`${process.env.ANDROID_NDK_HOME \|\| process.env.ANDROID_NDK_ROOT \|\| "/opt/android-ndk"}/toolchains/llvm/prebuilt/linux-x86_64/bin`);|' "$TOOLS_TS"
+        echo "  [ok] patched tools.ts — clang 18 + NDK search path"
     fi
 fi
