@@ -203,3 +203,22 @@ fi
 echo ""
 echo "=== Patches applied successfully ==="
 echo "Verify with: grep -n 'ANDROID_SELINUX_FIX_PATCH' src/bun.zig src/cli/run_command.zig"
+
+# ─── Patch 3: scripts/build/flags.ts — fix cross-compile CPU flags ────────
+FLAGS_TS="scripts/build/flags.ts"
+if [ ! -f "$FLAGS_TS" ]; then
+    echo "  [warn] $FLAGS_TS not found (skipping CPU flag patch)"
+else
+    if grep -q "ANDROID_SELINUX_FIX_PATCH" "$FLAGS_TS" 2>/dev/null; then
+        echo "  [skip] $FLAGS_TS already patched"
+    else
+        echo "  [patch] $FLAGS_TS: fix cross-compile CPU flags"
+        # Replace 'armv8-a+crc' with 'armv8-a' and remove mtune for cross-compile
+        # The +crc feature syntax isn't recognized by clang when cross-compiling
+        # from x86_64 to aarch64. Using plain armv8-a works universally.
+        sed -i 's/"-march=armv8-a+crc"/"-march=armv8-a"/g' "$FLAGS_TS"
+        # Also add marker
+        sed -i '1i // ANDROID_SELINUX_FIX_PATCH: simplified march flags for cross-compile' "$FLAGS_TS"
+        echo "  [ok] patched flags.ts — removed +crc feature flag"
+    fi
+fi
