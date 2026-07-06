@@ -38,6 +38,7 @@ with open("src/bun.zig", "r") as f:
     content = f.read()
 
 # Patch openDirForIteration: wrap the openatA call to handle EACCES
+# Note: Zig's os.linux.E enum uses .ACCES (not .EACCES)
 old1 = """pub fn openDirForIteration(dir: FD, path_: []const u8) sys.Maybe(FD) {
     if (comptime Environment.isWindows) {
         return sys.openDirAtWindowsA(dir, path_, .{ .iterable = true, .can_rename_or_delete = false, .read_only = true });
@@ -56,7 +57,7 @@ new1 = """pub fn openDirForIteration(dir: FD, path_: []const u8) sys.Maybe(FD) {
         return sys.openDirAtWindowsA(dir, path_, .{ .iterable = true, .can_rename_or_delete = false, .read_only = true });
     }
     const result = sys.openatA(dir, path_, O.DIRECTORY | O.CLOEXEC | O.RDONLY, 0);
-    if (result == .err and result.err.getErrno() == .EACCES) {
+    if (result == .err and result.err.getErrno() == .ACCES) {
         // Retry without O_DIRECTORY — returns a regular fd that works with fstat
         return sys.openatA(dir, path_, O.CLOEXEC | O.RDONLY, 0);
     }
@@ -86,7 +87,7 @@ new2 = """pub fn openDirAbsolute(path_: []const u8) !std.fs.Dir {
         try sys.openDirAtWindowsA(invalid_fd, path_, .{ .iterable = true, .can_rename_or_delete = true, .read_only = true }).unwrap()
     else blk: {
         const result = sys.openA(path_, O.DIRECTORY | O.CLOEXEC | O.RDONLY, 0);
-        if (result == .err and result.err.getErrno() == .EACCES) {
+        if (result == .err and result.err.getErrno() == .ACCES) {
             break :blk sys.openA(path_, O.CLOEXEC | O.RDONLY, 0).unwrap();
         }
         break :blk result.unwrap();
@@ -117,7 +118,7 @@ new3 = """pub fn openDirAbsoluteNotForDeletingOrRenaming(path_: []const u8) !std
         try sys.openDirAtWindowsA(invalid_fd, path_, .{ .iterable = true, .can_rename_or_delete = false, .read_only = true }).unwrap()
     else blk: {
         const result = sys.openA(path_, O.DIRECTORY | O.CLOEXEC | O.RDONLY, 0);
-        if (result == .err and result.err.getErrno() == .EACCES) {
+        if (result == .err and result.err.getErrno() == .ACCES) {
             break :blk sys.openA(path_, O.CLOEXEC | O.RDONLY, 0).unwrap();
         }
         break :blk result.unwrap();
@@ -179,10 +180,11 @@ new = """        // ANDROID_SELINUX_FIX_PATCH
             Output.flush();
             return err;
         } orelse blk: {
-            // Retry with "." (current directory) — bypasses the directory walk
-            if (this_transpiler.resolver.readDirInfo(".")) |cwd_info| {
+            // Retry with "." (current directory) — bypasses the directory walk.
+            // readDirInfo returns !?*DirInfo; catch null converts errors to null.
+            if (this_transpiler.resolver.readDirInfo(".") catch null) |cwd_info| {
                 break :blk cwd_info;
-            } else |_| {}
+            }
             ctx.log.print(Output.errorWriter()) catch {};
             Output.prettyErrorln("error loading current directory", .{});
             Output.flush();
