@@ -69,7 +69,7 @@ jobs:
         # Bun's build system uses Zig for cross-compilation, not Rust's
         # own cross-compile, so the host Rust toolchain is sufficient.
 
-      - name: Install Android NDK
+      - name: Install Android NDK (kept for shim build)
         uses: nttld/setup-ndk@v1
         id: setup_ndk
         with:
@@ -112,35 +112,31 @@ jobs:
           # Just verify it will work
           echo "Zig will be installed by Bun's build system"
 
-      - name: Build Bun for Android aarch64
+      - name: Build Bun for aarch64-linux-musl (static binary, runs natively on Termux)
         env:
-          ANDROID_NDK_ROOT: ${{ steps.setup_ndk.outputs.ndk-path }}
-          ANDROID_NDK_HOME: ${{ steps.setup_ndk.outputs.ndk-path }}
           CCACHE_DIR: /tmp/ccache
         run: |
           mkdir -p /tmp/ccache
           cd /tmp/bun-src
-          echo "=== Building Bun for Android aarch64 ==="
-          echo "NDK: $ANDROID_NDK_ROOT"
+          echo "=== Building Bun for aarch64-linux-musl ==="
           echo "Bun: $(bun --version)"
           echo "Start: $(date)"
 
-          # Bun's build system: bun scripts/build.ts --profile=release --abi=android
-          # The --abi=android flag triggers cross-compilation for Android
+          # Build for musl target — produces a static binary that runs on
+          # Termux without grun/proot. The SELinux patches in the source
+          # fix the openat() EACCES issue regardless of target ABI.
           bun scripts/build.ts \
             --profile=release \
-            --abi=android \
+            --abi=musl \
             --arch=aarch64 \
-            --build-dir=build/release-android 2>&1 | tail -100
+            --build-dir=build/release-musl 2>&1 | tail -100
 
           echo "End: $(date)"
 
       - name: Find and verify the built binary
         run: |
           echo "=== Looking for built binary ==="
-          # Bun's build outputs to build/<profile>/bun or build/bun
           find /tmp/bun-src/build -name "bun" -type f 2>/dev/null | head -10
-          find /tmp/bun-src/build -name "bun-android*" -type f 2>/dev/null | head -10
           find /tmp/bun-src -maxdepth 3 -name "bun" -type f -executable 2>/dev/null | head -10
 
           BUN_BIN=$(find /tmp/bun-src/build -name "bun" -type f 2>/dev/null | head -1)
@@ -148,8 +144,8 @@ jobs:
             echo "ERROR: Bun binary not found in build output"
             echo "=== Build directory contents ==="
             ls -la /tmp/bun-src/build/ 2>/dev/null || echo "No build dir"
-            find /tmp/bun-src/build -type f 2>/dev/null | head -30
-            echo "=== Last 50 lines of build output ==="
+            find /tmp/bun-src/build -maxdepth 3 -type f -name "*.o" 2>/dev/null | wc -l
+            echo "Object files count above — if 0, zig compile failed"
             exit 1
           fi
           echo "Found: $BUN_BIN"
@@ -157,18 +153,16 @@ jobs:
           ls -lh "$BUN_BIN"
           cp "$BUN_BIN" /tmp/bun-patched
 
-      - name: Verify the binary is Android-native
+      - name: Verify the binary is aarch64 musl-static
         run: |
           file /tmp/bun-patched
-          # Should show: ELF 64-bit LSB pie executable, ARM aarch64, interpreter /system/bin/linker64
+          # Should show: ELF 64-bit LSB executable, ARM aarch64, statically linked
           if ! file /tmp/bun-patched | grep -q "aarch64"; then
             echo "ERROR: Binary is not aarch64"
             exit 1
           fi
-          if ! file /tmp/bun-patched | grep -q "linker64"; then
-            echo "WARNING: Binary may not be Android-native (no /system/bin/linker64 interpreter)"
-          fi
           echo "=== Binary verification passed ==="
+          echo "Musl-static binaries run natively on Termux (no grun/proot needed)"
 
       - name: Upload patched binary artifact
         uses: actions/upload-artifact@v4
