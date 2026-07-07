@@ -176,7 +176,7 @@ new = """        // ANDROID_SELINUX_FIX_PATCH
             const result = this_transpiler.resolver.readDirInfo(this_transpiler.fs.top_level_dir) catch |err| {
                 // Print to stderr so we can see what's happening
                 std.debug.print("readDirInfo threw: {s}\\n", .{@errorName(err)});
-                null;
+                @as(?*DirInfo, null)
             };
             if (result) |info| {
                 std.debug.print("readDirInfo returned non-null\\n", .{});
