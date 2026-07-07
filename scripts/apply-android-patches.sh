@@ -366,7 +366,8 @@ old2 = """                    const dir_result = std.fs.openDirAbsoluteZ(
 
 new2 = """                    // ANDROID_SELINUX_FIX_PATCH: catch AccessDenied (EACCES) and
                     // convert to FileNotFound so the walk treats it as "not found"
-                    // instead of propagating an error.
+                    // instead of propagating an error. This is handled by the
+                    // switch below which returns null for FileNotFound.
                     const dir_result = std.fs.openDirAbsoluteZ(
                         sentinel,
                         .{ .no_follow = !follow_symlinks, .iterate = true },
@@ -380,6 +381,18 @@ if old2 in content:
     print("  [ok] patched openDirAbsoluteZ to catch AccessDenied")
 else:
     print("  [warn] could not find openDirAbsoluteZ pattern")
+
+# Also add AccessDenied to the walk's error switch (line 2898)
+# so it returns null instead of propagating
+old3 = """                    error.ENOTDIR, error.IsDir, error.NotDir => return null,"""
+new3 = """                    // ANDROID_SELINUX_FIX_PATCH: AccessDenied (EACCES) on Android
+                    // SELinux should be treated as "not found" (return null)
+                    error.ENOTDIR, error.IsDir, error.NotDir, error.AccessDenied => return null,"""
+if old3 in content:
+    content = content.replace(old3, new3, 1)
+    print("  [ok] added AccessDenied to walk error switch")
+else:
+    print("  [warn] could not find walk error switch")
 
 with open("src/resolver/resolver.zig", "w") as f:
     f.write(content)
