@@ -170,14 +170,14 @@ old = """        const root_dir_info = this_transpiler.resolver.readDirInfo(this
 
 new = """        // ANDROID_SELINUX_FIX_PATCH
         // On Android, the directory walk may fail or return null.
-        // Debug: log what's happening so we can see the actual error.
+        // Use std.debug.print for debug output (always works in release).
         const root_dir_info: *DirInfo = blk: {
-            Output.debug("root_dir_info: top_level_dir={s}", .{this_transpiler.fs.top_level_dir});
+            std.debug.print("root_dir_info: top_level_dir={s}\\n", .{this_transpiler.fs.top_level_dir});
             const result = this_transpiler.resolver.readDirInfo(this_transpiler.fs.top_level_dir) catch |err| {
-                Output.debug("root_dir_info: readDirInfo threw: {s}", .{@errorName(err)});
+                std.debug.print("root_dir_info: readDirInfo threw: {s}\\n", .{@errorName(err)});
                 // Try cwd as fallback
                 if (this_transpiler.resolver.readDirInfo(".") catch null) |cwd_info| {
-                    Output.debug("root_dir_info: cwd fallback OK", .{});
+                    std.debug.print("root_dir_info: cwd fallback OK\\n", .{});
                     break :blk cwd_info;
                 }
                 if (!log_errors) return error.CouldntReadCurrentDirectory;
@@ -186,11 +186,11 @@ new = """        // ANDROID_SELINUX_FIX_PATCH
                 Output.flush();
                 return error.CouldntReadCurrentDirectory;
             };
-            Output.debug("root_dir_info: returned {s}", .{if (result != null) "non-null" else "null"});
+            std.debug.print("root_dir_info: returned {s}\\n", .{if (result != null) "non-null" else "null"});
             if (result) |info| break :blk info;
             // result is null — try cwd
             if (this_transpiler.resolver.readDirInfo(".") catch null) |cwd_info| {
-                Output.debug("root_dir_info: null→cwd fallback OK", .{});
+                std.debug.print("root_dir_info: null→cwd fallback OK\\n", .{});
                 break :blk cwd_info;
             }
             if (!log_errors) return error.CouldntReadCurrentDirectory;
@@ -231,8 +231,8 @@ with open("src/resolver/resolver.zig", "r") as f:
     content = f.read()
 
 # Patch the root_path: change from path[0..1] ("/") to a deeper path
-# that's accessible on Android. Use "/data/data" (10 chars) which is
-# the Termux app data root and is always accessible.
+# that's accessible on Android. Use "/data/data/com.termux" (the Termux
+# prefix, definitely accessible) when the path starts with it.
 old = """        const root_path = if (Environment.isWindows)
             bun.strings.withoutTrailingSlashWindowsPath(ResolvePath.windowsFilesystemRoot(path))
         else
@@ -242,11 +242,12 @@ old = """        const root_path = if (Environment.isWindows)
 
 new = """        // ANDROID_SELINUX_FIX_PATCH: On Android, SELinux blocks openat(O_DIRECTORY)
         // on / and /data/. The walk goes from cwd UP to root_path. If root_path is "/",
-        // the walk fails because / can't be opened. Use "/data/data" (accessible on
-        // Termux) as the walk root so the walk stops there instead of going to /.
-        // This is safe because package.json is never at / or /data/ on Termux.
+        // the walk fails because / can't be opened. Use the Termux prefix
+        // (/data/data/com.termux, 22 chars) as the walk root — it's always accessible.
         const root_path = if (Environment.isWindows)
             bun.strings.withoutTrailingSlashWindowsPath(ResolvePath.windowsFilesystemRoot(path))
+        else if (path.len >= 22 and strings.eql(path[0..22], "/data/data/com.termux"))
+            path[0..22]
         else if (path.len >= 10 and strings.eql(path[0..10], "/data/data"))
             path[0..10]
         else
