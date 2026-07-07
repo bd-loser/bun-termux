@@ -37,41 +37,128 @@ else
 with open("src/bun.zig", "r") as f:
     content = f.read()
 
-# Patch openDirForIteration: wrap the openatA call to handle EACCES
-# Note: Zig's os.linux.E enum uses .ACCES (not .EACCES)
-old1 = """pub fn openDirForIteration(dir: FD, path_: []const u8) sys.Maybe(FD) {
+patches_applied = 0
+
+# ─── Patch ALL openDir functions that use O.DIRECTORY ─────────────────────
+# There are 8 openDir functions in bun.zig. We must patch ALL of them
+# because different code paths (bun run vs bunx) use different functions.
+
+# 1. openDir (line 850) — uses sys.openat with O.DIRECTORY
+old = """pub fn openDir(dir: std.fs.Dir, path_: [:0]const u8) !std.fs.Dir {
+    if (comptime Environment.isWindows) {
+        const res = try sys.openDirAtWindowsA(.fromStdDir(dir), path_, .{ .iterable = true, .can_rename_or_delete = true, .read_only = true }).unwrap();
+        return res.stdDir();
+    } else {
+        const fd = try sys.openat(.fromStdDir(dir), path_, O.DIRECTORY | O.CLOEXEC | O.RDONLY, 0).unwrap();
+        return fd.stdDir();
+    }
+}"""
+new = """pub fn openDir(dir: std.fs.Dir, path_: [:0]const u8) !std.fs.Dir {
+    // ANDROID_SELINUX_FIX_PATCH
+    if (comptime Environment.isWindows) {
+        const res = try sys.openDirAtWindowsA(.fromStdDir(dir), path_, .{ .iterable = true, .can_rename_or_delete = true, .read_only = true }).unwrap();
+        return res.stdDir();
+    } else {
+        const result = sys.openat(.fromStdDir(dir), path_, O.DIRECTORY | O.CLOEXEC | O.RDONLY, 0);
+        if (result == .err and result.err.getErrno() == .ACCES) {
+            const fallback = try sys.openat(.fromStdDir(dir), path_, O.CLOEXEC | O.RDONLY, 0).unwrap();
+            return fallback.stdDir();
+        }
+        const fd = try result.unwrap();
+        return fd.stdDir();
+    }
+}"""
+if old in content:
+    content = content.replace(old, new, 1)
+    patches_applied += 1
+    print("  [ok] patched openDir")
+else:
+    print("  [warn] could not find openDir")
+
+# 2. openDirA (line 866) — uses sys.openatA with O.DIRECTORY
+old = """pub fn openDirA(dir: std.fs.Dir, path_: []const u8) !std.fs.Dir {
+    if (comptime Environment.isWindows) {
+        const res = try sys.openDirAtWindowsA(.fromStdDir(dir), path_, .{ .iterable = true, .can_rename_or_delete = true, .read_only = true }).unwrap();
+        return res.stdDir();
+    } else {
+        const fd = try sys.openatA(.fromStdDir(dir), path_, O.DIRECTORY | O.CLOEXEC | O.RDONLY, 0).unwrap();
+        return fd.stdDir();
+    }
+}"""
+new = """pub fn openDirA(dir: std.fs.Dir, path_: []const u8) !std.fs.Dir {
+    // ANDROID_SELINUX_FIX_PATCH
+    if (comptime Environment.isWindows) {
+        const res = try sys.openDirAtWindowsA(.fromStdDir(dir), path_, .{ .iterable = true, .can_rename_or_delete = true, .read_only = true }).unwrap();
+        return res.stdDir();
+    } else {
+        const result = sys.openatA(.fromStdDir(dir), path_, O.DIRECTORY | O.CLOEXEC | O.RDONLY, 0);
+        if (result == .err and result.err.getErrno() == .ACCES) {
+            const fallback = try sys.openatA(.fromStdDir(dir), path_, O.CLOEXEC | O.RDONLY, 0).unwrap();
+            return fallback.stdDir();
+        }
+        const fd = try result.unwrap();
+        return fd.stdDir();
+    }
+}"""
+if old in content:
+    content = content.replace(old, new, 1)
+    patches_applied += 1
+    print("  [ok] patched openDirA")
+else:
+    print("  [warn] could not find openDirA")
+
+# 3. openDirForIteration (line 876) — already patched, but re-check
+old = """pub fn openDirForIteration(dir: FD, path_: []const u8) sys.Maybe(FD) {
     if (comptime Environment.isWindows) {
         return sys.openDirAtWindowsA(dir, path_, .{ .iterable = true, .can_rename_or_delete = false, .read_only = true });
     }
     return sys.openatA(dir, path_, O.DIRECTORY | O.CLOEXEC | O.RDONLY, 0);
 }"""
-
-new1 = """pub fn openDirForIteration(dir: FD, path_: []const u8) sys.Maybe(FD) {
+new = """pub fn openDirForIteration(dir: FD, path_: []const u8) sys.Maybe(FD) {
     // ANDROID_SELINUX_FIX_PATCH
-    // On Android, SELinux blocks openat(O_DIRECTORY) on / and /data/ for
-    // untrusted_app contexts. When EACCES is returned, retry without O_DIRECTORY.
-    // The resulting fd won't support readdir (ENOTDIR), so the resolver treats
-    // the directory as empty — correct for / and /data/ which don't contain
-    // package.json or node_modules. Safe on all platforms (only triggers on EACCES).
     if (comptime Environment.isWindows) {
         return sys.openDirAtWindowsA(dir, path_, .{ .iterable = true, .can_rename_or_delete = false, .read_only = true });
     }
     const result = sys.openatA(dir, path_, O.DIRECTORY | O.CLOEXEC | O.RDONLY, 0);
     if (result == .err and result.err.getErrno() == .ACCES) {
-        // Retry without O_DIRECTORY — returns a regular fd that works with fstat
         return sys.openatA(dir, path_, O.CLOEXEC | O.RDONLY, 0);
     }
     return result;
 }"""
-
-if old1 in content:
-    content = content.replace(old1, new1, 1)
+if old in content:
+    content = content.replace(old, new, 1)
+    patches_applied += 1
     print("  [ok] patched openDirForIteration")
 else:
-    print("  [warn] could not find openDirForIteration pattern")
+    print("  [skip] openDirForIteration already patched")
 
-# Patch openDirAbsolute: same EACCES fallback
-old2 = """pub fn openDirAbsolute(path_: []const u8) !std.fs.Dir {
+# 4. openDirForIterationOSPath (line 883) — uses sys.openatA with O.DIRECTORY
+old = """pub fn openDirForIterationOSPath(dir: FD, path_: []const OSPathChar) sys.Maybe(FD) {
+    if (comptime Environment.isWindows) {
+        return sys.openDirAtWindows(dir, path_, .{ .iterable = true, .can_rename_or_delete = false, .read_only = true });
+    }
+    return sys.openatA(dir, path_, O.DIRECTORY | O.CLOEXEC | O.RDONLY, 0);
+}"""
+new = """pub fn openDirForIterationOSPath(dir: FD, path_: []const OSPathChar) sys.Maybe(FD) {
+    // ANDROID_SELINUX_FIX_PATCH
+    if (comptime Environment.isWindows) {
+        return sys.openDirAtWindows(dir, path_, .{ .iterable = true, .can_rename_or_delete = false, .read_only = true });
+    }
+    const result = sys.openatA(dir, path_, O.DIRECTORY | O.CLOEXEC | O.RDONLY, 0);
+    if (result == .err and result.err.getErrno() == .ACCES) {
+        return sys.openatA(dir, path_, O.CLOEXEC | O.RDONLY, 0);
+    }
+    return result;
+}"""
+if old in content:
+    content = content.replace(old, new, 1)
+    patches_applied += 1
+    print("  [ok] patched openDirForIterationOSPath")
+else:
+    print("  [warn] could not find openDirForIterationOSPath")
+
+# 5. openDirAbsolute (line 890)
+old = """pub fn openDirAbsolute(path_: []const u8) !std.fs.Dir {
     const fd = if (comptime Environment.isWindows)
         try sys.openDirAtWindowsA(invalid_fd, path_, .{ .iterable = true, .can_rename_or_delete = true, .read_only = true }).unwrap()
     else
@@ -79,10 +166,8 @@ old2 = """pub fn openDirAbsolute(path_: []const u8) !std.fs.Dir {
 
     return fd.stdDir();
 }"""
-
-new2 = """pub fn openDirAbsolute(path_: []const u8) !std.fs.Dir {
+new = """pub fn openDirAbsolute(path_: []const u8) !std.fs.Dir {
     // ANDROID_SELINUX_FIX_PATCH
-    // Same EACCES fallback as openDirForIteration — retry without O_DIRECTORY
     const fd = if (comptime Environment.isWindows)
         try sys.openDirAtWindowsA(invalid_fd, path_, .{ .iterable = true, .can_rename_or_delete = true, .read_only = true }).unwrap()
     else blk: {
@@ -95,15 +180,15 @@ new2 = """pub fn openDirAbsolute(path_: []const u8) !std.fs.Dir {
 
     return fd.stdDir();
 }"""
-
-if old2 in content:
-    content = content.replace(old2, new2, 1)
+if old in content:
+    content = content.replace(old, new, 1)
+    patches_applied += 1
     print("  [ok] patched openDirAbsolute")
 else:
-    print("  [warn] could not find openDirAbsolute pattern")
+    print("  [skip] openDirAbsolute already patched")
 
-# Also patch openDirAbsoluteNotForDeletingOrRenaming
-old3 = """pub fn openDirAbsoluteNotForDeletingOrRenaming(path_: []const u8) !std.fs.Dir {
+# 6. openDirAbsoluteNotForDeletingOrRenaming (line 899)
+old = """pub fn openDirAbsoluteNotForDeletingOrRenaming(path_: []const u8) !std.fs.Dir {
     const fd = if (comptime Environment.isWindows)
         try sys.openDirAtWindowsA(invalid_fd, path_, .{ .iterable = true, .can_rename_or_delete = false, .read_only = true }).unwrap()
     else
@@ -111,8 +196,7 @@ old3 = """pub fn openDirAbsoluteNotForDeletingOrRenaming(path_: []const u8) !std
 
     return fd.stdDir();
 }"""
-
-new3 = """pub fn openDirAbsoluteNotForDeletingOrRenaming(path_: []const u8) !std.fs.Dir {
+new = """pub fn openDirAbsoluteNotForDeletingOrRenaming(path_: []const u8) !std.fs.Dir {
     // ANDROID_SELINUX_FIX_PATCH
     const fd = if (comptime Environment.isWindows)
         try sys.openDirAtWindowsA(invalid_fd, path_, .{ .iterable = true, .can_rename_or_delete = false, .read_only = true }).unwrap()
@@ -126,13 +210,31 @@ new3 = """pub fn openDirAbsoluteNotForDeletingOrRenaming(path_: []const u8) !std
 
     return fd.stdDir();
 }"""
-
-if old3 in content:
-    content = content.replace(old3, new3, 1)
+if old in content:
+    content = content.replace(old, new, 1)
+    patches_applied += 1
     print("  [ok] patched openDirAbsoluteNotForDeletingOrRenaming")
 else:
-    print("  [warn] could not find openDirAbsoluteNotForDeletingOrRenaming pattern")
+    print("  [skip] openDirAbsoluteNotForDeletingOrRenaming already patched")
 
+# 7. openDirForPath (line 1913) — uses O.DIRECTORY | O_PATH
+old = """pub fn openDirForPath(file_path: [:0]const u8) !std.fs.Dir {
+    const flags: u32 = O.CLOEXEC | O.NOCTTY | O.DIRECTORY | O_PATH;"""
+new = """pub fn openDirForPath(file_path: [:0]const u8) !std.fs.Dir {
+    // ANDROID_SELINUX_FIX_PATCH
+    const flags: u32 = O.CLOEXEC | O.NOCTTY | O.DIRECTORY | O_PATH;"""
+# This one uses O_PATH which is different — just add comment for now
+# O_PATH doesn't actually open the directory, just creates a handle
+# It should work on Android. Skip if not found.
+if old in content:
+    # Don't change the flags, just mark it
+    content = content.replace(old, new, 1)
+    patches_applied += 1
+    print("  [ok] marked openDirForPath")
+else:
+    print("  [warn] could not find openDirForPath")
+
+print(f"  Total: {patches_applied} patches applied")
 with open("src/bun.zig", "w") as f:
     f.write(content)
 PYEOF
@@ -169,42 +271,25 @@ old = """        const root_dir_info = this_transpiler.resolver.readDirInfo(this
         };"""
 
 new = """        // ANDROID_SELINUX_FIX_PATCH
-        // On Android, readDirInfo fails because the directory walk hits
-        // SELinux-blocked paths. Create a minimal DirInfo instead.
+        // On Android, readDirInfo may return null when no package.json is
+        // found. Create a minimal DirInfo from the cwd instead of failing.
         const root_dir_info: *DirInfo = blk: {
-            // Try readDirInfo first
-            const result = this_transpiler.resolver.readDirInfo(this_transpiler.fs.top_level_dir) catch |err| blk2: {
-                Output.prettyErrorln("readDirInfo threw: {s}", .{@errorName(err)});
-                Output.flush();
-                break :blk2 @as(?*DirInfo, null);
-            };
-            if (result) |info| {
-                Output.prettyErrorln("readDirInfo returned non-null", .{});
-                Output.flush();
-                break :blk info;
-            }
-            Output.prettyErrorln("readDirInfo returned null, creating minimal DirInfo", .{});
-            Output.flush();
-            // Create a minimal DirInfo using a unique cache key
+            const result = this_transpiler.resolver.readDirInfo(this_transpiler.fs.top_level_dir) catch null;
+            if (result) |info| break :blk info;
+            // readDirInfo returned null — create a minimal DirInfo
             var unique_key_buf: [bun.MAX_PATH_BYTES + 1]u8 = undefined;
             const key_len = @min(this_transpiler.fs.top_level_dir.len, bun.MAX_PATH_BYTES);
             @memcpy(unique_key_buf[0..key_len], this_transpiler.fs.top_level_dir[0..key_len]);
             unique_key_buf[key_len] = 0;
             const unique_key = unique_key_buf[0..key_len + 1];
-            var cache_result = this_transpiler.resolver.dir_cache.getOrPut(unique_key) catch |err| {
-                Output.prettyErrorln("getOrPut threw: {s}", .{@errorName(err)});
-                Output.flush();
+            var cache_result = this_transpiler.resolver.dir_cache.getOrPut(unique_key) catch {
                 if (!log_errors) return error.CouldntReadCurrentDirectory;
                 ctx.log.print(Output.errorWriter()) catch {};
                 Output.prettyErrorln("error loading current directory", .{});
                 Output.flush();
                 return error.CouldntReadCurrentDirectory;
             };
-            Output.prettyErrorln("getOrPut OK, calling put", .{});
-            Output.flush();
-            break :blk this_transpiler.resolver.dir_cache.put(&cache_result, DirInfo{ .abs_path = this_transpiler.fs.top_level_dir }) catch |err| {
-                Output.prettyErrorln("put threw: {s}", .{@errorName(err)});
-                Output.flush();
+            break :blk this_transpiler.resolver.dir_cache.put(&cache_result, DirInfo{ .abs_path = this_transpiler.fs.top_level_dir }) catch {
                 if (!log_errors) return error.CouldntReadCurrentDirectory;
                 ctx.log.print(Output.errorWriter()) catch {};
                 Output.prettyErrorln("error loading current directory", .{});

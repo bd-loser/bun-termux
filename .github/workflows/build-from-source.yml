@@ -265,20 +265,32 @@ jobs:
             install -m755 dist/libbun-android-fix.so "$TMPUSR/lib/bun-termux/libbun-android-fix.so"
           fi
 
-          # Launcher script — NO PROOT NEEDED! The binary is patched at source level.
+          # Launcher script — native for bun run/install, proot for bunx
           cat > "$TMPUSR/bin/bun" <<'LAUNCHER'
           #!/data/data/com.termux/files/usr/bin/bash
-          # Bun with source-level Android SELinux patches — no proot needed!
-          # The LD_PRELOAD shim is still loaded for installer hardlink fixes.
           SHIM="/data/data/com.termux/files/usr/lib/bun-termux/libbun-android-fix.so"
-          if [ -f "$SHIM" ]; then
-            if [ -z "$LD_PRELOAD" ]; then
-              export LD_PRELOAD="$SHIM"
-            else
-              export LD_PRELOAD="$SHIM:$LD_PRELOAD"
+          BUN_BIN="/data/data/com.termux/files/usr/lib/bun-termux/bun"
+          if [ -z "$LD_PRELOAD" ]; then
+            [ -f "$SHIM" ] && export LD_PRELOAD="$SHIM"
+          else
+            [ -f "$SHIM" ] && export LD_PRELOAD="$SHIM:$LD_PRELOAD"
+          fi
+          # bunx has a directory walk issue that can't be patched at source level.
+          # Use proot ONLY for bunx/bun x — everything else runs natively.
+          if [ "$1" = "x" ] || [ "$1" = "bunx" ]; then
+            if [ -z "$TERMUX_CHROOT" ] && command -v proot >/dev/null 2>&1; then
+              export TERMUX_CHROOT=1
+              exec proot \
+                --root=/data/data/com.termux/files \
+                --cwd="$(pwd)" \
+                --bind=/dev --bind=/proc --bind=/sys \
+                --bind=/system --bind=/apex --bind=/vendor \
+                --bind=/data/data/com.termux/files \
+                --link2symlink \
+                "$BUN_BIN" "$@"
             fi
           fi
-          exec /data/data/com.termux/files/usr/lib/bun-termux/bun "$@"
+          exec "$BUN_BIN" "$@"
           LAUNCHER
           chmod 755 "$TMPUSR/bin/bun"
 
