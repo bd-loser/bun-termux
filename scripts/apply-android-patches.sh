@@ -339,17 +339,13 @@ old = """        const root_path = if (Environment.isWindows)
             path[0..1];"""
 
 new = """        // ANDROID_SELINUX_FIX_PATCH: On Android, SELinux blocks openat(O_DIRECTORY)
-        // on / and /data/. The walk goes from cwd UP to root_path. If root_path is "/",
-        // the walk fails because / can't be opened. Use the Termux prefix
-        // (/data/data/com.termux, 22 chars) as the walk root — it's always accessible.
+        // on / and /data/. The walk goes from cwd UP to root_path. Use the cwd's
+        // own path as root_path (so the walk only processes the cwd itself, not
+        // its parents). This prevents the walk from ever reaching / or /data/.
         const root_path = if (Environment.isWindows)
             bun.strings.withoutTrailingSlashWindowsPath(ResolvePath.windowsFilesystemRoot(path))
-        else if (path.len >= 22 and strings.eql(path[0..22], "/data/data/com.termux"))
-            path[0..22]
-        else if (path.len >= 10 and strings.eql(path[0..10], "/data/data"))
-            path[0..10]
         else
-            path[0..1];"""
+            path;"""
 
 if old in content:
     content = content.replace(old, new, 1)
