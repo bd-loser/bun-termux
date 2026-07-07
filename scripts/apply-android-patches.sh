@@ -186,7 +186,7 @@ new = """        // ANDROID_SELINUX_FIX_PATCH
                 Output.flush();
                 return error.CouldntReadCurrentDirectory;
             };
-            Output.debug("root_dir_info: returned {s}", .{if (result) "non-null" else "null"});
+            Output.debug("root_dir_info: returned {s}", .{if (result != null) "non-null" else "null"});
             if (result) |info| break :blk info;
             // result is null — try cwd
             if (this_transpiler.resolver.readDirInfo(".") catch null) |cwd_info| {
