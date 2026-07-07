@@ -360,10 +360,11 @@ old2 = """                    const dir_result = std.fs.openDirAbsoluteZ(
                         .{ .no_follow = !follow_symlinks, .iterate = true },
                     ) catch |err| break :open_req err;"""
 
-new2 = """                    // ANDROID_SELINUX_FIX_PATCH: catch AccessDenied (EACCES) and
-                    // convert to FileNotFound so the walk treats it as "not found"
-                    // instead of propagating an error. This is handled by the
-                    // switch below which returns null for FileNotFound.
+new2 = """                    // ANDROID_SELINUX_FIX_PATCH: On Android, SELinux blocks openat(O_DIRECTORY)
+                    // on / and /data/. Skip these paths entirely — treat as not found.
+                    if (strings.eqlComptime(sentinel, "/") or strings.eqlComptime(sentinel, "/data") or strings.eqlComptime(sentinel, "/data/")) {
+                        break :open_req error.FileNotFound;
+                    }
                     const dir_result = std.fs.openDirAbsoluteZ(
                         sentinel,
                         .{ .no_follow = !follow_symlinks, .iterate = true },
