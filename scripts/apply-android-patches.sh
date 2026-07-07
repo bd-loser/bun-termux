@@ -169,35 +169,33 @@ old = """        const root_dir_info = this_transpiler.resolver.readDirInfo(this
         };"""
 
 new = """        // ANDROID_SELINUX_FIX_PATCH
-        // On Android, the directory walk may fail or return null.
-        // Use std.debug.print for debug output (always works in release).
+        // On Android, readDirInfo may return null when no package.json is
+        // found. Instead of failing, create a minimal DirInfo from the cwd.
         const root_dir_info: *DirInfo = blk: {
-            std.debug.print("root_dir_info: top_level_dir={s}\\n", .{this_transpiler.fs.top_level_dir});
-            const result = this_transpiler.resolver.readDirInfo(this_transpiler.fs.top_level_dir) catch |err| {
-                std.debug.print("root_dir_info: readDirInfo threw: {s}\\n", .{@errorName(err)});
-                // Try cwd as fallback
-                if (this_transpiler.resolver.readDirInfo(".") catch null) |cwd_info| {
-                    std.debug.print("root_dir_info: cwd fallback OK\\n", .{});
-                    break :blk cwd_info;
-                }
+            const result = this_transpiler.resolver.readDirInfo(this_transpiler.fs.top_level_dir) catch null;
+            if (result) |info| break :blk info;
+            // readDirInfo returned null — create a minimal DirInfo using
+            // dir_cache.getOrPut + atIndex (same pattern as line 2743).
+            const cache_result = this_transpiler.resolver.dir_cache.getOrPut(this_transpiler.fs.top_level_dir) catch {
                 if (!log_errors) return error.CouldntReadCurrentDirectory;
                 ctx.log.print(Output.errorWriter()) catch {};
                 Output.prettyErrorln("error loading current directory", .{});
                 Output.flush();
                 return error.CouldntReadCurrentDirectory;
             };
-            std.debug.print("root_dir_info: returned {s}\\n", .{if (result != null) "non-null" else "null"});
-            if (result) |info| break :blk info;
-            // result is null — try cwd
-            if (this_transpiler.resolver.readDirInfo(".") catch null) |cwd_info| {
-                std.debug.print("root_dir_info: null→cwd fallback OK\\n", .{});
-                break :blk cwd_info;
+            // atIndex returns ?*DirInfo — create empty DirInfo if needed
+            if (this_transpiler.resolver.dir_cache.atIndex(cache_result.index)) |info| {
+                break :blk info;
             }
-            if (!log_errors) return error.CouldntReadCurrentDirectory;
-            ctx.log.print(Output.errorWriter()) catch {};
-            Output.prettyErrorln("error loading current directory", .{});
-            Output.flush();
-            return error.CouldntReadCurrentDirectory;
+            // atIndex returned null — put a new empty DirInfo
+            const put_result = this_transpiler.resolver.dir_cache.put(&cache_result, DirInfo{}) catch {
+                if (!log_errors) return error.CouldntReadCurrentDirectory;
+                ctx.log.print(Output.errorWriter()) catch {};
+                Output.prettyErrorln("error loading current directory", .{});
+                Output.flush();
+                return error.CouldntReadCurrentDirectory;
+            };
+            break :blk put_result;
         };"""
 
 if old in content:
