@@ -362,7 +362,14 @@ old2 = """                    const dir_result = std.fs.openDirAbsoluteZ(
 
 new2 = """                    // ANDROID_SELINUX_FIX_PATCH: On Android, SELinux blocks openat(O_DIRECTORY)
                     // on / and /data/. Skip these paths entirely — treat as not found.
-                    if (strings.eqlComptime(sentinel, "/") or strings.eqlComptime(sentinel, "/data") or strings.eqlComptime(sentinel, "/data/")) {
+                    // Use byte-level comparison (eqlComptime may not work with sentinel slices).
+                    if (sentinel.len == 1 and sentinel[0] == '/') {
+                        break :open_req error.FileNotFound;
+                    }
+                    if (sentinel.len == 5 and sentinel[0] == '/' and sentinel[1] == 'd' and sentinel[2] == 'a' and sentinel[3] == 't' and sentinel[4] == 'a') {
+                        break :open_req error.FileNotFound;
+                    }
+                    if (sentinel.len == 6 and sentinel[0] == '/' and sentinel[1] == 'd' and sentinel[2] == 'a' and sentinel[3] == 't' and sentinel[4] == 'a' and sentinel[5] == '/') {
                         break :open_req error.FileNotFound;
                     }
                     const dir_result = std.fs.openDirAbsoluteZ(
