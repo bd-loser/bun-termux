@@ -169,12 +169,15 @@ old = """        const root_dir_info = this_transpiler.resolver.readDirInfo(this
         };"""
 
 new = """        // ANDROID_SELINUX_FIX_PATCH
-        // On Android, the directory walk may fail or return null when
-        // no package.json is found. Instead of failing, try cwd as fallback.
+        // On Android, the directory walk may fail or return null.
+        // Debug: log what's happening so we can see the actual error.
         const root_dir_info: *DirInfo = blk: {
-            const result = this_transpiler.resolver.readDirInfo(this_transpiler.fs.top_level_dir) catch {
-                // Walk threw an error — try cwd as fallback
+            Output.debug("root_dir_info: top_level_dir={s}", .{this_transpiler.fs.top_level_dir});
+            const result = this_transpiler.resolver.readDirInfo(this_transpiler.fs.top_level_dir) catch |err| {
+                Output.debug("root_dir_info: readDirInfo threw: {s}", .{@errorName(err)});
+                // Try cwd as fallback
                 if (this_transpiler.resolver.readDirInfo(".") catch null) |cwd_info| {
+                    Output.debug("root_dir_info: cwd fallback OK", .{});
                     break :blk cwd_info;
                 }
                 if (!log_errors) return error.CouldntReadCurrentDirectory;
@@ -183,8 +186,11 @@ new = """        // ANDROID_SELINUX_FIX_PATCH
                 Output.flush();
                 return error.CouldntReadCurrentDirectory;
             };
+            Output.debug("root_dir_info: returned {s}", .{if (result) "non-null" else "null"});
             if (result) |info| break :blk info;
+            // result is null — try cwd
             if (this_transpiler.resolver.readDirInfo(".") catch null) |cwd_info| {
+                Output.debug("root_dir_info: null→cwd fallback OK", .{});
                 break :blk cwd_info;
             }
             if (!log_errors) return error.CouldntReadCurrentDirectory;
