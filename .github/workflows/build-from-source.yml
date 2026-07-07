@@ -125,12 +125,12 @@ jobs:
           echo "Bun: $(bun --version)"
           echo "Start: $(date)"
 
-          # Build for android target — produces a Bionic-linked binary.
-          # The build may fail at the 'strip' step because the system's
-          # GNU strip doesn't understand Android ELF format. That's OK —
-          # the binary (bun-profile) is already built by that point.
-          # We use `|| true` to ignore the strip failure and handle it
-          # in the next step (using NDK's llvm-strip).
+          # Clear Zig cache to force recompilation with our patches
+          echo "=== Clearing Zig cache to force recompile ==="
+          rm -rf build/release-android/cache/zig 2>/dev/null || true
+          rm -rf ~/.bun/build-cache/zig 2>/dev/null || true
+
+          # Build for android target
           bun scripts/build.ts \
             --profile=release \
             --abi=android \

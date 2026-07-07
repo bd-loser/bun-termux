@@ -169,29 +169,37 @@ old = """        const root_dir_info = this_transpiler.resolver.readDirInfo(this
         };"""
 
 new = """        // ANDROID_SELINUX_FIX_PATCH
-        // On Android, readDirInfo may return null or throw when the directory
-        // walk hits SELinux-blocked paths. The cache also gets poisoned with
-        // "not found" status, making fallback calls fail too.
-        // Fix: try readDirInfo, but if it fails, create a fresh DirInfo using
-        // a UNIQUE cache key (appending a null byte) to bypass any poisoned cache.
+        // On Android, readDirInfo fails because the directory walk hits
+        // SELinux-blocked paths. Create a minimal DirInfo instead.
         const root_dir_info: *DirInfo = blk: {
-            const result = this_transpiler.resolver.readDirInfo(this_transpiler.fs.top_level_dir) catch null;
-            if (result) |info| break :blk info;
-            // readDirInfo failed — use a unique cache key to avoid poisoned cache
-            // This creates an empty DirInfo that lets the transpiler continue.
+            // Try readDirInfo first
+            const result = this_transpiler.resolver.readDirInfo(this_transpiler.fs.top_level_dir) catch |err| {
+                // Print to stderr so we can see what's happening
+                std.debug.print("readDirInfo threw: {s}\\n", .{@errorName(err)});
+                null;
+            };
+            if (result) |info| {
+                std.debug.print("readDirInfo returned non-null\\n", .{});
+                break :blk info;
+            }
+            std.debug.print("readDirInfo returned null, creating minimal DirInfo\\n", .{});
+            // Create a minimal DirInfo using a unique cache key
             var unique_key_buf: [bun.MAX_PATH_BYTES + 1]u8 = undefined;
             const key_len = @min(this_transpiler.fs.top_level_dir.len, bun.MAX_PATH_BYTES);
             @memcpy(unique_key_buf[0..key_len], this_transpiler.fs.top_level_dir[0..key_len]);
-            unique_key_buf[key_len] = 0; // null terminator makes it unique
+            unique_key_buf[key_len] = 0;
             const unique_key = unique_key_buf[0..key_len + 1];
-            var cache_result = this_transpiler.resolver.dir_cache.getOrPut(unique_key) catch {
+            var cache_result = this_transpiler.resolver.dir_cache.getOrPut(unique_key) catch |err| {
+                std.debug.print("getOrPut threw: {s}\\n", .{@errorName(err)});
                 if (!log_errors) return error.CouldntReadCurrentDirectory;
                 ctx.log.print(Output.errorWriter()) catch {};
                 Output.prettyErrorln("error loading current directory", .{});
                 Output.flush();
                 return error.CouldntReadCurrentDirectory;
             };
-            break :blk this_transpiler.resolver.dir_cache.put(&cache_result, DirInfo{}) catch {
+            std.debug.print("getOrPut OK, calling put\\n", .{});
+            break :blk this_transpiler.resolver.dir_cache.put(&cache_result, DirInfo{}) catch |err| {
+                std.debug.print("put threw: {s}\\n", .{@errorName(err)});
                 if (!log_errors) return error.CouldntReadCurrentDirectory;
                 ctx.log.print(Output.errorWriter()) catch {};
                 Output.prettyErrorln("error loading current directory", .{});
