@@ -131,57 +131,64 @@ jobs:
           echo "Bun: $(bun --version)"
           echo "Start: $(date)"
 
-          # Clear Zig cache to force recompilation with our patches
-          echo "=== Clearing Zig cache to force recompile ==="
-          rm -rf build/release-android/cache/zig 2>/dev/null || true
-          rm -rf ~/.bun/build-cache/zig 2>/dev/null || true
+          # Nuke ALL caches to force 100% fresh recompile
+          echo "=== Nuking ALL caches ==="
+          rm -rf build/ 2>/dev/null || true
+          rm -rf ~/.bun/build-cache/ 2>/dev/null || true
+          rm -rf /tmp/zig-cache 2>/dev/null || true
+          # Also clear Zig global cache
+          rm -rf ~/.cache/zig 2>/dev/null || true
 
-          # Build for android target
+          # Use a unique build dir to prevent ANY cache reuse
+          BUILD_DIR="build/fresh-$(date +%s)"
+          echo "Using build dir: $BUILD_DIR"
+
           bun scripts/build.ts \
             --profile=release \
             --abi=android \
             --arch=aarch64 \
-            --build-dir=build/release-android 2>&1 | tail -100 || true
+            --build-dir="$BUILD_DIR" 2>&1 | tail -100 || true
 
           echo "End: $(date)"
           echo ""
-          echo "=== Checking for built binary (bun-profile or bun) ==="
+          echo "=== Checking for built binary ==="
           find build -name "bun*" -type f 2>/dev/null | head -10
+          
+          # Copy binary to expected location
+          BUN_BIN=$(find build -name "bun-profile" -type f 2>/dev/null | head -1)
+          if [ -z "$BUN_BIN" ]; then
+            BUN_BIN=$(find build -name "bun" -type f 2>/dev/null | head -1)
+          fi
+          if [ -n "$BUN_BIN" ]; then
+            cp "$BUN_BIN" /tmp/bun-patched
+            echo "Binary copied to /tmp/bun-patched"
+          fi
 
       - name: Find and verify the built binary
         env:
           ANDROID_NDK_HOME: ${{ steps.setup_ndk.outputs.ndk-path }}
         run: |
           echo "=== Looking for built binary ==="
-          find /tmp/bun-src/build -name "bun*" -type f 2>/dev/null | head -10
-
-          BUN_BIN=""
-          # Try stripped version first
-          BUN_BIN=$(find /tmp/bun-src/build -name "bun" -type f 2>/dev/null | head -1)
-          if [ -z "$BUN_BIN" ]; then
-            # Fall back to unstripped bun-profile
+          if [ -f /tmp/bun-patched ]; then
+            echo "Binary already copied from build step"
+          else
+            find /tmp/bun-src/build -name "bun*" -type f 2>/dev/null | head -10
             BUN_BIN=$(find /tmp/bun-src/build -name "bun-profile" -type f 2>/dev/null | head -1)
-            if [ -n "$BUN_BIN" ]; then
-              echo "Using unstripped bun-profile (strip step failed — using GNU strip on Android ELF)"
+            if [ -z "$BUN_BIN" ]; then
+              BUN_BIN=$(find /tmp/bun-src/build -name "bun" -type f 2>/dev/null | head -1)
             fi
+            if [ -z "$BUN_BIN" ]; then
+              echo "ERROR: Bun binary not found"
+              exit 1
+            fi
+            cp "$BUN_BIN" /tmp/bun-patched
           fi
+          file /tmp/bun-patched
+          ls -lh /tmp/bun-patched
 
-          if [ -z "$BUN_BIN" ]; then
-            echo "ERROR: Bun binary not found in build output"
-            echo "=== Build directory contents ==="
-            ls -la /tmp/bun-src/build/release-android/ 2>/dev/null || echo "No build dir"
-            find /tmp/bun-src/build -maxdepth 3 -type f -name "bun*" 2>/dev/null
-            exit 1
-          fi
-          echo "Found: $BUN_BIN"
-          file "$BUN_BIN"
-          ls -lh "$BUN_BIN"
-          cp "$BUN_BIN" /tmp/bun-patched
-
-          # Strip with NDK's llvm-strip (understands Android ELF format)
+          # Strip with NDK's llvm-strip
           NDK_STRIP="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
           if [ -x "$NDK_STRIP" ]; then
-            echo "Stripping with NDK llvm-strip..."
             "$NDK_STRIP" --strip-all /tmp/bun-patched || true
             ls -lh /tmp/bun-patched
           fi
