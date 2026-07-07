@@ -40,7 +40,7 @@ bun-fix-network
 ### One-liner
 
 ```bash
-curl -fsSL https://github.com/bd-loser/bun-termux/releases/latest/download/bun_1.3.14-patched_aarch64.deb -o /tmp/bun.deb && dpkg -i /tmp/bun.deb && rm /tmp/bun.deb
+curl -fsSL https://github.com/bd-loser/bun-termux/releases/latest/download/bun_1.3.14-patched_aarch64.deb -o ~/bun.deb && dpkg -i ~/bun.deb && rm ~/bun.deb
 ```
 
 ### From source (advanced)
