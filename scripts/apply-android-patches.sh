@@ -173,10 +173,9 @@ new = """        // ANDROID_SELINUX_FIX_PATCH
         // SELinux-blocked paths. Create a minimal DirInfo instead.
         const root_dir_info: *DirInfo = blk: {
             // Try readDirInfo first
-            const result = this_transpiler.resolver.readDirInfo(this_transpiler.fs.top_level_dir) catch |err| {
-                // Print to stderr so we can see what's happening
+            const result = this_transpiler.resolver.readDirInfo(this_transpiler.fs.top_level_dir) catch |err| blk2: {
                 std.debug.print("readDirInfo threw: {s}\\n", .{@errorName(err)});
-                @as(?*DirInfo, null)
+                break :blk2 @as(?*DirInfo, null);
             };
             if (result) |info| {
                 std.debug.print("readDirInfo returned non-null\\n", .{});
