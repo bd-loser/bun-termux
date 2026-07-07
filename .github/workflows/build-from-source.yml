@@ -451,11 +451,18 @@ jobs:
             - `root_path` changed from `path[0..1]` (`/`) to `path` (the cwd).
               The walk-up loop condition `top.len > root_path.len` is immediately
               false, so NO ancestors are queued. The walk processes only the cwd.
+              LIMITATION: this disables ancestor walking, so enclosing
+              package.json from parent dirs is not found. For most Termux
+              users (cwd = project root) this is fine.
             - Walk error switch: `AccessDenied` now `continue`s to the next queue
-              item instead of `return null`. Belt-and-suspenders — if an ancestor
-              is somehow still queued, the walk won't abort.
-            - `openDirAbsoluteZ` call site: `AccessDenied` converted to
-              `FileNotFound` so the not-found cache path is taken cleanly.
+              item instead of `return null`. This is the CORRECT non-limiting
+              fix — it skips inaccessible ancestors (/, /data) while still
+              processing accessible ones. Belt-and-suspenders with the root_path
+              fix above.
+            - (Previous Layer 1c — `openDirAbsoluteZ: AccessDenied → FileNotFound`
+              — was REMOVED: it was counterproductive. FileNotFound still hit
+              the `else` branch which does `return null`, AND it prevented
+              Layer 1b's `continue` from firing.)
 
             **Layer 2 — `src/cli/run_command.zig` (fallback):**
             - When `readDirInfo` still returns `null` (shouldn't happen with

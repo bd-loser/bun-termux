@@ -11,16 +11,30 @@
 #
 # WHAT THIS PATCHES (Bun v1.3.14 Zig codebase):
 #
-#   1. src/resolver/resolver.zig — THE bunx fix (3 changes):
-#      a) root_path: on Android, set root_path = path (the cwd) instead
-#         of path[0..1] ("/"). This prevents the directory walk from
-#         ever queuing /, /data, /data/data as ancestors. Those dirs
-#         are mode 0771 on Android and opendir() returns EACCES.
+#   1. src/resolver/resolver.zig — THE bunx fix (2 changes):
+#      a) root_path: set root_path = path (the cwd) instead of
+#         path[0..1] ("/"). Prevents the directory walk from ever
+#         queuing /, /data, /data/data as ancestors (mode 0771,
+#         opendir() returns EACCES).
+#         LIMITATION: disables ALL ancestor walking, so Bun cannot
+#         find enclosing package.json from parent dirs (affects
+#         monorepos, npm_package_name env var). For most Termux
+#         users (cwd = project root) this is fine. Layer 1b is the
+#         correct non-limiting fix; 1a is kept as safe belt-and-
+#         suspenders.
 #      b) Walk error switch: on AccessDenied, CONTINUE to the next
-#         queue item instead of returning null. Belt-and-suspenders:
-#         if (a) is somehow bypassed, the walk still won't abort.
-#      c) openDirAbsoluteZ call site: catch AccessDenied and convert
-#         to FileNotFound, so the not-found cache path is taken.
+#         queue item instead of returning null. THE CORRECT FIX —
+#         skips inaccessible ancestors (/, /data) while still
+#         processing accessible ones. Belt-and-suspenders with (a):
+#         if (a) is bypassed, the walk still won't abort.
+#
+#      NOTE: A previous Layer 1c (openDirAbsoluteZ: AccessDenied →
+#      FileNotFound) was REMOVED — it was counterproductive. It
+#      converted AccessDenied to FileNotFound, but FileNotFound still
+#      hit the `else` branch (return null → walk aborts), AND it
+#      prevented Layer 1b's `continue` from ever firing (since
+#      AccessDenied was already converted). With 1c removed, 1b
+#      correctly handles AccessDenied by continuing the walk.
 #
 #   2. src/cli/run_command.zig — CouldntReadCurrentDirectory fallback:
 #      When readDirInfo returns null (walk failed), create a minimal
@@ -94,11 +108,18 @@ old_root_path = r'''        const root_path = if \(Environment\.isWindows\)
             // we will write to the buffer past the ptr len so it must be a non-const buffer
             path\[0\.\.1\];'''
 
-new_root_path = '''        // ANDROID_TERMUX_FIX: On Android, / and /data are mode 0771 (system:system).
-        // opendir() on them returns EACCES, which aborts the entire directory walk.
-        // Fix: set root_path = path (the cwd itself) so the walk-up loop condition
-        // (top.len > root_path.len) is immediately false — no ancestors are queued.
-        // The walk processes ONLY the cwd, which is always accessible.
+new_root_path = '''        // ANDROID_TERMUX_FIX [Layer 1a]: On Android, / and /data are mode 0771
+        // (system:system). opendir() on them returns EACCES, which aborts the
+        // entire directory walk. Fix: set root_path = path (the cwd itself) so
+        // the walk-up loop condition (top.len > root_path.len) is immediately
+        // false — no ancestors are queued. The walk processes ONLY the cwd.
+        //
+        // LIMITATION: This disables ancestor walking, so Bun cannot find
+        // enclosing package.json/tsconfig.json from parent directories.
+        // Affects: monorepos, npm_package_name env var, browser_scope
+        // inheritance. For most Termux users (cwd = project root), this
+        // is fine. Layer 1b is the correct non-limiting fix; Layer 1a
+        // is kept as a safe belt-and-suspenders.
         const root_path = if (Environment.isWindows)
             bun.strings.withoutTrailingSlashWindowsPath(ResolvePath.windowsFilesystemRoot(path))
         else
@@ -114,8 +135,22 @@ else:
     sys.exit(1)
 
 # ── 1b: Walk error switch — add AccessDenied and change return to continue ──
-# The walk returns null on ANY error, which aborts processing of ALL remaining
-# queue items (including the cwd). Change AccessDenied to continue instead.
+# THE CORRECT FIX: On AccessDenied (EACCES from openDirAbsoluteZ on / or
+# /data), skip this ancestor and CONTINUE the walk-down loop. The cwd at
+# queue[0] is always accessible — returning null would abort the entire
+# walk and never try the cwd.
+#
+# Without Layer 1a, this is the ONLY fix needed: the walk queues all
+# ancestors, and 1b skips the inaccessible ones (/, /data) while
+# processing the accessible ones (restoring enclosing package.json
+# detection). With Layer 1a, 1b is belt-and-suspenders (dead code,
+# but harmless and documents the correct approach).
+#
+# NOTE: A previous Layer 1c converted AccessDenied → FileNotFound at
+# the openDirAbsoluteZ call site. That was COUNTERPRODUCTIVE: FileNotFound
+# still hit the `else` branch (return null → walk aborts), AND it
+# prevented 1b from firing (AccessDenied was already converted).
+# 1c has been removed.
 # Target the exact error switch in the walk-down loop.
 old_switch = r'''                    error\.ENOTDIR, error\.IsDir, error\.NotDir => return null,'''
 
@@ -140,38 +175,11 @@ else:
     print("    [FAIL] could not find walk error switch")
     sys.exit(1)
 
-# ── 1c: openDirAbsoluteZ call site — catch AccessDenied as fallback ──
-# Even with 1a and 1b, if somehow an inaccessible ancestor IS queued,
-# convert AccessDenied to FileNotFound so the not-found cache path is taken.
-old_open = r'''                    const dir_result = std\.fs\.openDirAbsoluteZ\(
-                        sentinel,
-                        \.\{ \.no_follow = !follow_symlinks, \.iterate = true \},
-                    \) catch \|err\| break :open_req err;'''
-
-new_open = '''                    // ANDROID_TERMUX_FIX: catch AccessDenied from openDirAbsoluteZ
-                    // and convert to FileNotFound. This ensures the not-found
-                    // cache path is taken (mark + continue) instead of propagating.
-                    const dir_result = std.fs.openDirAbsoluteZ(
-                        sentinel,
-                        .{ .no_follow = !follow_symlinks, .iterate = true },
-                    ) catch |err| switch (err) {
-                        error.AccessDenied => break :open_req error.FileNotFound,
-                        else => break :open_req err,
-                    };'''
-
-new_content = re.sub(old_open, lambda m: new_open, content, count=1)
-if new_content != content:
-    content = new_content
-    patched += 1
-    print("    [1c] openDirAbsoluteZ: AccessDenied → FileNotFound")
-else:
-    print("    [FAIL] could not find openDirAbsoluteZ pattern")
-    sys.exit(1)
 
 with open("src/resolver/resolver.zig", "w") as f:
     f.write(content)
 
-print(f"    Total: {patched}/3 sub-patches applied to resolver.zig")
+print(f"    Total: {patched}/2 sub-patches applied to resolver.zig")
 PYEOF
         verify_patch "$RESOLVER_ZIG" "$PATCH_MARKER" || true
     fi
