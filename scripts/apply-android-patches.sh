@@ -175,27 +175,22 @@ new = """        // ANDROID_SELINUX_FIX_PATCH
             const result = this_transpiler.resolver.readDirInfo(this_transpiler.fs.top_level_dir) catch null;
             if (result) |info| break :blk info;
             // readDirInfo returned null — create a minimal DirInfo using
-            // dir_cache.getOrPut + atIndex (same pattern as line 2743).
-            const cache_result = this_transpiler.resolver.dir_cache.getOrPut(this_transpiler.fs.top_level_dir) catch {
+            // dir_cache.getOrPut + put (same pattern as line 3023).
+            var cache_result = this_transpiler.resolver.dir_cache.getOrPut(this_transpiler.fs.top_level_dir) catch {
                 if (!log_errors) return error.CouldntReadCurrentDirectory;
                 ctx.log.print(Output.errorWriter()) catch {};
                 Output.prettyErrorln("error loading current directory", .{});
                 Output.flush();
                 return error.CouldntReadCurrentDirectory;
             };
-            // atIndex returns ?*DirInfo — create empty DirInfo if needed
-            if (this_transpiler.resolver.dir_cache.atIndex(cache_result.index)) |info| {
-                break :blk info;
-            }
-            // atIndex returned null — put a new empty DirInfo
-            const put_result = this_transpiler.resolver.dir_cache.put(&cache_result, DirInfo{}) catch {
+            // put() initializes the DirInfo and returns *DirInfo
+            break :blk this_transpiler.resolver.dir_cache.put(&cache_result, DirInfo{}) catch {
                 if (!log_errors) return error.CouldntReadCurrentDirectory;
                 ctx.log.print(Output.errorWriter()) catch {};
                 Output.prettyErrorln("error loading current directory", .{});
                 Output.flush();
                 return error.CouldntReadCurrentDirectory;
             };
-            break :blk put_result;
         };"""
 
 if old in content:
