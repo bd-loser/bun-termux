@@ -197,7 +197,7 @@ new = """        // ANDROID_SELINUX_FIX_PATCH
                 return error.CouldntReadCurrentDirectory;
             };
             std.debug.print("getOrPut OK, calling put\\n", .{});
-            break :blk this_transpiler.resolver.dir_cache.put(&cache_result, DirInfo{}) catch |err| {
+            break :blk this_transpiler.resolver.dir_cache.put(&cache_result, DirInfo{ .abs_path = this_transpiler.fs.top_level_dir }) catch |err| {
                 std.debug.print("put threw: {s}\\n", .{@errorName(err)});
                 if (!log_errors) return error.CouldntReadCurrentDirectory;
                 ctx.log.print(Output.errorWriter()) catch {};
