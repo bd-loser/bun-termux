@@ -214,61 +214,76 @@ echo ""
 echo "=== Patches applied successfully ==="
 echo "Verify with: grep -n 'ANDROID_SELINUX_FIX_PATCH' src/bun.zig src/cli/run_command.zig"
 
-# ─── Patch 8: src/resolver/resolver.zig — use bun.openDirAbsoluteZ instead of std.fs ─
-# The directory walk in dir_info_cached_miss uses std.fs.openDirAbsoluteZ
-# which doesn't have our EACCES fallback. Replace it with bun.openDirAbsolute
-# which we patched to retry without O_DIRECTORY on EACCES.
+# ─── Patch 8: src/resolver/resolver.zig — stop walk at /data/data (not /) ─
+# The directory walk goes from cwd UP to root_path (which is "/").
+# On Android, SELinux blocks openat(O_DIRECTORY) on / and /data/.
+# Fix: change root_path to "/data/data" (accessible on Termux) so the
+# walk stops there instead of going to /.
 RESOLVER_ZIG="src/resolver/resolver.zig"
 if [ -f "$RESOLVER_ZIG" ]; then
     if grep -q "ANDROID_SELINUX_FIX_PATCH" "$RESOLVER_ZIG" 2>/dev/null; then
         echo "  [skip] $RESOLVER_ZIG already patched"
     else
-        echo "  [patch] $RESOLVER_ZIG: use bun.openDirAbsolute for EACCES fallback"
-        # Replace std.fs.openDirAbsoluteZ with bun.openDirAbsoluteZ
-        # First check if bun has openDirAbsoluteZ
-        if grep -q "pub fn openDirAbsoluteZ" src/bun.zig 2>/dev/null; then
-            sed -i 's|std\.fs\.openDirAbsoluteZ|bun.openDirAbsoluteZ|g' "$RESOLVER_ZIG"
-            echo "  [ok] replaced std.fs.openDirAbsoluteZ with bun.openDirAbsoluteZ"
-        else
-            # bun doesn't have openDirAbsoluteZ, so patch the call site directly
-            # Replace the openDirAbsoluteZ call with a try that catches EACCES
-            python3 <<'PYEOF'
+        echo "  [patch] $RESOLVER_ZIG: stop walk at /data/data instead of /"
+        python3 <<'PYEOF'
 with open("src/resolver/resolver.zig", "r") as f:
     content = f.read()
 
-old = """                const open_req = if (comptime Environment.isPosix) open_req: {
-                    const dir_result = std.fs.openDirAbsoluteZ(
+# Patch the root_path: change from path[0..1] ("/") to a deeper path
+# that's accessible on Android. Use "/data/data" (10 chars) which is
+# the Termux app data root and is always accessible.
+old = """        const root_path = if (Environment.isWindows)
+            bun.strings.withoutTrailingSlashWindowsPath(ResolvePath.windowsFilesystemRoot(path))
+        else
+            // we cannot just use "/"
+            // we will write to the buffer past the ptr len so it must be a non-const buffer
+            path[0..1];"""
+
+new = """        // ANDROID_SELINUX_FIX_PATCH: On Android, SELinux blocks openat(O_DIRECTORY)
+        // on / and /data/. The walk goes from cwd UP to root_path. If root_path is "/",
+        // the walk fails because / can't be opened. Use "/data/data" (accessible on
+        // Termux) as the walk root so the walk stops there instead of going to /.
+        // This is safe because package.json is never at / or /data/ on Termux.
+        const root_path = if (Environment.isWindows)
+            bun.strings.withoutTrailingSlashWindowsPath(ResolvePath.windowsFilesystemRoot(path))
+        else if (path.len >= 10 and strings.eql(path[0..10], "/data/data"))
+            path[0..10]
+        else
+            path[0..1];"""
+
+if old in content:
+    content = content.replace(old, new, 1)
+    print("  [ok] patched root_path to stop at /data/data")
+else:
+    print("  [warn] could not find root_path pattern")
+
+# Also patch the walk error handler: when AccessDenied is returned,
+# treat as FileNotFound (already handled by the walk's error switch)
+old2 = """                    const dir_result = std.fs.openDirAbsoluteZ(
                         sentinel,
                         .{ .no_follow = !follow_symlinks, .iterate = true },
-                    ) catch |err| break :open_req err;
-                    break :open_req FD.fromStdDir(dir_result);
-                } else if (comptime Environment.isWindows) open_req: {"""
+                    ) catch |err| break :open_req err;"""
 
-new = """                // ANDROID_SELINUX_FIX_PATCH: On Android, openDirAbsoluteZ fails with
-                // EACCES on / and /data/ due to SELinux. Catch the error and
-                // treat as "not found" (break with error) so the walk stops.
-                const open_req = if (comptime Environment.isPosix) open_req: {
+new2 = """                    // ANDROID_SELINUX_FIX_PATCH: catch AccessDenied (EACCES) and
+                    // convert to FileNotFound so the walk treats it as "not found"
+                    // instead of propagating an error.
                     const dir_result = std.fs.openDirAbsoluteZ(
                         sentinel,
                         .{ .no_follow = !follow_symlinks, .iterate = true },
                     ) catch |err| {
-                        // EACCES means SELinux blocked it — treat as not found
                         if (err == error.AccessDenied) break :open_req error.FileNotFound;
                         break :open_req err;
-                    };
-                    break :open_req FD.fromStdDir(dir_result);
-                } else if (comptime Environment.isWindows) open_req: {"""
+                    };"""
 
-if old in content:
-    content = content.replace(old, new, 1)
-    print("  [ok] patched resolver to catch AccessDenied as FileNotFound")
+if old2 in content:
+    content = content.replace(old2, new2, 1)
+    print("  [ok] patched openDirAbsoluteZ to catch AccessDenied")
 else:
-    print("  [warn] could not find openDirAbsoluteZ pattern in resolver.zig")
+    print("  [warn] could not find openDirAbsoluteZ pattern")
 
 with open("src/resolver/resolver.zig", "w") as f:
     f.write(content)
 PYEOF
-        fi
     fi
 fi
 
