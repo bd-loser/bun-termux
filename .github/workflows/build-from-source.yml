@@ -84,23 +84,28 @@ jobs:
           git submodule update --init --recursive --depth 1
           echo "Source size: $(du -sh . | cut -f1)"
 
-      - name: Apply Android SELinux patches
+      - name: Apply Android/Termux patches (with strict verification)
         run: |
           echo "=== Applying patches ==="
           chmod +x scripts/apply-android-patches.sh
           bash scripts/apply-android-patches.sh /tmp/bun-src
+          # The script itself verifies all patches and exits non-zero on failure.
+          # If we reach here, all critical patches applied successfully.
           echo ""
-          echo "=== Verify patches ==="
-          grep -n "ANDROID_SELINUX_FIX_PATCH" /tmp/bun-src/src/bun.zig
-          grep -n "ANDROID_SELINUX_FIX_PATCH" /tmp/bun-src/src/cli/run_command.zig
-          grep -n "ANDROID_SELINUX_FIX_PATCH" /tmp/bun-src/scripts/build/flags.ts
-          grep -n "ANDROID_SELINUX_FIX_PATCH" /tmp/bun-src/scripts/build/tools.ts
+          echo "=== Additional verification: root_path patch ==="
+          # This is THE most critical patch — verify it explicitly.
+          if grep -q "ANDROID_TERMUX_FIX.*root_path = path" /tmp/bun-src/src/resolver/resolver.zig; then
+            echo "  [OK] root_path = path (cwd) — prevents ancestor walk"
+          else
+            echo "  [FAIL] root_path patch NOT applied! bunx will still crash."
+            exit 1
+          fi
           echo ""
-          echo "=== Verify root_path patch ==="
-          grep -A3 "ANDROID_SELINUX_FIX_PATCH.*blocks openat" /tmp/bun-src/src/resolver/resolver.zig
+          echo "=== Show patched root_path ==="
+          grep -A2 "const root_path" /tmp/bun-src/src/resolver/resolver.zig
           echo ""
-          echo "=== Show actual root_path line ==="
-          grep "const root_path" /tmp/bun-src/src/resolver/resolver.zig
+          echo "=== Show AccessDenied continue patch ==="
+          grep -B1 -A4 "error.AccessDenied => {" /tmp/bun-src/src/resolver/resolver.zig
 
       - name: Install Bun for bootstrapping
         env:
@@ -278,7 +283,11 @@ jobs:
             install -m755 dist/libbun-android-fix.so "$TMPUSR/lib/bun-termux/libbun-android-fix.so"
           fi
 
-          # Launcher script — native for bun run/install, proot for bunx
+          # Launcher script — ALL commands run natively (no proot!)
+          # bunx is fixed at source level via the resolver.zig patch:
+          #   1. root_path = path (cwd) — prevents ancestor walk to / and /data
+          #   2. AccessDenied → continue (not return null) — belt-and-suspenders
+          #   3. readDirInfo null fallback — synthesizes minimal DirInfo from cwd
           cat > "$TMPUSR/bin/bun" <<'LAUNCHER'
           #!/data/data/com.termux/files/usr/bin/bash
           SHIM="/data/data/com.termux/files/usr/lib/bun-termux/libbun-android-fix.so"
@@ -288,21 +297,8 @@ jobs:
           else
             [ -f "$SHIM" ] && export LD_PRELOAD="$SHIM:$LD_PRELOAD"
           fi
-          # bunx has a directory walk issue that can't be patched at source level.
-          # Use proot ONLY for bunx/bun x — everything else runs natively.
-          if [ "$1" = "x" ] || [ "$1" = "bunx" ]; then
-            if [ -z "$TERMUX_CHROOT" ] && command -v proot >/dev/null 2>&1; then
-              export TERMUX_CHROOT=1
-              exec proot \
-                --root=/data/data/com.termux/files \
-                --cwd="$(pwd)" \
-                --bind=/dev --bind=/proc --bind=/sys \
-                --bind=/system --bind=/apex --bind=/vendor \
-                --bind=/data/data/com.termux/files \
-                --link2symlink \
-                "$BUN_BIN" "$@"
-            fi
-          fi
+          # Everything runs natively — bunx, bun run, bun install, bun build.
+          # No proot needed. The resolver patches handle SELinux EACCES.
           exec "$BUN_BIN" "$@"
           LAUNCHER
           chmod 755 "$TMPUSR/bin/bun"
@@ -318,10 +314,11 @@ jobs:
           Maintainer: bd-loser
           Section: utils
           Priority: optional
-          Description: Android-native Bun runtime (source-patched for Termux)
+          Description: Android-native Bun runtime (source-patched for Termux, bunx FIXED)
            Bun v$VERSION with source-level patches for Android SELinux compatibility.
-           No proot, no root required. Works natively on Termux.
-           Patches: open_dir_absolute_z EACCES fallback, CouldntReadCurrentDirectory cwd fallback.
+           No proot, no root required. Works natively on Termux — including bunx.
+           Patches: resolver.zig root_path=cwd + AccessDenied continue, run_command.zig
+           readDirInfo null fallback, bun.zig openDir EACCES fallback.
           Depends: bash, ncurses, curl
           EOF
           echo "Installed-Size: $(du -sk "$ROOT" | cut -f1)" >> "$ROOT/DEBIAN/control"
@@ -367,27 +364,40 @@ jobs:
           files: dist/*
           generate_release_notes: true
           body: |
-            # Bun for Termux v${{ github.event.inputs.version || '1.3.14' }} — Source-Patched
+            # Bun for Termux v${{ github.event.inputs.version || '1.3.14' }} — Source-Patched (bunx FIXED)
 
             This is Bun built from source with Android SELinux patches applied.
-            **No proot, no root required.** Works natively on Termux.
+            **No proot, no root required.** Works natively on Termux — including `bunx`.
 
-            ## What's patched
+            ## What's patched (3-layer defense for the `bunx` crash)
 
-            1. **`open_dir_absolute_z()`** in `src/resolver/resolver.rs`:
-               When `openat(O_DIRECTORY)` returns EACCES (Android SELinux blocks
-               this on `/` and `/data/`), retries without `O_DIRECTORY`. The fd
-               won't support `readdir` (ENOTDIR), so the resolver treats the
-               directory as empty — correct since `/` and `/data/` don't contain
-               `package.json`.
+            The root cause: Bun's directory resolver walks UP from the cwd to `/`
+            and tries `opendir()` on every ancestor. On Android, `/` and `/data`
+            are mode `0771` (system:system), so `opendir()` returns `EACCES` and
+            the walk aborts — even though the cwd itself is fully readable. This
+            only affected `bunx` because it's the only command that calls
+            `configureEnvForRun` with the linker enabled, which triggers the
+            directory walk before anything else.
 
-            2. **`open_dir_z()`** in `src/resolver/resolver.rs`:
-               Same EACCES fallback for the relative-path version.
+            **Layer 1 — `src/resolver/resolver.zig` (THE fix):**
+            - `root_path` changed from `path[0..1]` (`/`) to `path` (the cwd).
+              The walk-up loop condition `top.len > root_path.len` is immediately
+              false, so NO ancestors are queued. The walk processes only the cwd.
+            - Walk error switch: `AccessDenied` now `continue`s to the next queue
+              item instead of `return null`. Belt-and-suspenders — if an ancestor
+              is somehow still queued, the walk won't abort.
+            - `openDirAbsoluteZ` call site: `AccessDenied` converted to
+              `FileNotFound` so the not-found cache path is taken cleanly.
 
-            3. **`CouldntReadCurrentDirectory` error path** in `src/runtime/cli/run_command.rs`:
-               When `read_dir_info` returns `Ok(None)` on Android (directory walk
-               blocked by SELinux), falls back to using the cwd as `top_level_dir`
-               instead of failing fatally.
+            **Layer 2 — `src/cli/run_command.zig` (fallback):**
+            - When `readDirInfo` still returns `null` (shouldn't happen with
+              Layer 1, but just in case), synthesizes a minimal `DirInfo` from
+              the cwd instead of returning `CouldntReadCurrentDirectory`.
+
+            **Layer 3 — `src/bun.zig` (general Android compat):**
+            - `openDirForIteration` and `openDirAbsolute`: on `EACCES`, retry
+              without `O_DIRECTORY`. The fd won't support `readdir` but callers
+              that only stat/access the path will work.
 
             ## Installation
 
@@ -397,10 +407,11 @@ jobs:
             # If network issues (ConnectionRefused):
             bun-fix-network
 
-            # Everything works natively — no proot needed!
+            # Everything works natively — including bunx!
             bun install
             bun run index.ts
-            bun dev
+            bunx prettier --version
+            bunx create-vite my-app
             bun build
             ```
 
