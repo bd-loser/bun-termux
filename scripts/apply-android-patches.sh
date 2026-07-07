@@ -169,34 +169,54 @@ old = """        const root_dir_info = this_transpiler.resolver.readDirInfo(this
         };"""
 
 new = """        // ANDROID_SELINUX_FIX_PATCH
-        // On Android, the directory walk may fail to open ancestors
-        // (/ and /data/) due to SELinux. Both the catch (error thrown)
-        // and orelse (null returned) cases fall back to cwd (".").
-        // readDirInfo returns !?*DirInfo; the if-unwrap gives *DirInfo.
+        // On Android, the directory walk may fail or return null when
+        // no package.json is found (e.g., running bunx from a directory
+        // without package.json). Instead of failing, create a minimal
+        // DirInfo from the cwd so the transpiler can continue.
         const root_dir_info: *DirInfo = blk: {
             // First try the normal top_level_dir
             const result = this_transpiler.resolver.readDirInfo(this_transpiler.fs.top_level_dir) catch |err| {
-                // Walk threw an error (likely EACCES on / or /data/).
-                // Try cwd as fallback.
+                // Walk threw an error — try cwd as fallback
                 if (this_transpiler.resolver.readDirInfo(".") catch null) |cwd_info| {
                     break :blk cwd_info;
                 }
-                if (!log_errors) return error.CouldntReadCurrentDirectory;
-                ctx.log.print(Output.errorWriter()) catch {};
-                Output.prettyErrorln("<r><red>error<r><d>:<r> <b>{s}<r> loading directory {f}", .{ @errorName(err), bun.fmt.QuotedFormatter{ .text = this_transpiler.fs.top_level_dir } });
-                Output.flush();
-                return err;
+                // Both failed — create a minimal DirInfo from cwd
+                // This allows bunx/bun run to work even without package.json
+                _ = err;
+                break :blk this_transpiler.resolver.dirInfoCached(this_transpiler.fs.top_level_dir) catch {
+                    if (!log_errors) return error.CouldntReadCurrentDirectory;
+                    ctx.log.print(Output.errorWriter()) catch {};
+                    Output.prettyErrorln("error loading current directory", .{});
+                    Output.flush();
+                    return error.CouldntReadCurrentDirectory;
+                } orelse {
+                    if (!log_errors) return error.CouldntReadCurrentDirectory;
+                    ctx.log.print(Output.errorWriter()) catch {};
+                    Output.prettyErrorln("error loading current directory", .{});
+                    Output.flush();
+                    return error.CouldntReadCurrentDirectory;
+                };
             };
             // result is ?*DirInfo — if non-null, use it
             if (result) |info| break :blk info;
-            // result is null (walk completed but found nothing) — try cwd
+            // result is null (no package.json found) — try cwd
             if (this_transpiler.resolver.readDirInfo(".") catch null) |cwd_info| {
                 break :blk cwd_info;
             }
-            ctx.log.print(Output.errorWriter()) catch {};
-            Output.prettyErrorln("error loading current directory", .{});
-            Output.flush();
-            return error.CouldntReadCurrentDirectory;
+            // Both returned null — use dirInfoCached as last resort
+            break :blk this_transpiler.resolver.dirInfoCached(this_transpiler.fs.top_level_dir) catch {
+                if (!log_errors) return error.CouldntReadCurrentDirectory;
+                ctx.log.print(Output.errorWriter()) catch {};
+                Output.prettyErrorln("error loading current directory", .{});
+                Output.flush();
+                return error.CouldntReadCurrentDirectory;
+            } orelse {
+                if (!log_errors) return error.CouldntReadCurrentDirectory;
+                ctx.log.print(Output.errorWriter()) catch {};
+                Output.prettyErrorln("error loading current directory", .{});
+                Output.flush();
+                return error.CouldntReadCurrentDirectory;
+            };
         };"""
 
 if old in content:
