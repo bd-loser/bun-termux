@@ -174,14 +174,17 @@ new = """        // ANDROID_SELINUX_FIX_PATCH
         const root_dir_info: *DirInfo = blk: {
             // Try readDirInfo first
             const result = this_transpiler.resolver.readDirInfo(this_transpiler.fs.top_level_dir) catch |err| blk2: {
-                std.debug.print("readDirInfo threw: {s}\\n", .{@errorName(err)});
+                Output.prettyErrorln("readDirInfo threw: {s}", .{@errorName(err)});
+                Output.flush();
                 break :blk2 @as(?*DirInfo, null);
             };
             if (result) |info| {
-                std.debug.print("readDirInfo returned non-null\\n", .{});
+                Output.prettyErrorln("readDirInfo returned non-null", .{});
+                Output.flush();
                 break :blk info;
             }
-            std.debug.print("readDirInfo returned null, creating minimal DirInfo\\n", .{});
+            Output.prettyErrorln("readDirInfo returned null, creating minimal DirInfo", .{});
+            Output.flush();
             // Create a minimal DirInfo using a unique cache key
             var unique_key_buf: [bun.MAX_PATH_BYTES + 1]u8 = undefined;
             const key_len = @min(this_transpiler.fs.top_level_dir.len, bun.MAX_PATH_BYTES);
@@ -189,16 +192,19 @@ new = """        // ANDROID_SELINUX_FIX_PATCH
             unique_key_buf[key_len] = 0;
             const unique_key = unique_key_buf[0..key_len + 1];
             var cache_result = this_transpiler.resolver.dir_cache.getOrPut(unique_key) catch |err| {
-                std.debug.print("getOrPut threw: {s}\\n", .{@errorName(err)});
+                Output.prettyErrorln("getOrPut threw: {s}", .{@errorName(err)});
+                Output.flush();
                 if (!log_errors) return error.CouldntReadCurrentDirectory;
                 ctx.log.print(Output.errorWriter()) catch {};
                 Output.prettyErrorln("error loading current directory", .{});
                 Output.flush();
                 return error.CouldntReadCurrentDirectory;
             };
-            std.debug.print("getOrPut OK, calling put\\n", .{});
+            Output.prettyErrorln("getOrPut OK, calling put", .{});
+            Output.flush();
             break :blk this_transpiler.resolver.dir_cache.put(&cache_result, DirInfo{ .abs_path = this_transpiler.fs.top_level_dir }) catch |err| {
-                std.debug.print("put threw: {s}\\n", .{@errorName(err)});
+                Output.prettyErrorln("put threw: {s}", .{@errorName(err)});
+                Output.flush();
                 if (!log_errors) return error.CouldntReadCurrentDirectory;
                 ctx.log.print(Output.errorWriter()) catch {};
                 Output.prettyErrorln("error loading current directory", .{});
