@@ -95,6 +95,12 @@ jobs:
           grep -n "ANDROID_SELINUX_FIX_PATCH" /tmp/bun-src/src/cli/run_command.zig
           grep -n "ANDROID_SELINUX_FIX_PATCH" /tmp/bun-src/scripts/build/flags.ts
           grep -n "ANDROID_SELINUX_FIX_PATCH" /tmp/bun-src/scripts/build/tools.ts
+          echo ""
+          echo "=== Verify root_path patch ==="
+          grep -A3 "ANDROID_SELINUX_FIX_PATCH.*blocks openat" /tmp/bun-src/src/resolver/resolver.zig
+          echo ""
+          echo "=== Show actual root_path line ==="
+          grep "const root_path" /tmp/bun-src/src/resolver/resolver.zig
 
       - name: Install Bun for bootstrapping
         env:
