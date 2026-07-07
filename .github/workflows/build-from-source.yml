@@ -92,17 +92,47 @@ jobs:
           # The script itself verifies all patches and exits non-zero on failure.
           # If we reach here, all critical patches applied successfully.
           echo ""
-          echo "=== Additional verification: root_path patch ==="
-          # This is THE most critical patch — verify it explicitly.
-          if grep -q "ANDROID_TERMUX_FIX.*root_path = path" /tmp/bun-src/src/resolver/resolver.zig; then
-            echo "  [OK] root_path = path (cwd) — prevents ancestor walk"
+          echo "=== Additional verification: root_path patch (THE bunx fix) ==="
+          # The root_path patch changes `path[0..1]` (== "/") to just `path` (cwd)
+          # so the walk-up loop never queues inaccessible ancestors like / and /data.
+          # Verify three things:
+          #   1. The ANDROID_TERMUX_FIX marker is present in resolver.zig
+          #   2. The comment describing the root_path fix is present
+          #   3. The old `path[0..1]` pattern is GONE from the root_path block
+          PATCH_OK=true
+          if grep -q "ANDROID_TERMUX_FIX" /tmp/bun-src/src/resolver/resolver.zig; then
+            echo "  [OK] ANDROID_TERMUX_FIX marker present in resolver.zig"
           else
-            echo "  [FAIL] root_path patch NOT applied! bunx will still crash."
+            echo "  [FAIL] ANDROID_TERMUX_FIX marker NOT in resolver.zig"
+            PATCH_OK=false
+          fi
+          if grep -q "set root_path = path (the cwd itself)" /tmp/bun-src/src/resolver/resolver.zig; then
+            echo "  [OK] root_path = path (cwd) comment present — prevents ancestor walk"
+          else
+            echo "  [FAIL] root_path fix comment NOT found"
+            PATCH_OK=false
+          fi
+          # Extract the root_path block (5 lines after `const root_path`) and
+          # confirm `path[0..1]` is gone. It should now end with just `path;`.
+          ROOT_BLOCK=$(grep -A5 "const root_path" /tmp/bun-src/src/resolver/resolver.zig)
+          if echo "$ROOT_BLOCK" | grep -q "path\[0\.\.1\]"; then
+            echo "  [FAIL] old path[0..1] pattern still present — root_path NOT patched"
+            PATCH_OK=false
+          else
+            echo "  [OK] old path[0..1] pattern removed from root_path block"
+          fi
+          if [ "$PATCH_OK" != "true" ]; then
+            echo ""
+            echo "  [FATAL] root_path verification failed — bunx will still crash."
+            echo "  Patched root_path block:"
+            echo "$ROOT_BLOCK"
             exit 1
           fi
           echo ""
-          echo "=== Show patched root_path ==="
-          grep -A2 "const root_path" /tmp/bun-src/src/resolver/resolver.zig
+          echo "  [SUCCESS] root_path patch verified — bunx should work!"
+          echo ""
+          echo "=== Show patched root_path block ==="
+          grep -A5 "const root_path" /tmp/bun-src/src/resolver/resolver.zig
           echo ""
           echo "=== Show AccessDenied continue patch ==="
           grep -B1 -A4 "error.AccessDenied => {" /tmp/bun-src/src/resolver/resolver.zig
