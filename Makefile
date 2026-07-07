@@ -53,9 +53,8 @@ deb: build
 	TMPUSR="$$ROOT/data/data/com.termux/files/usr"; \
 	mkdir -p "$$ROOT/DEBIAN" "$$TMPUSR/bin" "$$TMPUSR/lib/bun-termux"; \
 	install -m755 $(RUNTIME_BIN) "$$TMPUSR/lib/bun-termux/bun"; \
-	echo '#!/data/data/com.termux/files/usr/bin/bash' > "$$TMPUSR/bin/bun"; \
-	echo 'exec /data/data/com.termux/files/usr/lib/bun-termux/bun "$$@"' >> "$$TMPUSR/bin/bun"; \
-	chmod 755 "$$TMPUSR/bin/bun"; \
+	install -m755 scripts/launcher-bun.sh "$$TMPUSR/bin/bun"; \
+	install -m755 scripts/launcher-bunx.sh "$$TMPUSR/bin/bunx"; \
 	install -m755 scripts/fix-bun-network.sh "$$TMPUSR/bin/bun-fix-network"; \
 	cat > "$$ROOT/DEBIAN/control" << CONTROL; \
 	Package: bun; \
@@ -81,9 +80,8 @@ pacman: build
 	TMPUSR="$$ROOT/data/data/com.termux/files/usr"; \
 	mkdir -p "$$TMPUSR/bin" "$$TMPUSR/lib/bun-termux"; \
 	install -m755 $(RUNTIME_BIN) "$$TMPUSR/lib/bun-termux/bun"; \
-	echo '#!/data/data/com.termux/files/usr/bin/bash' > "$$TMPUSR/bin/bun"; \
-	echo 'exec /data/data/com.termux/files/usr/lib/bun-termux/bun "$$@"' >> "$$TMPUSR/bin/bun"; \
-	chmod 755 "$$TMPUSR/bin/bun"; \
+	install -m755 scripts/launcher-bun.sh "$$TMPUSR/bin/bun"; \
+	install -m755 scripts/launcher-bunx.sh "$$TMPUSR/bin/bunx"; \
 	install -m755 scripts/fix-bun-network.sh "$$TMPUSR/bin/bun-fix-network"; \
 	cat > "$$ROOT/.PKGINFO" << PKGINFO; \
 	pkgname = bun; \

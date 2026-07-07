@@ -53,6 +53,23 @@ fi
 exec grun "$BUN_BIN" "$@"
 LAUNCHER
     chmod 755 "$pkgdir$prefix/bin/bun"
+
+    # bunx launcher — uses `exec -a "bunx"` to set argv[0]="bunx" so
+    # Bun's isBunX() detection (src/cli/cli.zig, ends-with "bunx")
+    # routes to BunxCommand. A plain `exec bun` would set argv[0] to
+    # the binary path (ending in "bun"), failing the isBunX() check.
+    cat > "$pkgdir$prefix/bin/bunx" <<'LAUNCHER_BUNX'
+#!/usr/bin/env bash
+set -euo pipefail
+PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
+BUN_BIN="$PREFIX/lib/bun/bun"
+if [[ ! -x "$BUN_BIN" ]]; then
+    echo "Error: Bun runtime not found at $BUN_BIN" >&2
+    exit 1
+fi
+exec -a "bunx" grun "$BUN_BIN" "$@"
+LAUNCHER_BUNX
+    chmod 755 "$pkgdir$prefix/bin/bunx"
 }
 
 package() {

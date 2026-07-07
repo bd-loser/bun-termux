@@ -54,7 +54,50 @@ pacman -U bun-1.3.14-1-aarch64.pkg.tar.xz
 bun --version
 bun run script.ts
 bun install
+bunx prettier --version     # bunx works! (see note below)
 ```
+
+## bunx — the missing piece (IMPORTANT)
+
+Bun detects `bunx` mode by checking if `argv[0]` **ends with the string
+`"bunx"`** (see `src/cli/cli.zig`, function `isBunX()`). A plain symlink
+or `exec bun` would set `argv[0]` to the binary path (ending in `"bun"`),
+failing this check — so `bunx` would either not exist as a command or
+would fall through to an unpatched `~/.bun/bin/bunx` left over from
+`curl https://bun.sh/install | bash`.
+
+This package installs a dedicated `bunx` launcher at
+`$PREFIX/bin/bunx` that uses the bash builtin **`exec -a "bunx"`** to
+set `argv[0]="bunx"` while still executing the patched Bun binary.
+The launcher also loads the `libbun-android-fix.so` LD_PRELOAD shim,
+matching the behavior of the `bun` launcher.
+
+### If you see `CouldntReadCurrentDirectory` after install
+
+You almost certainly have a stale, unpatched `bunx` earlier in your
+`PATH` (typically `~/.bun/bin/bunx` from the official Bun installer).
+The `postinst` script detects this and warns. To fix:
+
+```bash
+# Option 1: remove the conflicting bunx
+rm ~/.bun/bin/bunx
+
+# Option 2: ensure Termux's bin comes first in PATH
+echo 'export PATH=$PREFIX/bin:$PATH' >> ~/.bashrc
+source ~/.bashrc
+
+# Verify the RIGHT bunx is being used
+which bunx
+# Should print: /data/data/com.termux/files/usr/bin/bunx
+```
+
+### `bun x` as an alternative
+
+`bun x <package>` is equivalent to `bunx <package>` — both route to
+`BunxCommand.exec()`. If you cannot install the `bunx` launcher for
+some reason, `bun x` works as a fallback (the `bun` launcher sets
+`argv[0]` to the binary path, but Bun's `RootCommandMatcher.case("x")`
+routes to `BunxCommand` for the `x` subcommand).
 
 ## Why the network fix?
 
@@ -93,11 +136,15 @@ sed -i '/bun-fix-network begin/,/bun-fix-network end/d' ~/.bashrc
 ## Architecture
 
 ```
-/usr/bin/bun                → launcher shell script
+/usr/bin/bun                → launcher shell script (loads LD_PRELOAD shim)
+/usr/bin/bunx               → launcher shell script (exec -a "bunx" + shim)
 /usr/bin/bun-fix-network    → network fix script
 /usr/lib/bun-termux/bun     → Android-native Bun binary (Bionic-linked)
                               interpreter: /system/bin/linker64
                               No glibc, no grun, no wrapper
+/usr/lib/bun-termux/libbun-android-fix.so
+                            → LD_PRELOAD shim (EACCES fallbacks for
+                              linkat/symlinkat/openat/renameat)
 ```
 
 Supported architectures: `aarch64`, `x86_64`

@@ -313,28 +313,35 @@ jobs:
             install -m755 dist/libbun-android-fix.so "$TMPUSR/lib/bun-termux/libbun-android-fix.so"
           fi
 
-          # Launcher script — ALL commands run natively (no proot!)
-          # bunx is fixed at source level via the resolver.zig patch:
-          #   1. root_path = path (cwd) — prevents ancestor walk to / and /data
-          #   2. AccessDenied → continue (not return null) — belt-and-suspenders
-          #   3. readDirInfo null fallback — synthesizes minimal DirInfo from cwd
-          cat > "$TMPUSR/bin/bun" <<'LAUNCHER'
-          #!/data/data/com.termux/files/usr/bin/bash
-          SHIM="/data/data/com.termux/files/usr/lib/bun-termux/libbun-android-fix.so"
-          BUN_BIN="/data/data/com.termux/files/usr/lib/bun-termux/bun"
-          if [ -z "$LD_PRELOAD" ]; then
-            [ -f "$SHIM" ] && export LD_PRELOAD="$SHIM"
-          else
-            [ -f "$SHIM" ] && export LD_PRELOAD="$SHIM:$LD_PRELOAD"
-          fi
-          # Everything runs natively — bunx, bun run, bun install, bun build.
-          # No proot needed. The resolver patches handle SELinux EACCES.
-          exec "$BUN_BIN" "$@"
-          LAUNCHER
-          chmod 755 "$TMPUSR/bin/bun"
+          # Launcher scripts — install the shared launcher-bun.sh and
+          # launcher-bunx.sh from scripts/. These load the LD_PRELOAD
+          # shim and exec the patched binary.
+          #
+          # CRITICAL: launcher-bunx.sh uses `exec -a "bunx"` to set
+          # argv[0]="bunx" so Bun's isBunX() detection (src/cli/cli.zig)
+          # routes to BunxCommand. Without a bunx launcher, `bunx`
+          # would either be missing or fall through to the official
+          # unpatched ~/.bun/bin/bunx (if installed via curl bun.sh).
+          #
+          # The source-level patches handle the directory walk EACCES:
+          #   1. resolver.zig: root_path = path (cwd) — prevents ancestor walk
+          #   2. resolver.zig: AccessDenied → continue (not return null)
+          #   3. run_command.zig: readDirInfo null fallback — synthesize DirInfo
+          install -m755 scripts/launcher-bun.sh  "$TMPUSR/bin/bun"
+          install -m755 scripts/launcher-bunx.sh "$TMPUSR/bin/bunx"
 
           # Network fix script
           install -m755 scripts/fix-bun-network.sh "$TMPUSR/bin/bun-fix-network"
+
+          # Verify both launchers were installed
+          for bin in bun bunx; do
+            if [ ! -x "$TMPUSR/bin/$bin" ]; then
+              echo "FATAL: $TMPUSR/bin/$bin not installed"
+              exit 1
+            fi
+          done
+          echo "[OK] bun and bunx launchers installed"
+          ls -la "$TMPUSR/bin/"
 
           # Control file
           cat > "$ROOT/DEBIAN/control" <<EOF
@@ -363,6 +370,37 @@ jobs:
           echo ""
           echo "=== Built: dist/bun_${VERSION}-patched_${ARCH}.deb ==="
           ls -la dist/
+
+      - name: Verify deb contents (bun + bunx launchers)
+        run: |
+          set -e
+          DEB=$(ls dist/bun_*-patched_*.deb | head -1)
+          echo "Inspecting: $DEB"
+          mkdir -p /tmp/deb-check
+          dpkg-deb -x "$DEB" /tmp/deb-check
+          echo ""
+          echo "=== Files in /usr/bin/ ==="
+          ls -la /tmp/deb-check/data/data/com.termux/files/usr/bin/
+          echo ""
+          # Both bun AND bunx launchers must be present
+          for bin in bun bunx; do
+            PATH="/tmp/deb-check/data/data/com.termux/files/usr/bin:$PATH"
+            if [ ! -x "/tmp/deb-check/data/data/com.termux/files/usr/bin/$bin" ]; then
+              echo "FATAL: $bin launcher missing from deb"
+              exit 1
+            fi
+          done
+          # Verify bunx launcher uses exec -a (the critical bit)
+          BUNX_CONTENT="/tmp/deb-check/data/data/com.termux/files/usr/bin/bunx"
+          if ! grep -q 'exec -a "bunx"' "$BUNX_CONTENT"; then
+            echo "FATAL: bunx launcher does not use 'exec -a \"bunx\"'"
+            echo "Content:"
+            cat "$BUNX_CONTENT"
+            exit 1
+          fi
+          echo "[OK] bun launcher present"
+          echo "[OK] bunx launcher present and uses 'exec -a \"bunx\"'"
+          rm -rf /tmp/deb-check
 
       - name: Upload DEB artifact
         uses: actions/upload-artifact@v4
@@ -428,6 +466,18 @@ jobs:
             - `openDirForIteration` and `openDirAbsolute`: on `EACCES`, retry
               without `O_DIRECTORY`. The fd won't support `readdir` but callers
               that only stat/access the path will work.
+
+            **Layer 4 — `bunx` launcher (THE missing piece):**
+            - Previous releases installed a `bun` launcher but NOT a `bunx`
+              launcher. So `bunx` would either be missing or fall through to
+              an unpatched `~/.bun/bin/bunx` from `curl bun.sh`, causing the
+              same `CouldntReadCurrentDirectory` even with the patched binary.
+            - This release adds `$PREFIX/bin/bunx` — a dedicated launcher
+              that uses `exec -a "bunx"` (a bash builtin) to set
+              `argv[0]="bunx"` so Bun's `isBunX()` detection in
+              `src/cli/cli.zig` routes to `BunxCommand.exec()`.
+            - The launcher also loads the `libbun-android-fix.so`
+              LD_PRELOAD shim, matching the `bun` launcher.
 
             ## Installation
 

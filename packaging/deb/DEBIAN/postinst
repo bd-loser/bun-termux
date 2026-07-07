@@ -45,8 +45,46 @@ fi
 
 echo "  Useful commands:"
 echo "    bun --version"
-echo "    bun install"
+echo "    bunx prettier --version   (bunx is now installed!)"
 echo "    bun-fix-network    (auto-fix network issues if they appear)"
 echo ""
+
+# Verify bunx launcher is installed (the missing piece that caused
+# CouldntReadCurrentDirectory for users with unpatched ~/.bun/bin/bunx)
+if [ -x "$PREFIX/bin/bunx" ]; then
+    echo "  [OK] bunx launcher installed at $PREFIX/bin/bunx"
+else
+    echo "  [WARN] bunx launcher NOT found at $PREFIX/bin/bunx"
+    echo "         Report this — the package should have installed it."
+fi
+echo ""
+
+# Warn if an unpatched bunx exists earlier in PATH (e.g. from
+# `curl https://bun.sh/install | bash`, which installs to ~/.bun/bin/bunx).
+# That unpatched bunx does NOT have the resolver/run_command patches and
+# will fail with CouldntReadCurrentDirectory. The fix is to either remove
+# ~/.bun/bin/bunx or ensure $PREFIX/bin comes first in PATH.
+CONFLICTING_BUNX=""
+IFS=':' read -ra PATH_DIRS <<< "${PATH:-}"
+for dir in "${PATH_DIRS[@]}"; do
+    if [ "$dir" = "$PREFIX/bin" ]; then
+        break  # $PREFIX/bin comes first — no conflict possible
+    fi
+    if [ -x "$dir/bunx" ] && [ "$dir" != "$PREFIX/bin" ]; then
+        CONFLICTING_BUNX="$dir/bunx"
+        break
+    fi
+done
+if [ -n "$CONFLICTING_BUNX" ]; then
+    echo "  [!] WARNING: An unpatched bunx was found earlier in PATH:"
+    echo "        $CONFLICTING_BUNX"
+    echo "      This will shadow the patched $PREFIX/bin/bunx and cause"
+    echo "      'CouldntReadCurrentDirectory' errors."
+    echo ""
+    echo "      Fix options:"
+    echo "        1. Remove it:  rm $CONFLICTING_BUNX"
+    echo "        2. Reorder PATH so $PREFIX/bin comes first."
+    echo ""
+fi
 
 exit 0

@@ -221,6 +221,20 @@ jobs:
           fi
           LAUNCHER
           chmod 755 "$TMPUSR/bin/bun"
+          # bunx launcher — uses `exec -a "bunx"` so Bun's isBunX()
+          # detection (src/cli/cli.zig, ends-with "bunx") routes to
+          # BunxCommand. Without this, `bunx` would either be missing
+          # or fall through to an unpatched ~/.bun/bin/bunx.
+          #
+          # NOTE: This launcher does NOT use proot. For the UNPATCHED
+          # binary (this build), `bunx` may still hit EACCES on / and
+          # /data/. Users who need bunx should either:
+          #   1. Use the source-patched build (build-from-source.yml),
+          #      which has bunx fixed at the source level, OR
+          #   2. Use `bun x <package>` instead of `bunx <package>` —
+          #      this routes through the same BunxCommand but stays
+          #      inside the proot-wrapped `bun` process.
+          install -m755 scripts/launcher-bunx.sh "$TMPUSR/bin/bunx"
           # Network fix script
           install -m755 scripts/fix-bun-network.sh "$TMPUSR/bin/bun-fix-network"
           # Control file — continuation lines start with ONE space (Debian format).
@@ -344,6 +358,9 @@ jobs:
           exec /data/data/com.termux/files/usr/lib/bun-termux/bun "$@"
           LAUNCHER
           chmod 755 "$TMPUSR/bin/bun"
+          # bunx launcher — uses `exec -a "bunx"` so Bun detects bunx mode.
+          # See the deb build step above for the full rationale.
+          install -m755 scripts/launcher-bunx.sh "$TMPUSR/bin/bunx"
           # Network fix script
           install -m755 scripts/fix-bun-network.sh "$TMPUSR/bin/bun-fix-network"
           # .PKGINFO
