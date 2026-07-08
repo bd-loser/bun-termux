@@ -698,7 +698,12 @@ int execve(const char *pathname, char *const argv[], char *const envp[]) {
             int i = 0;
             new_argv[i++] = (char *)translated;
             if (has_arg) new_argv[i++] = arg_buf;
-            new_argv[i++] = (char *)(argv[0] ? argv[0] : pathname);
+            /* Use pathname (full path), NOT argv[0] — matches Linux kernel
+             * shebang behavior. The kernel replaces argv[0] with the full
+             * script path. Using argv[0] (which may be just "ng") causes
+             * the interpreter (node) to fail resolving the script relative
+             * to cwd instead of using the full path. */
+            new_argv[i++] = (char *)pathname;
             for (int j = 1; j < orig_argc; j++) new_argv[i++] = argv[j];
             new_argv[i] = NULL;
 
