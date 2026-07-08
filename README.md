@@ -94,27 +94,30 @@ Bun's directory resolver walks UP from the cwd to `/` and tries `opendir()` on e
 
 This affected `bunx` most because it's the only command that calls `configureEnvForRun` with the linker enabled, triggering the directory walk.
 
-### The fix: LD_PRELOAD shim (no source patches)
+### The fix: hybrid (source patches + LD_PRELOAD shim)
 
-**Previous versions** patched Bun's Zig source (resolver.zig, run_command.zig, bun.zig). **These source patches are now REMOVED** — the `libbun-android-fix.so` LD_PRELOAD shim handles everything at the syscall level, which is strictly better:
+Two complementary fix layers are needed because Bun uses **two different syscall paths**:
 
-- ✅ Works for ALL callers of `openat` (not just the resolver)
-- ✅ Does NOT disable ancestor walking (restores monorepo support)
-- ✅ Survives Bun version upgrades without source patch maintenance
+**1. Source patches** (for the resolver walk)
+Bun's directory resolver uses `std.fs.openDirAbsoluteZ` → Zig's `std.os.linux.openat` — a **raw syscall** (inline asm, NOT libc). LD_PRELOAD shims can ONLY intercept libc function calls, not raw syscalls. Therefore source patches are required:
 
-**Shim interceptors:**
+- `resolver.zig Layer 1a`: `root_path = path` (cwd) instead of `path[0..1]` (`/`) — prevents the walk from ever queuing `/`, `/data` as ancestors
+- `resolver.zig Layer 1b`: `AccessDenied => continue` instead of `return null` — belt-and-suspenders
+- `run_command.zig Layer 2`: synthesize minimal `DirInfo` when `readDirInfo` returns null — final fallback
+
+**2. LD_PRELOAD shim** (for libc calls)
+`libbun-android-fix.so` intercepts libc-level calls that the source patches can't reach:
 
 | Interceptor | What it fixes |
 |-------------|---------------|
-| `openat` 3-tier EACCES fallback | Ancestor walk (returns `safe_dir_fd` duplicate for `/`, `/data`) |
+| `linkat`/`symlinkat`/`renameat` | Copy-on-EACCES fallback (`bun install`) |
 | `fopen`/`fopen64` | Redirect `/etc/resolv.conf` → `$PREFIX/etc/` (DNS) |
 | `mkdir`/`symlink` | Translate `/tmp` → `$TMPDIR` (`bun --bun`) |
 | `execve` | Shebang translation `/usr/bin/` → `$PREFIX/bin/` |
-| `linkat`/`symlinkat`/`renameat` | Copy-on-EACCES fallback (`bun install`) |
 | `getcwd` | Fallback to `/proc/self/cwd` or `$PWD` on EACCES |
 | `/proc/stat` fake | `os.cpus()` returns real CPU count (via `memfd_create`) |
 
-**`bunx` launcher** (packaging)
+**3. `bunx` launcher** (packaging)
 - Uses `exec -a "bunx"` to set `argv[0]="bunx"` so Bun's `isBunX()` detection routes to `BunxCommand.exec()`
 
 ### The network problem
@@ -195,12 +198,11 @@ HTTP_PROXY= HTTPS_PROXY= bun install
 <details>
 <summary><b>Monorepo: enclosing package.json not found</b></summary>
 
-**Fixed in current version!** Previous versions had a source patch (`root_path = cwd`) that disabled ancestor walking, breaking monorepo support. The shim-based approach now handles EACCES at the syscall level, so ancestor walking works naturally — Bun finds enclosing `package.json` from parent directories.
+Layer 1a (`root_path = cwd`) disables ancestor walking to prevent the resolver from hitting EACCES on `/` and `/data` (raw syscalls that the shim can't intercept). This means Bun can't find `package.json` from parent directories.
 
-If you still see issues, verify the shim is loaded:
-```bash
-BUN_FIX_DEBUG=1 bun --version 2>&1 | grep "libbun-android-fix"
-```
+**Workaround**: always run `bun` from the project root, or set `npm_package_name` manually.
+
+This is a known limitation. The alternative (removing Layer 1a and relying on the shim alone) doesn't work because Bun's resolver uses raw syscalls, not libc calls.
 
 </details>
 
@@ -299,9 +301,10 @@ This project builds on the work of several people:
 - **[opencode-termux](https://github.com/Hope2333/opencode-termux)** — related Termux packaging work
 
 **This fork adds:**
-- `libbun-android-fix.so` LD_PRELOAD shim — handles ALL Android SELinux EACCES issues at the syscall level (no source patches needed!)
+- Source patches (resolver.zig, run_command.zig) — fix the directory resolver walk (raw syscalls)
+- `libbun-android-fix.so` LD_PRELOAD shim — fix libc-level calls (linkat, fopen, /proc/stat, etc.)
 - `bunx` launcher using `exec -a "bunx"` for proper `isBunX()` detection
-- Build-only patches for NDK clang 18 cross-compilation (no runtime behavior changes)
+- Build patches for NDK clang 18 cross-compilation
 - Bionic-native (no glibc-runner, no userland exec) — runs directly via `/system/bin/linker64`
 
 Developed with AI assistance for deep source-code analysis of the Bun runtime.

@@ -84,54 +84,47 @@ jobs:
           git submodule update --init --recursive --depth 1
           echo "Source size: $(du -sh . | cut -f1)"
 
-      - name: Apply Android/Termux build patches (with strict verification)
+      - name: Apply Android/Termux patches (source + build, with strict verification)
         run: |
-          echo "=== Applying build patches ==="
+          echo "=== Applying patches (hybrid: source + shim) ==="
           chmod +x scripts/apply-android-patches.sh
           bash scripts/apply-android-patches.sh /tmp/bun-src
-          # The script itself verifies all build patches and exits non-zero on failure.
-          # If we reach here, all build patches applied successfully.
+          # The script itself verifies all patches and exits non-zero on failure.
           echo ""
-          echo "=== Verify NO source-level patches are applied (shim handles runtime) ==="
-          # Source patches (Layers 1a/1b/2/3a/3b) were REMOVED because the
-          # LD_PRELOAD shim (libbun-android-fix.so) now handles all EACCES
-          # issues at the syscall level. Verify the source is UNPATCHED:
+          echo "=== Verify source patches are applied (required for resolver walk) ==="
+          # Source patches ARE needed because Bun's resolver uses raw syscalls
+          # (Zig inline asm) that LD_PRELOAD cannot intercept. The shim handles
+          # libc calls (linkat, fopen, etc.) but NOT the resolver's openat.
           PATCH_OK=true
           if grep -q "ANDROID_TERMUX_FIX" /tmp/bun-src/src/resolver/resolver.zig; then
-            echo "  [FAIL] ANDROID_TERMUX_FIX marker found in resolver.zig — source patches should NOT be applied!"
-            PATCH_OK=false
+            echo "  [OK] resolver.zig patched (root_path = cwd, AccessDenied continue)"
           else
-            echo "  [OK] resolver.zig is UNPATCHED — shim will handle EACCES at runtime"
+            echo "  [FAIL] resolver.zig NOT patched — bunx will crash!"
+            PATCH_OK=false
           fi
           if grep -q "ANDROID_TERMUX_FIX" /tmp/bun-src/src/cli/run_command.zig; then
-            echo "  [FAIL] ANDROID_TERMUX_FIX marker found in run_command.zig — source patches should NOT be applied!"
-            PATCH_OK=false
+            echo "  [OK] run_command.zig patched (CouldntReadCurrentDirectory fallback)"
           else
-            echo "  [OK] run_command.zig is UNPATCHED — shim will handle EACCES at runtime"
-          fi
-          if grep -q "ANDROID_TERMUX_FIX" /tmp/bun-src/src/bun.zig; then
-            echo "  [FAIL] ANDROID_TERMUX_FIX marker found in bun.zig — source patches should NOT be applied!"
+            echo "  [FAIL] run_command.zig NOT patched"
             PATCH_OK=false
-          else
-            echo "  [OK] bun.zig is UNPATCHED — shim will handle EACCES at runtime"
           fi
-          # Verify root_path is the ORIGINAL (path[0..1]) — ancestor walking is restored
+          # Verify root_path is patched (path, not path[0..1])
           ROOT_BLOCK=$(grep -A5 "const root_path" /tmp/bun-src/src/resolver/resolver.zig)
           if echo "$ROOT_BLOCK" | grep -q "path\[0\.\.1\]"; then
-            echo "  [OK] root_path is original (path[0..1] = '/') — ancestor walking restored (monorepo support!)"
-          else
-            echo "  [FAIL] root_path is not original — should be path[0..1]"
+            echo "  [FAIL] root_path still uses path[0..1] — patch did not apply"
             PATCH_OK=false
+          else
+            echo "  [OK] root_path = path (cwd) — prevents ancestor walk to /"
           fi
           if [ "$PATCH_OK" != "true" ]; then
             echo ""
-            echo "  [FATAL] Source patch verification failed — dead patches still present."
+            echo "  [FATAL] Source patch verification failed — bunx will crash."
             exit 1
           fi
           echo ""
-          echo "  [SUCCESS] Source is clean — all runtime fixes are in libbun-android-fix.so (shim)"
+          echo "  [SUCCESS] Source patches verified — bunx will work!"
           echo ""
-          echo "=== Show original root_path block (should be path[0..1]) ==="
+          echo "=== Show patched root_path block ==="
           grep -A5 "const root_path" /tmp/bun-src/src/resolver/resolver.zig
 
       - name: Install Bun for bootstrapping
@@ -348,12 +341,13 @@ jobs:
           Maintainer: bd-loser
           Section: utils
           Priority: optional
-          Description: Android-native Bun runtime (shim-based for Termux, bunx FIXED)
-           Bun v$VERSION with libbun-android-fix.so LD_PRELOAD shim for Android
-           SELinux compatibility. No source patches, no proot, no root required.
+          Description: Android-native Bun runtime (hybrid patches for Termux, bunx FIXED)
+           Bun v$VERSION with source patches (resolver.zig, run_command.zig) for
+           the directory walk + LD_PRELOAD shim for libc calls. No proot, no root.
            Works natively on Termux — including bunx.
-           Shim: openat safe_dir_fd duplicate, /proc/stat fake, fopen DNS redirect,
-           /tmp translate, execve shebang translate, linkat copy-on-EACCES.
+           Source: root_path=cwd, AccessDenied=continue, DirInfo fallback.
+           Shim: linkat copy-on-EACCES, fopen DNS redirect, /tmp translate,
+           execve shebang, /proc/stat fake.
           Depends: bash, ncurses, curl
           EOF
           echo "Installed-Size: $(du -sk "$ROOT" | cut -f1)" >> "$ROOT/DEBIAN/control"
@@ -430,54 +424,42 @@ jobs:
           files: dist/*
           generate_release_notes: true
           body: |
-            # Bun for Termux v${{ github.event.inputs.version || '1.3.14' }} — Shim-Based (bunx FIXED)
+            # Bun for Termux v${{ github.event.inputs.version || '1.3.14' }} — Hybrid (bunx FIXED)
 
-            This is Bun built from source with **build-only patches** (no source-level
-            runtime patches). All Android SELinux EACCES issues are handled at runtime
-            by the `libbun-android-fix.so` LD_PRELOAD shim.
+            This is Bun built from source with **source patches + LD_PRELOAD shim**.
             **No proot, no root required.** Works natively on Termux — including `bunx`.
 
-            ## Architecture: shim-first (no source patches)
+            ## Architecture: hybrid (source patches + shim)
 
-            Previous versions patched Bun's Zig source (resolver.zig, run_command.zig,
-            bun.zig) to work around Android SELinux EACCES errors. **These source
-            patches are now REMOVED** — the LD_PRELOAD shim handles everything at the
-            syscall level, which is strictly better:
+            Two complementary fix layers are needed because Bun uses two different
+            syscall paths:
 
-            - Works for ALL callers of openat (not just the resolver)
-            - Does NOT disable ancestor walking (restores monorepo support —
-              enclosing package.json from parent dirs is now found correctly)
-            - Survives Bun version upgrades without source patch maintenance
+            **1. Source patches (for the resolver walk)**
+            Bun's directory resolver uses `std.fs.openDirAbsoluteZ` → Zig's
+            `std.os.linux.openat` — a **raw syscall** (inline asm, NOT libc).
+            LD_PRELOAD shims can ONLY intercept libc function calls, not raw syscalls.
+            Therefore source patches are required:
 
-            ### How the shim fixes the `bunx` crash
+            - `resolver.zig Layer 1a`: `root_path = path` (cwd) instead of `path[0..1]`
+              (`/`) — prevents the walk from ever queuing `/`, `/data` as ancestors
+            - `resolver.zig Layer 1b`: `AccessDenied => continue` instead of `return null`
+              — belt-and-suspenders: if 1a is bypassed, walk still won't abort
+            - `run_command.zig Layer 2`: synthesize minimal `DirInfo` when `readDirInfo`
+              returns null — final fallback to prevent `CouldntReadCurrentDirectory`
 
-            The root cause: Bun's directory resolver walks UP from the cwd to `/`
-            and tries `opendir()` on every ancestor. On Android, `/` and `/data`
-            are mode `0771` (system:system), so `opendir()` returns `EACCES` and
-            the walk aborts.
+            **2. LD_PRELOAD shim (for libc calls)**
+            `libbun-android-fix.so` intercepts libc-level calls that the source patches
+            can't reach:
 
-            **Shim fix:** `openat()` interceptor has a 3-tier EACCES fallback:
-            1. Retry without `O_NOFOLLOW`
-            2. Retry without `O_DIRECTORY`
-            3. **Return `fcntl(safe_dir_fd, F_DUPFD_CLOEXEC)`** — gives Bun a valid
-               directory fd (to `$TMPDIR` or `BUN_FIX_FAKE_ROOT`) it can `readdir()` on,
-               so the ancestor walk completes naturally
-
-            ### What else the shim does
-
-            - `/proc/stat` faking via `memfd_create` → fixes `os.cpus()`
+            - `linkat`/`symlinkat`/`renameat` copy-on-EACCES → fixes `bun install`
             - `fopen` redirect `/etc/resolv.conf` → `$PREFIX/etc/` → fixes DNS
             - `mkdir`/`symlink` translate `/tmp` → `$TMPDIR` → fixes `bun --bun`
             - `execve` shebang translation `/usr/bin/` → `$PREFIX/bin/`
-            - `linkat`/`symlinkat`/`renameat` copy-on-EACCES fallback → fixes `bun install`
-            - `__OPEN_NEEDS_MODE` for correct `O_TMPFILE` mode extraction
+            - `/proc/stat` faking via `memfd_create` → fixes `os.cpus()`
 
-            ### `bunx` launcher (THE missing piece)
-
-            Previous releases installed a `bun` launcher but NOT a `bunx` launcher.
-            This release adds `$PREFIX/bin/bunx` — a dedicated launcher that uses
-            `exec -a "bunx"` (a bash builtin) to set `argv[0]="bunx"` so Bun's
-            `isBunX()` detection in `src/cli/cli.zig` routes to `BunxCommand.exec()`.
+            **3. `bunx` launcher (packaging)**
+            Uses `exec -a "bunx"` to set `argv[0]="bunx"` so Bun's `isBunX()` detection
+            routes to `BunxCommand.exec()`.
 
             ## Installation
 
