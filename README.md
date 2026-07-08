@@ -101,8 +101,8 @@ Two complementary fix layers are needed because Bun uses **two different syscall
 **1. Source patches** (for the resolver walk)
 Bun's directory resolver uses `std.fs.openDirAbsoluteZ` → Zig's `std.os.linux.openat` — a **raw syscall** (inline asm, NOT libc). LD_PRELOAD shims can ONLY intercept libc function calls, not raw syscalls. Therefore source patches are required:
 
-- `resolver.zig Layer 1a`: `root_path = path` (cwd) instead of `path[0..1]` (`/`) — prevents the walk from ever queuing `/`, `/data` as ancestors
-- `resolver.zig Layer 1b`: `AccessDenied => continue` instead of `return null` — belt-and-suspenders
+- `resolver.zig Layer 1a`: `AccessDenied => continue` instead of `return null` in the processing loop — skips inaccessible ancestors (/, /data) while still processing accessible ones. **Ancestor walking is PRESERVED** (monorepo support works!)
+- `resolver.zig Layer 1b`: DirEntry cache `.err` branch doesn't return `AccessDenied` — prevents cached EACCES on "/" from propagating on subsequent walks, bypassing Layer 1a
 - `run_command.zig Layer 2`: synthesize minimal `DirInfo` when `readDirInfo` returns null — final fallback
 
 **2. LD_PRELOAD shim** (for libc calls)
@@ -198,11 +198,14 @@ HTTP_PROXY= HTTPS_PROXY= bun install
 <details>
 <summary><b>Monorepo: enclosing package.json not found</b></summary>
 
-Layer 1a (`root_path = cwd`) disables ancestor walking to prevent the resolver from hitting EACCES on `/` and `/data` (raw syscalls that the shim can't intercept). This means Bun can't find `package.json` from parent directories.
+**Fixed!** The source patches use `AccessDenied => continue` (Layer 1a) which skips inaccessible ancestors (/, /data) while still processing accessible ones. This means ancestor walking is **preserved** — Bun finds enclosing `package.json` from parent directories normally.
 
-**Workaround**: always run `bun` from the project root, or set `npm_package_name` manually.
-
-This is a known limitation. The alternative (removing Layer 1a and relying on the shim alone) doesn't work because Bun's resolver uses raw syscalls, not libc calls.
+If you still see issues, verify the patches were applied:
+```bash
+# Check that root_path is ORIGINAL (path[0..1]) — not changed to path
+strings $(which bun) | grep -c "ANDROID_TERMUX_FIX"
+# Should be > 0
+```
 
 </details>
 

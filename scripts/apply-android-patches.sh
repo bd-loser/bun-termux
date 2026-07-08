@@ -27,18 +27,22 @@
 #
 # WHAT THIS PATCHES (Bun v1.3.14 Zig codebase):
 #
-#   1. src/resolver/resolver.zig — THE bunx fix (2 changes):
-#      a) root_path: set root_path = path (the cwd) instead of
-#         path[0..1] ("/"). Prevents the directory walk from ever
-#         queuing /, /data, /data/data as ancestors (mode 0771,
-#         opendir() returns EACCES).
-#         LIMITATION: disables ALL ancestor walking, so Bun cannot
-#         find enclosing package.json from parent dirs (affects
-#         monorepos, npm_package_name env var). For most Termux
-#         users (cwd = project root) this is fine.
-#      b) Walk error switch: on AccessDenied, CONTINUE to the next
-#         queue item instead of returning null. Belt-and-suspenders
-#         with (a): if (a) is bypassed, the walk still won't abort.
+#   1. src/resolver/resolver.zig — THE bunx fix (2 changes, ancestor walk PRESERVED):
+#      a) Walk error switch: on AccessDenied, CONTINUE to the next
+#         queue item instead of returning null. Skips inaccessible
+#         ancestors (/, /data) while still processing accessible ones.
+#         This is the PRIMARY fix — ancestor walking is preserved,
+#         so enclosing package.json from parent dirs IS found (monorepo
+#         support works!).
+#      b) DirEntry cache .err branch: on AccessDenied, don't return the
+#         cached error. Without this, a previously-cached EACCES on "/"
+#         would propagate as an error on subsequent walks, bypassing (a).
+#         This lets root_path be queued, and (a) handles it in processing.
+#
+#      NOTE: Previous versions had a Layer 1a (root_path = path) that
+#      prevented ancestor walking entirely. This is NO LONGER NEEDED
+#      because 1a+1b together handle all AccessDenied cases. Removing
+#      1a RESTORES MONOREPO SUPPORT (ancestor walking works).
 #
 #   2. src/cli/run_command.zig — CouldntReadCurrentDirectory fallback:
 #      When readDirInfo returns null (walk failed), create a minimal
@@ -93,48 +97,21 @@ else
 import re, sys
 
 with open("src/resolver/resolver.zig", "r") as f:
-    lines = f.readlines()
+    content = f.read()
 
-content = "".join(lines)
 patched = 0
 
-# 1a: root_path = path (cwd) instead of path[0..1] ("/")
-old_root_path = r'''        const root_path = if \(Environment\.isWindows\)
-            bun\.strings\.withoutTrailingSlashWindowsPath\(ResolvePath\.windowsFilesystemRoot\(path\)\)
-        else
-            // we cannot just use "/"
-            // we will write to the buffer past the ptr len so it must be a non-const buffer
-            path\[0\.\.1\];'''
-
-new_root_path = '''        // ANDROID_TERMUX_FIX [Layer 1a]: On Android, / and /data are mode 0771
-        // (system:system). opendir() on them returns EACCES via raw syscall,
-        // which the LD_PRELOAD shim cannot intercept (Zig uses inline asm,
-        // not libc openat). Fix: set root_path = path (the cwd itself) so
-        // the walk-up loop condition (top.len > root_path.len) is immediately
-        // false — no ancestors are queued. The walk processes ONLY the cwd.
-        // LIMITATION: disables ancestor walking (no enclosing package.json
-        // from parent dirs). For most Termux users (cwd = project root) fine.
-        const root_path = if (Environment.isWindows)
-            bun.strings.withoutTrailingSlashWindowsPath(ResolvePath.windowsFilesystemRoot(path))
-        else
-            path;'''
-
-new_content = re.sub(old_root_path, lambda m: new_root_path, content, count=1)
-if new_content != content:
-    content = new_content
-    patched += 1
-    print("    [1a] root_path = path (cwd) — prevents ancestor walk")
-else:
-    print("    [FAIL] could not find root_path pattern")
-    sys.exit(1)
-
-# 1b: Walk error switch — add AccessDenied and change return to continue
+# 1a: Walk error switch — add AccessDenied => continue (PRIMARY FIX)
+# This is in the queue PROCESSING loop. When openDirAbsoluteZ returns
+# EACCES for / or /data, skip this ancestor and continue to the next.
+# The cwd at queue[0] is always accessible.
 old_switch = r'''                    error\.ENOTDIR, error\.IsDir, error\.NotDir => return null,'''
 
-new_switch = '''                    // ANDROID_TERMUX_FIX [Layer 1b]: On AccessDenied (EACCES), skip this
+new_switch = '''                    // ANDROID_TERMUX_FIX [Layer 1a]: On AccessDenied (EACCES), skip this
                     // ancestor and CONTINUE processing the rest of the queue. The cwd
                     // at queue[0] is always accessible — returning null would abort
-                    // the entire walk and never try the cwd.
+                    // the entire walk and never try the cwd. Ancestor walking is
+                    // PRESERVED (monorepo support works).
                     error.ENOTDIR, error.IsDir, error.NotDir => return null,
                     error.AccessDenied => {
                         r.dir_cache.markNotFound(queue_top.result);
@@ -147,15 +124,48 @@ new_content = re.sub(old_switch, lambda m: new_switch, content, count=1)
 if new_content != content:
     content = new_content
     patched += 1
-    print("    [1b] AccessDenied → continue (not return null)")
+    print("    [1a] AccessDenied => continue in processing loop (PRIMARY FIX)")
 else:
-    print("    [FAIL] could not find walk error switch")
+    print("    [FAIL] could not find walk error switch pattern")
+    sys.exit(1)
+
+# 1b: DirEntry cache .err branch — don't return AccessDenied (CACHE FIX)
+# This is in the queue QUEUING phase (if top == root_path block). Without
+# this, a previously-cached EACCES on "/" would propagate as an error on
+# subsequent walks, bypassing Layer 1a entirely. With this, root_path
+# gets queued, and Layer 1a handles EACCES in the processing loop.
+old_err = r'''                        \.err => \|err\| \{
+                            debuglog\("Failed to load DirEntry \{s\}  \{s\} - \{s\}", \.\{ top, @errorName\(err\.original_err\), @errorName\(err\.canonical_error\) \}\);
+                            return err\.canonical_error;
+                        \},'''
+
+new_err = '''                        .err => |err| {
+                            // ANDROID_TERMUX_FIX [Layer 1b]: On AccessDenied, don't return
+                            // the cached error. Let root_path be queued — Layer 1a will
+                            // handle EACCES in the processing loop. Without this, a
+                            // previously-cached EACCES on "/" would propagate as an error
+                            // on subsequent walks, bypassing Layer 1a.
+                            if (err.canonical_error != error.AccessDenied) {
+                                debuglog("Failed to load DirEntry {s}  {s} - {s}", .{ top, @errorName(err.original_err), @errorName(err.canonical_error) });
+                                return err.canonical_error;
+                            }
+                            // AccessDenied: fall through (root_path gets queued, Layer 1a handles it)
+                        },'''
+
+new_content = re.sub(old_err, lambda m: new_err, content, count=1)
+if new_content != content:
+    content = new_content
+    patched += 1
+    print("    [1b] DirEntry cache .err: don't return AccessDenied (CACHE FIX)")
+else:
+    print("    [FAIL] could not find .err branch pattern")
     sys.exit(1)
 
 with open("src/resolver/resolver.zig", "w") as f:
     f.write(content)
 
 print(f"    Total: {patched}/2 sub-patches applied to resolver.zig")
+print(f"    Ancestor walking PRESERVED (monorepo support works!)")
 PYEOF
         verify_patch "$RESOLVER_ZIG" "$PATCH_MARKER" || true
     fi

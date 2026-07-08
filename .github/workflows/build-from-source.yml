@@ -97,7 +97,7 @@ jobs:
           # libc calls (linkat, fopen, etc.) but NOT the resolver's openat.
           PATCH_OK=true
           if grep -q "ANDROID_TERMUX_FIX" /tmp/bun-src/src/resolver/resolver.zig; then
-            echo "  [OK] resolver.zig patched (root_path = cwd, AccessDenied continue)"
+            echo "  [OK] resolver.zig patched (AccessDenied continue + cache fix)"
           else
             echo "  [FAIL] resolver.zig NOT patched — bunx will crash!"
             PATCH_OK=false
@@ -108,13 +108,27 @@ jobs:
             echo "  [FAIL] run_command.zig NOT patched"
             PATCH_OK=false
           fi
-          # Verify root_path is patched (path, not path[0..1])
+          # Verify root_path is ORIGINAL (path[0..1]) — ancestor walking preserved!
           ROOT_BLOCK=$(grep -A5 "const root_path" /tmp/bun-src/src/resolver/resolver.zig)
           if echo "$ROOT_BLOCK" | grep -q "path\[0\.\.1\]"; then
-            echo "  [FAIL] root_path still uses path[0..1] — patch did not apply"
-            PATCH_OK=false
+            echo "  [OK] root_path = path[0..1] (ORIGINAL) — ancestor walking preserved (monorepo support!)"
           else
-            echo "  [OK] root_path = path (cwd) — prevents ancestor walk to /"
+            echo "  [FAIL] root_path was changed — should be original path[0..1] for ancestor walking"
+            PATCH_OK=false
+          fi
+          # Verify Layer 1a (AccessDenied => continue) is present
+          if grep -q "error.AccessDenied => {" /tmp/bun-src/src/resolver/resolver.zig; then
+            echo "  [OK] Layer 1a present (AccessDenied => continue in processing loop)"
+          else
+            echo "  [FAIL] Layer 1a missing — EACCES will abort the walk"
+            PATCH_OK=false
+          fi
+          # Verify Layer 1b (cache .err AccessDenied fix) is present
+          if grep -q "err.canonical_error != error.AccessDenied" /tmp/bun-src/src/resolver/resolver.zig; then
+            echo "  [OK] Layer 1b present (cache .err doesn't return AccessDenied)"
+          else
+            echo "  [FAIL] Layer 1b missing — cached EACCES will propagate on subsequent walks"
+            PATCH_OK=false
           fi
           if [ "$PATCH_OK" != "true" ]; then
             echo ""
@@ -424,10 +438,11 @@ jobs:
           files: dist/*
           generate_release_notes: true
           body: |
-            # Bun for Termux v${{ github.event.inputs.version || '1.3.14' }} — Hybrid (bunx FIXED)
+            # Bun for Termux v${{ github.event.inputs.version || '1.3.14' }} — Hybrid (bunx FIXED, monorepo support!)
 
             This is Bun built from source with **source patches + LD_PRELOAD shim**.
             **No proot, no root required.** Works natively on Termux — including `bunx`.
+            **Monorepo support works!** (ancestor walking preserved)
 
             ## Architecture: hybrid (source patches + shim)
 
@@ -440,10 +455,13 @@ jobs:
             LD_PRELOAD shims can ONLY intercept libc function calls, not raw syscalls.
             Therefore source patches are required:
 
-            - `resolver.zig Layer 1a`: `root_path = path` (cwd) instead of `path[0..1]`
-              (`/`) — prevents the walk from ever queuing `/`, `/data` as ancestors
-            - `resolver.zig Layer 1b`: `AccessDenied => continue` instead of `return null`
-              — belt-and-suspenders: if 1a is bypassed, walk still won't abort
+            - `resolver.zig Layer 1a`: `AccessDenied => continue` instead of `return null`
+              in the processing loop — skips inaccessible ancestors (/, /data) while
+              still processing accessible ones. **Ancestor walking is PRESERVED**
+              (monorepo support works!)
+            - `resolver.zig Layer 1b`: DirEntry cache `.err` branch doesn't return
+              `AccessDenied` — prevents cached EACCES on "/" from propagating on
+              subsequent walks, bypassing Layer 1a
             - `run_command.zig Layer 2`: synthesize minimal `DirInfo` when `readDirInfo`
               returns null — final fallback to prevent `CouldntReadCurrentDirectory`
 
@@ -460,6 +478,18 @@ jobs:
             **3. `bunx` launcher (packaging)**
             Uses `exec -a "bunx"` to set `argv[0]="bunx"` so Bun's `isBunX()` detection
             routes to `BunxCommand.exec()`.
+
+            ## What changed from previous versions
+
+            Previous versions had `Layer 1a: root_path = path` which prevented ancestor
+            walking entirely (breaking monorepo support). This has been REPLACED with
+            a two-part fix that preserves ancestor walking:
+
+            - NEW Layer 1a: `AccessDenied => continue` (skips inaccessible ancestors)
+            - NEW Layer 1b: cache `.err` branch doesn't return AccessDenied (cache fix)
+
+            Together, these handle EACCES at both the processing and queueing phases,
+            allowing the walk to complete naturally while skipping inaccessible dirs.
 
             ## Installation
 
