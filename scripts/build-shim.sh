@@ -45,12 +45,13 @@ echo "Compiling: $SRC"
 echo "Output:    $OUT"
 
 # Compile flags:
-# -shared           → shared library (.so)
-# -fPIC             → position-independent code
-# -O2               → optimization
-# -Wall -Wextra     → warnings
-# -ldl              → link against libdl (for dlsym)
-$CC -shared -fPIC -O2 -Wall -Wextra \
+# -shared              → shared library (.so)
+# -fPIC                → position-independent code
+# -O2                  → optimization
+# -Wall -Wextra        → warnings
+# -Wno-nonnull-compare → silence (pathname ? ... : ...) checks on nonnull params
+# -ldl                 → link against libdl (for dlsym)
+$CC -shared -fPIC -O2 -Wall -Wextra -Wno-nonnull-compare \
     -o "$OUT" \
     "$SRC" \
     -ldl

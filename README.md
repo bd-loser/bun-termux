@@ -196,6 +196,82 @@ This is a known limitation documented in `scripts/apply-android-patches.sh`. Rem
 
 </details>
 
+<details>
+<summary><b>Native module install fails (e.g. node-gyp, esbuild)</b></summary>
+
+Some npm packages with native C/C++ code fail to install on Android because Bun's installer doesn't detect the platform correctly. Add `BUN_OPTIONS="--os=android"`:
+
+```bash
+BUN_OPTIONS="--os=android" bun install
+```
+
+For verbose install logs (helps diagnose native module issues):
+
+```bash
+BUN_OPTIONS="--os=android --verbose" bun install
+```
+
+</details>
+
+<details>
+<summary><b>os.cpus() returns empty array</b></summary>
+
+Android SELinux blocks reads of `/proc/stat`. Our LD_PRELOAD shim (v2+) synthesizes a fake `/proc/stat` via `memfd_create` so `os.cpus()` returns the real CPU count. If you're seeing `[]`:
+
+1. Verify the shim is loaded: `BUN_FIX_DEBUG=1 bun -e 'console.log(process.env)' | grep bun-fix`
+2. Update to the latest build — `/proc/stat` faking was added in the v2 shim (commit `feat(shim): port Happ1ness patterns`)
+
+</details>
+
+<details>
+<summary><b>DNS lookup fails (ENOTFOUND)</b></summary>
+
+The shim transparently redirects `/etc/resolv.conf`, `/etc/nsswitch.conf`, and `/etc/hosts` to `$PREFIX/etc/`. If DNS still fails:
+
+```bash
+# Check if resolv.conf exists in Termux prefix
+ls -la $PREFIX/etc/resolv.conf
+
+# If missing, install resolv-conf
+pkg install resolv-conf
+
+# Or create manually
+echo "nameserver 8.8.8.8" > $PREFIX/etc/resolv.conf
+```
+
+</details>
+
+<details>
+<summary><b>#!shebang scripts fail with "No such file or directory"</b></summary>
+
+The shim translates `#!/usr/bin/env node` and similar shebangs to `$PREFIX/bin/env node`. If a script still fails:
+
+```bash
+# Check the shebang
+head -1 problematic_script.js
+
+# Use termux-fix-shebang for non-Bun-executed scripts
+termux-fix-shebang problematic_script.js
+```
+
+</details>
+
+<details>
+<summary><b>bun build --compile output doesn't run</b></summary>
+
+`bun build --compile` on Bionic Bun 1.3.14 has known issues with RELRO segment layout. If your compiled binary fails to start:
+
+```bash
+# Check if RELRO is the issue
+llvm-readelf -lW your-compiled-binary | grep GNU_RELRO
+```
+
+If `GNU_RELRO` is present, the compiled binary may not run on Android. This is a Bun upstream issue (not a Termux packaging issue). Track it at [oven-sh/bun#issues](https://github.com/oven-sh/bun/issues).
+
+For now, use `bun build --target=bun` (non-compiled) as a workaround.
+
+</details>
+
 ---
 
 ## 🙏 Credits
@@ -203,14 +279,23 @@ This is a known limitation documented in `scripts/apply-android-patches.sh`. Rem
 This project builds on the work of several people:
 
 - **[Hope2333/bun-termux](https://github.com/Hope2333/bun-termux)** — upstream fork source, original packaging structure and network fix concept
+- **[Happ1ness-dev/bun-termux](https://github.com/Happ1ness-dev/bun-termux)** — several LD_PRELOAD shim patterns adapted into our `libbun-android-fix.c`:
+  - `safe_dir_fd` duplicate for `O_DIRECTORY` ancestor opens (fixes project root walk)
+  - `/proc/stat` faking via `memfd_create` (fixes `os.cpus()`)
+  - `fopen` redirect for `/etc/resolv.conf` → `$PREFIX/etc/` (fixes DNS)
+  - `mkdir`/`symlink` translation of `/tmp` → `$TMPDIR` (fixes `bun --bun`)
+  - `execve` shebang translation `/usr/bin/` → `$PREFIX/bin/`
+  - `__OPEN_NEEDS_MODE` for correct `O_TMPFILE` mode extraction
+- **[kaan-escober/bun-termux-loader](https://github.com/kaan-escober/bun-termux-loader)** — original userland-exec technique (Happ1ness's base)
 - **[oven-sh/bun](https://github.com/oven-sh/bun)** — the Bun runtime itself, by Jarred Sumner and contributors
 - **[opencode-termux](https://github.com/Hope2333/opencode-termux)** — related Termux packaging work
 
 **This fork adds:**
 - Source-level SELinux patches (resolver.zig, run_command.zig, bun.zig) — fixing `CouldntReadCurrentDirectory` at the root
-- `libbun-android-fix.so` LD_PRELOAD shim for EACCES syscall fallbacks
+- `libbun-android-fix.so` LD_PRELOAD shim for EACCES syscall fallbacks (original approach + Happ1ness patterns)
 - `bunx` launcher using `exec -a "bunx"` for proper `isBunX()` detection
 - Reworked CI with from-source patched builds
+- Bionic-native (no glibc-runner, no userland exec) — runs directly via `/system/bin/linker64`
 
 Developed with AI assistance for deep source-code analysis of the Bun runtime.
 

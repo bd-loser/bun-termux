@@ -1,7 +1,9 @@
 MIT License
 
 Copyright (c) 2026 Hope2333
-Copyright (c) 2026 bd-loser (bunx launcher + source-level SELinux patches)
+Copyright (c) 2026 Happ1ness-dev (shim patterns: /proc/stat, safe_dir_fd, fopen, shebang, /tmp translate)
+Copyright (c) 2026 kaan-escober (original userland-exec technique, bun-termux-loader)
+Copyright (c) 2026 bd-loser (bunx launcher + source-level SELinux patches + Bionic-native shim)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

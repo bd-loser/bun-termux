@@ -286,7 +286,7 @@ jobs:
             NDK_TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
             CC="$NDK_TOOLCHAIN/bin/aarch64-linux-android29-clang"
             mkdir -p dist
-            "$CC" -shared -fPIC -O2 -Wall -Wextra \
+            "$CC" -shared -fPIC -O2 -Wall -Wextra -Wno-nonnull-compare \
               -o dist/libbun-android-fix.so \
               src/libbun-android-fix.c \
               -ldl

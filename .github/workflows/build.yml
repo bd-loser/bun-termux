@@ -95,7 +95,7 @@ jobs:
           echo "CC=$CC"
           "$CC" --version
           mkdir -p dist
-          "$CC" -shared -fPIC -O2 -Wall -Wextra \
+          "$CC" -shared -fPIC -O2 -Wall -Wextra -Wno-nonnull-compare \
             -o dist/libbun-android-fix.so \
             src/libbun-android-fix.c \
             -ldl
