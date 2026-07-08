@@ -94,29 +94,34 @@ Bun's directory resolver walks UP from the cwd to `/` and tries `opendir()` on e
 
 This affected `bunx` most because it's the only command that calls `configureEnvForRun` with the linker enabled, triggering the directory walk.
 
-### The fix (3 layers)
+### The fix: LD_PRELOAD shim (no source patches)
 
-**Layer 1 — `src/resolver/resolver.zig`** (source patch)
-- `root_path = path` (cwd) instead of `path[0..1]` (`/`) — walk never queues inaccessible ancestors
-- `AccessDenied => continue` instead of `return null` — skips inaccessible ancestors cleanly
+**Previous versions** patched Bun's Zig source (resolver.zig, run_command.zig, bun.zig). **These source patches are now REMOVED** — the `libbun-android-fix.so` LD_PRELOAD shim handles everything at the syscall level, which is strictly better:
 
-**Layer 2 — `src/cli/run_command.zig`** (source patch)
-- When `readDirInfo` returns `null`, synthesize a minimal `DirInfo` from cwd instead of returning `CouldntReadCurrentDirectory`
+- ✅ Works for ALL callers of `openat` (not just the resolver)
+- ✅ Does NOT disable ancestor walking (restores monorepo support)
+- ✅ Survives Bun version upgrades without source patch maintenance
 
-**Layer 3 — `src/bun.zig`** (source patch)
-- `openDirForIteration` / `openDirAbsolute`: on `EACCES`, retry without `O_DIRECTORY`
+**Shim interceptors:**
 
-**Layer 4 — `libbun-android-fix.so`** (LD_PRELOAD shim)
-- Intercepts `linkat`/`symlinkat`/`openat`/`renameat` — falls back to copy on EACCES
+| Interceptor | What it fixes |
+|-------------|---------------|
+| `openat` 3-tier EACCES fallback | Ancestor walk (returns `safe_dir_fd` duplicate for `/`, `/data`) |
+| `fopen`/`fopen64` | Redirect `/etc/resolv.conf` → `$PREFIX/etc/` (DNS) |
+| `mkdir`/`symlink` | Translate `/tmp` → `$TMPDIR` (`bun --bun`) |
+| `execve` | Shebang translation `/usr/bin/` → `$PREFIX/bin/` |
+| `linkat`/`symlinkat`/`renameat` | Copy-on-EACCES fallback (`bun install`) |
+| `getcwd` | Fallback to `/proc/self/cwd` or `$PWD` on EACCES |
+| `/proc/stat` fake | `os.cpus()` returns real CPU count (via `memfd_create`) |
 
-**Layer 5 — `bunx` launcher** (packaging)
+**`bunx` launcher** (packaging)
 - Uses `exec -a "bunx"` to set `argv[0]="bunx"` so Bun's `isBunX()` detection routes to `BunxCommand.exec()`
 
 ### The network problem
 
-Bun's c-ares DNS resolver hardcodes `/etc/resolv.conf`, which doesn't exist on Termux (it's at `$PREFIX/etc/resolv.conf`). When Bun can't find it, it falls back to `8.8.8.8`/`1.1.1.1`, which are blocked on many APAC carriers (UDP/53 refused).
+Bun's c-ares DNS resolver hardcodes `/etc/resolv.conf`, which doesn't exist on Termux (it's at `$PREFIX/etc/resolv.conf`). The shim transparently redirects `fopen("/etc/resolv.conf")` → `$PREFIX/etc/resolv.conf`, so c-ares finds the right file.
 
-`bun-fix-network` routes Bun through a local `tinyproxy` on `127.0.0.1:8888`, which uses Android's `getaddrinfo` (same path `curl` uses).
+If DNS still fails (e.g. APAC carrier blocks UDP/53), `bun-fix-network` routes Bun through a local `tinyproxy` on `127.0.0.1:8888`, which uses Android's `getaddrinfo` (same path `curl` uses).
 
 ---
 
@@ -190,9 +195,12 @@ HTTP_PROXY= HTTPS_PROXY= bun install
 <details>
 <summary><b>Monorepo: enclosing package.json not found</b></summary>
 
-Layer 1a (`root_path = cwd`) disables ancestor walking, so Bun can't find `package.json` from parent directories. **Workaround**: always run `bun` from the project root, or set `npm_package_name` manually.
+**Fixed in current version!** Previous versions had a source patch (`root_path = cwd`) that disabled ancestor walking, breaking monorepo support. The shim-based approach now handles EACCES at the syscall level, so ancestor walking works naturally — Bun finds enclosing `package.json` from parent directories.
 
-This is a known limitation documented in `scripts/apply-android-patches.sh`. Removing Layer 1a and relying on Layer 1b alone would restore ancestor walking, but is riskier.
+If you still see issues, verify the shim is loaded:
+```bash
+BUN_FIX_DEBUG=1 bun --version 2>&1 | grep "libbun-android-fix"
+```
 
 </details>
 
@@ -291,10 +299,9 @@ This project builds on the work of several people:
 - **[opencode-termux](https://github.com/Hope2333/opencode-termux)** — related Termux packaging work
 
 **This fork adds:**
-- Source-level SELinux patches (resolver.zig, run_command.zig, bun.zig) — fixing `CouldntReadCurrentDirectory` at the root
-- `libbun-android-fix.so` LD_PRELOAD shim for EACCES syscall fallbacks (original approach + Happ1ness patterns)
+- `libbun-android-fix.so` LD_PRELOAD shim — handles ALL Android SELinux EACCES issues at the syscall level (no source patches needed!)
 - `bunx` launcher using `exec -a "bunx"` for proper `isBunX()` detection
-- Reworked CI with from-source patched builds
+- Build-only patches for NDK clang 18 cross-compilation (no runtime behavior changes)
 - Bionic-native (no glibc-runner, no userland exec) — runs directly via `/system/bin/linker64`
 
 Developed with AI assistance for deep source-code analysis of the Bun runtime.

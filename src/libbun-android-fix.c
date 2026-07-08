@@ -68,6 +68,15 @@
 #include <unistd.h>
 #include <limits.h>
 
+/* __OPEN_NEEDS_MODE is glibc-internal; Bionic/NDK clang 18 doesn't define it.
+ * Define our own equivalent: open() needs mode if O_CREAT or O_TMPFILE is set.
+ * (O_TMPFILE == (__O_TMPFILE | O_DIRECTORY) on Linux; checking O_TMPFILE
+ *  covers both the O_TMPFILE and the __O_TMPFILE part.) */
+#ifndef __OPEN_NEEDS_MODE
+#define __OPEN_NEEDS_MODE(flags) \
+    (((flags) & O_CREAT) != 0 || ((flags) & O_TMPFILE) != 0)
+#endif
+
 #ifndef PATH_MAX
 #define PATH_MAX 4096
 #endif
