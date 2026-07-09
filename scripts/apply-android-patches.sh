@@ -48,9 +48,22 @@
 #      When readDirInfo returns null (walk failed), create a minimal
 #      DirInfo from the cwd instead of erroring out.
 #
-#   3. scripts/build/flags.ts — cross-compile CPU flag fix
-#   4. scripts/build/tools.ts — accept NDK clang 18
-#   5. C++ dangling-reference fix for clang 18
+#   3. src/exe_format/elf.zig — bun build --compile fix (2 changes):
+#      a) writeBunSection: pick the LAST writable PT_LOAD instead of the
+#         first. With RELRO, the linker can emit two RW PT_LOADs (one
+#         RELRO-covered, one not). Growing the first would swallow the
+#         second, producing overlapping PT_LOADs that Bionic's linker64
+#         rejects with "CANNOT LINK EXECUTABLE". Picking the last RW
+#         PT_LOAD (highest vaddr) means the extension goes past all
+#         other PT_LOADs — no overlap. Works for both single-RW and
+#         split-RW layouts, doesn't regress WSL1.
+#      b) Defensive overlap check after extension — returns a clear
+#         error if the extended segment would overlap another PT_LOAD,
+#         instead of silently producing a broken binary.
+#
+#   4. scripts/build/flags.ts — cross-compile CPU flag fix
+#   5. scripts/build/tools.ts — accept NDK clang 18
+#   6. C++ dangling-reference fix for clang 18
 #
 set -euo pipefail
 
@@ -257,7 +270,108 @@ PYEOF
 fi
 
 # =====================================================================
-# PATCH 3: scripts/build/flags.ts — cross-compile CPU flag fix
+# PATCH 3: src/exe_format/elf.zig — bun build --compile fix
+# =====================================================================
+ELF_ZIG="src/exe_format/elf.zig"
+
+if [ ! -f "$ELF_ZIG" ]; then
+    echo "  [FAIL] $ELF_ZIG not found"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+else
+    if grep -q "$PATCH_MARKER" "$ELF_ZIG" 2>/dev/null; then
+        echo "  [SKIP] $ELF_ZIG already patched"
+    else
+        echo "  [PATCH] $ELF_ZIG"
+        python3 <<'PYEOF'
+import re, sys
+
+with open("src/exe_format/elf.zig", "r") as f:
+    content = f.read()
+
+patched = 0
+
+# 3a: Pick the LAST writable PT_LOAD instead of the first
+# Bug: with RELRO, the linker can emit two RW PT_LOADs. Growing the first
+# would swallow the second, producing overlapping PT_LOADs that Bionic's
+# linker64 rejects. Picking the last (highest vaddr) means the extension
+# goes past all other PT_LOADs — no overlap.
+old_pick = r'''            if \(\(phdr\.p_flags & elf\.PF_W\) != 0 and rw_phdr_index == null\) \{
+                rw_phdr_index = i;
+                rw_phdr = phdr;
+            \}'''
+
+new_pick = '''            // ANDROID_TERMUX_FIX [Layer 4a]: Pick the LAST writable PT_LOAD
+            // (highest vaddr) instead of the first. With RELRO, the linker
+            // can emit two RW PT_LOADs (one RELRO-covered, one not). Growing
+            // the first would swallow the second, producing overlapping
+            // PT_LOADs that Bionic's linker64 rejects with "CANNOT LINK
+            // EXECUTABLE". Picking the last means the extension goes past
+            // all other PT_LOADs — no overlap. Works for both single-RW
+            // and split-RW layouts, doesn't regress WSL1.
+            if ((phdr.p_flags & elf.PF_W) != 0) {
+                rw_phdr_index = i;
+                rw_phdr = phdr;
+            }'''
+
+new_content = re.sub(old_pick, lambda m: new_pick, content, count=1)
+if new_content != content:
+    content = new_content
+    patched += 1
+    print("    [4a] Pick LAST writable PT_LOAD (fixes RELRO overlap)")
+else:
+    print("    [FAIL] could not find PT_LOAD selection pattern")
+    sys.exit(1)
+
+# 3b: Defensive overlap check after extension
+# Returns a clear error if the extended segment would overlap another
+# PT_LOAD, instead of silently producing a broken binary.
+old_extend_end = r'''            const phdr_offset = @as\(usize, @intCast\(ehdr\.e_phoff\)\) \+ rw_index \* phdr_size;
+            @memcpy\(self\.data\.items\[phdr_offset\.\.\]\[0\.\.phdr_size\], std\.mem\.asBytes\(&extended\)\);
+        \}
+    \}'''
+
+new_extend_end = '''            const phdr_offset = @as(usize, @intCast(ehdr.e_phoff)) + rw_index * phdr_size;
+            @memcpy(self.data.items[phdr_offset..][0..phdr_size], std.mem.asBytes(&extended));
+
+            // ANDROID_TERMUX_FIX [Layer 4b]: Defensive overlap check.
+            // Verify no other PT_LOAD overlaps with the extended range.
+            // If this fails, the input binary has an unusual layout that
+            // would produce a broken --compile output — fail loudly.
+            const new_end = rw_phdr.p_vaddr + new_segment_size;
+            for (0..ehdr.e_phnum) |j| {
+                if (j == rw_index) continue;
+                const other_offset = @as(usize, @intCast(ehdr.e_phoff)) + j * phdr_size;
+                const other_phdr = std.mem.bytesAsValue(Elf64_Phdr, self.data.items[other_offset..][0..phdr_size]).*;
+                if (other_phdr.p_type != elf.PT_LOAD) continue;
+                const other_end = other_phdr.p_vaddr + other_phdr.p_memsz;
+                if (other_phdr.p_vaddr < new_end and other_end > rw_phdr.p_vaddr) {
+                    return error.ExtendedSegmentWouldOverlap;
+                }
+            }
+        }
+    }'''
+
+new_content = re.sub(old_extend_end, lambda m: new_extend_end, content, count=1)
+if new_content != content:
+    content = new_content
+    patched += 1
+    print("    [4b] Defensive overlap check after extension")
+else:
+    print("    [FAIL] could not find extension block pattern")
+    sys.exit(1)
+
+with open("src/exe_format/elf.zig", "w") as f:
+    f.write(content)
+
+print(f"    Total: {patched}/2 sub-patches applied to elf.zig")
+print(f"    bun build --compile should now work on Bionic!")
+PYEOF
+        verify_patch "$ELF_ZIG" "$PATCH_MARKER" || true
+    fi
+fi
+
+# =====================================================================
+# PATCH 4: scripts/build/flags.ts — cross-compile CPU flag fix
 # =====================================================================
 FLAGS_TS="scripts/build/flags.ts"
 if [ -f "$FLAGS_TS" ]; then
@@ -329,7 +443,7 @@ echo "PATCH VERIFICATION SUMMARY"
 echo "=========================================="
 
 TOTAL_FAIL=0
-for f in src/resolver/resolver.zig src/cli/run_command.zig scripts/build/flags.ts scripts/build/tools.ts; do
+for f in src/resolver/resolver.zig src/cli/run_command.zig src/exe_format/elf.zig scripts/build/flags.ts scripts/build/tools.ts; do
     if [ -f "$f" ]; then
         if grep -q "$PATCH_MARKER" "$f" 2>/dev/null; then
             COUNT=$(grep -c "$PATCH_MARKER" "$f")

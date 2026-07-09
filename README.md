@@ -104,6 +104,7 @@ Bun's directory resolver uses `std.fs.openDirAbsoluteZ` → Zig's `std.os.linux.
 - `resolver.zig Layer 1a`: `AccessDenied => continue` instead of `return null` in the processing loop — skips inaccessible ancestors (/, /data) while still processing accessible ones. **Ancestor walking is PRESERVED** (monorepo support works!)
 - `resolver.zig Layer 1b`: DirEntry cache `.err` branch doesn't return `AccessDenied` — prevents cached EACCES on "/" from propagating on subsequent walks, bypassing Layer 1a
 - `run_command.zig Layer 2`: synthesize minimal `DirInfo` when `readDirInfo` returns null — final fallback
+- `elf.zig Layer 4`: `writeBunSection` picks the **last** writable PT_LOAD + defensive overlap check — fixes `bun build --compile` on Bionic (RELRO/PT_LOAD overlap issue)
 
 **2. LD_PRELOAD shim** (for libc calls)
 `libbun-android-fix.so` intercepts libc-level calls that the source patches can't reach:
@@ -272,16 +273,18 @@ termux-fix-shebang problematic_script.js
 <details>
 <summary><b>bun build --compile output doesn't run</b></summary>
 
-`bun build --compile` on Bionic Bun 1.3.14 has known issues with RELRO segment layout. If your compiled binary fails to start:
+**Fixed in current version!** The source patch (Layer 4) in `src/exe_format/elf.zig` fixes the RELRO/PT_LOAD overlap issue:
 
+- **Layer 4a**: `writeBunSection` now picks the **last** writable PT_LOAD instead of the first. With RELRO, the linker emits two RW PT_LOADs; growing the first would swallow the second, producing overlapping PT_LOADs that Bionic's `linker64` rejects.
+- **Layer 4b**: Defensive overlap check — if the extended segment would overlap another PT_LOAD, `--compile` fails loudly with `error.ExtendedSegmentWouldOverlap` instead of silently producing a broken binary.
+
+Test it:
 ```bash
-# Check if RELRO is the issue
-llvm-readelf -lW your-compiled-binary | grep GNU_RELRO
+echo 'console.log("Hello from compiled Bun!")' > hello.ts
+bun build --compile hello.ts --outfile hello
+./hello
+# Should print: Hello from compiled Bun!
 ```
-
-If `GNU_RELRO` is present, the compiled binary may not run on Android. This is a Bun upstream issue (not a Termux packaging issue). Track it at [oven-sh/bun#issues](https://github.com/oven-sh/bun/issues).
-
-For now, use `bun build --target=bun` (non-compiled) as a workaround.
 
 </details>
 
