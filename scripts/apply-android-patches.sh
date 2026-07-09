@@ -290,24 +290,13 @@ with open("src/exe_format/elf.zig", "r") as f:
 
 patched = 0
 
-# 3a: Pick the LAST writable PT_LOAD instead of the first
-# Bug: with RELRO, the linker can emit two RW PT_LOADs. Growing the first
-# would swallow the second, producing overlapping PT_LOADs that Bionic's
-# linker64 rejects. Picking the last (highest vaddr) means the extension
-# goes past all other PT_LOADs — no overlap.
+# 4a: Pick the LAST writable PT_LOAD instead of the first
 old_pick = r'''            if \(\(phdr\.p_flags & elf\.PF_W\) != 0 and rw_phdr_index == null\) \{
                 rw_phdr_index = i;
                 rw_phdr = phdr;
             \}'''
 
 new_pick = '''            // ANDROID_TERMUX_FIX [Layer 4a]: Pick the LAST writable PT_LOAD
-            // (highest vaddr) instead of the first. With RELRO, the linker
-            // can emit two RW PT_LOADs (one RELRO-covered, one not). Growing
-            // the first would swallow the second, producing overlapping
-            // PT_LOADs that Bionic's linker64 rejects with "CANNOT LINK
-            // EXECUTABLE". Picking the last means the extension goes past
-            // all other PT_LOADs — no overlap. Works for both single-RW
-            // and split-RW layouts, doesn't regress WSL1.
             if ((phdr.p_flags & elf.PF_W) != 0) {
                 rw_phdr_index = i;
                 rw_phdr = phdr;
@@ -322,9 +311,80 @@ else:
     print("    [FAIL] could not find PT_LOAD selection pattern")
     sys.exit(1)
 
-# 3b: Defensive overlap check after extension
-# Returns a clear error if the extended segment would overlap another
-# PT_LOAD, instead of silently producing a broken binary.
+# 4b: Add sh_addr to BunSectionInfo (needed for offset computation)
+old_struct = r'''    const BunSectionInfo = struct \{
+        /// File offset of the \.bun section's data \(sh_offset\)\.
+        file_offset: u64,
+        /// Index of the \.bun section in the section header table\.
+        section_index: u16,
+    \};'''
+
+new_struct = '''    const BunSectionInfo = struct {
+        /// File offset of the .bun section's data (sh_offset).
+        file_offset: u64,
+        /// Index of the .bun section in the section header table.
+        section_index: u16,
+        /// ANDROID_TERMUX_FIX: Virtual address of .bun section (sh_addr).
+        sh_addr: u64,
+    };'''
+
+new_content = re.sub(old_struct, lambda m: new_struct, content, count=1)
+if new_content != content:
+    content = new_content
+    patched += 1
+    print("    [4b] Add sh_addr to BunSectionInfo")
+else:
+    print("    [FAIL] could not find BunSectionInfo struct")
+    sys.exit(1)
+
+# 4c: Return sh_addr from findBunSection
+old_return = r'''                    return \.\{
+                        \.file_offset = shdr\.sh_offset,
+                        \.section_index = @intCast\(i\),
+                    \};'''
+
+new_return = '''                    return .{
+                        .file_offset = shdr.sh_offset,
+                        .section_index = @intCast(i),
+                        .sh_addr = shdr.sh_addr, // ANDROID_TERMUX_FIX
+                    };'''
+
+new_content = re.sub(old_return, lambda m: new_return, content, count=1)
+if new_content != content:
+    content = new_content
+    patched += 1
+    print("    [4c] Return sh_addr from findBunSection")
+else:
+    print("    [FAIL] could not find findBunSection return")
+    sys.exit(1)
+
+# 4d: Write OFFSET instead of absolute vaddr to BUN_COMPILED.size
+# This is the KEY fix for PIE/ASLR: on Android, PIE binaries are loaded
+# at a random base address. The runtime can't use @ptrFromInt(vaddr)
+# because vaddr is relative to 0, not to the load base. By storing the
+# offset from BUN_COMPILED to the payload, the runtime can use pointer
+# arithmetic (which automatically accounts for the base).
+old_write = r'''std\.mem\.writeInt\(u64, self\.data\.items\[bun_section_offset\.\.\]\[0\.\.8\], new_vaddr, \.little\);'''
+
+new_write = '''// ANDROID_TERMUX_FIX [Layer 4d]: Write OFFSET (not absolute vaddr)
+                    // to BUN_COMPILED.size. On PIE binaries (required on Android),
+                    // the binary is loaded at a random ASLR base. The runtime can't
+                    // use @ptrFromInt(vaddr) — it must use pointer arithmetic:
+                    //   target = &BUN_COMPILED + offset
+                    // This automatically accounts for the ASLR base.
+                    const bun_offset = new_vaddr - bun_section.sh_addr;
+                    std.mem.writeInt(u64, self.data.items[bun_section_offset..][0..8], bun_offset, .little);'''
+
+new_content = re.sub(old_write, lambda m: new_write, content, count=1)
+if new_content != content:
+    content = new_content
+    patched += 1
+    print("    [4d] Write OFFSET (not vaddr) to BUN_COMPILED.size (PIE/ASLR fix)")
+else:
+    print("    [FAIL] could not find BUN_COMPILED.size write")
+    sys.exit(1)
+
+# 4e: Defensive overlap check
 old_extend_end = r'''            const phdr_offset = @as\(usize, @intCast\(ehdr\.e_phoff\)\) \+ rw_index \* phdr_size;
             @memcpy\(self\.data\.items\[phdr_offset\.\.\]\[0\.\.phdr_size\], std\.mem\.asBytes\(&extended\)\);
         \}
@@ -333,10 +393,7 @@ old_extend_end = r'''            const phdr_offset = @as\(usize, @intCast\(ehdr\
 new_extend_end = '''            const phdr_offset = @as(usize, @intCast(ehdr.e_phoff)) + rw_index * phdr_size;
             @memcpy(self.data.items[phdr_offset..][0..phdr_size], std.mem.asBytes(&extended));
 
-            // ANDROID_TERMUX_FIX [Layer 4b]: Defensive overlap check.
-            // Verify no other PT_LOAD overlaps with the extended range.
-            // If this fails, the input binary has an unusual layout that
-            // would produce a broken --compile output — fail loudly.
+            // ANDROID_TERMUX_FIX [Layer 4e]: Defensive overlap check.
             const new_end = rw_phdr.p_vaddr + new_segment_size;
             for (0..ehdr.e_phnum) |j| {
                 if (j == rw_index) continue;
@@ -355,7 +412,7 @@ new_content = re.sub(old_extend_end, lambda m: new_extend_end, content, count=1)
 if new_content != content:
     content = new_content
     patched += 1
-    print("    [4b] Defensive overlap check after extension")
+    print("    [4e] Defensive overlap check after extension")
 else:
     print("    [FAIL] could not find extension block pattern")
     sys.exit(1)
@@ -363,10 +420,78 @@ else:
 with open("src/exe_format/elf.zig", "w") as f:
     f.write(content)
 
-print(f"    Total: {patched}/2 sub-patches applied to elf.zig")
-print(f"    bun build --compile should now work on Bionic!")
+print(f"    Total: {patched}/5 sub-patches applied to elf.zig")
 PYEOF
         verify_patch "$ELF_ZIG" "$PATCH_MARKER" || true
+    fi
+fi
+
+# =====================================================================
+# PATCH 3b: src/standalone_graph/StandaloneModuleGraph.zig — PIE/ASLR fix
+# =====================================================================
+SMG_ZIG="src/standalone_graph/StandaloneModuleGraph.zig"
+
+if [ ! -f "$SMG_ZIG" ]; then
+    echo "  [FAIL] $SMG_ZIG not found"
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+else
+    if grep -q "$PATCH_MARKER" "$SMG_ZIG" 2>/dev/null; then
+        echo "  [SKIP] $SMG_ZIG already patched"
+    else
+        echo "  [PATCH] $SMG_ZIG"
+        python3 <<'PYEOF'
+import re, sys
+
+with open("src/standalone_graph/StandaloneModuleGraph.zig", "r") as f:
+    content = f.read()
+
+# Change getData() to use pointer arithmetic instead of @ptrFromInt(vaddr)
+# Bug: @ptrFromInt(vaddr) uses the raw ELF vaddr as an ABSOLUTE address.
+# On PIE binaries (required on Android), the binary is loaded at a random
+# ASLR base. The payload is at base+vaddr, not at vaddr.
+# Fix: use &BUN_COMPILED + offset (pointer arithmetic accounts for base).
+old = r'''        pub fn getData\(\) \?\[\]const u8 \{
+            const vaddr = \(Bun__getStandaloneModuleGraphELFVaddr\(\) orelse return null\)\.\*;
+            if \(vaddr == 0\) return null;
+            // BUN_COMPILED\.size holds the virtual address of the appended data\.
+            // The kernel mapped it via PT_LOAD, so we can dereference directly\.
+            // Format at target: \[u64 payload_len\]\[payload bytes\]
+            const target: \[\*\]const u8 = @ptrFromInt\(vaddr\);
+            const payload_len = std\.mem\.readInt\(u64, target\[0\.\.8\], \.little\);
+            if \(payload_len < 8\) return null;
+            return target\[8\.\.\]\[0\.\.payload_len\];
+        \}'''
+
+new = '''        pub fn getData() ?[]const u8 {
+            // ANDROID_TERMUX_FIX: Use pointer arithmetic instead of @ptrFromInt.
+            // On PIE binaries (required on Android), the binary is loaded at a
+            // random ASLR base. BUN_COMPILED.size now stores an OFFSET (not an
+            // absolute vaddr). We compute: target = &BUN_COMPILED + offset.
+            // This automatically accounts for the ASLR base address.
+            const ptr = Bun__getStandaloneModuleGraphELFVaddr() orelse return null;
+            const offset = ptr.*;
+            if (offset == 0) return null;
+            const ptr_addr: usize = @intFromPtr(ptr);
+            const target: [*]const u8 = @ptrFromInt(ptr_addr + offset);
+            const payload_len = std.mem.readInt(u64, target[0..8], .little);
+            if (payload_len < 8) return null;
+            return target[8..][0..payload_len];
+        }'''
+
+new_content = re.sub(old, lambda m: new, content, count=1)
+if new_content != content:
+    content = new_content
+    print("    [5a] Use pointer arithmetic for PIE/ASLR (offset instead of vaddr)")
+else:
+    print("    [FAIL] could not find getData() pattern")
+    sys.exit(1)
+
+with open("src/standalone_graph/StandaloneModuleGraph.zig", "w") as f:
+    f.write(content)
+
+print("    Total: 1/1 sub-patches applied to StandaloneModuleGraph.zig")
+PYEOF
+        verify_patch "$SMG_ZIG" "$PATCH_MARKER" || true
     fi
 fi
 
@@ -443,7 +568,7 @@ echo "PATCH VERIFICATION SUMMARY"
 echo "=========================================="
 
 TOTAL_FAIL=0
-for f in src/resolver/resolver.zig src/cli/run_command.zig src/exe_format/elf.zig scripts/build/flags.ts scripts/build/tools.ts; do
+for f in src/resolver/resolver.zig src/cli/run_command.zig src/exe_format/elf.zig src/standalone_graph/StandaloneModuleGraph.zig scripts/build/flags.ts scripts/build/tools.ts; do
     if [ -f "$f" ]; then
         if grep -q "$PATCH_MARKER" "$f" 2>/dev/null; then
             COUNT=$(grep -c "$PATCH_MARKER" "$f")
