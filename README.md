@@ -57,9 +57,9 @@ The tricky part: Bun's resolver uses **raw syscalls** (Zig inline asm, not libc)
 ### Quick install (recommended)
 
 ```bash
-# Download and install the latest .deb in one command
-curl -fsSL https://github.com/bd-loser/bun-termux/releases/latest/download/bun_1.3.14-patched_aarch64.deb -o /tmp/bun.deb && \
-  dpkg -i /tmp/bun.deb && rm /tmp/bun.deb
+# Download and install the latest .deb in one command (uses $TMPDIR — Termux compatible)
+curl -fsSL https://github.com/bd-loser/bun-termux/releases/latest/download/bun_1.3.14-patched_aarch64.deb -o "$TMPDIR/bun.deb" && \
+  dpkg -i "$TMPDIR/bun.deb" && rm "$TMPDIR/bun.deb"
 ```
 
 ### Manual install
@@ -67,15 +67,6 @@ curl -fsSL https://github.com/bd-loser/bun-termux/releases/latest/download/bun_1
 1. Download `bun_1.3.14-patched_aarch64.deb` from [Releases](https://github.com/bd-loser/bun-termux/releases/latest)
 2. Install: `dpkg -i bun_1.3.14-patched_aarch64.deb`
 3. (Optional) Fix network: `bun-fix-network`
-
-### From source (advanced)
-
-```bash
-git clone https://github.com/bd-loser/bun-termux.git
-cd bun-termux
-make deb PKGVER=1.3.14
-dpkg -i dist/bun_1.3.14-patched_aarch64.deb
-```
 
 ### pacman (Arch-style)
 
@@ -274,23 +265,18 @@ termux-fix-shebang problematic_script.js
 
 ---
 
-## 🔨 Building from source
+## 🔨 Building (CI)
 
-```bash
-make deb    PKGVER=1.3.14    # build .deb package
-make pacman PKGVER=1.3.14    # build .pkg.tar.xz package
-```
+Builds are handled by GitHub Actions — no local build required. The **`Build Bun from Source`** workflow cross-compiles with NDK r27c and publishes releases automatically.
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PKGVER` | `1.3.14` | Bun version to package |
-| `ARCH`   | `aarch64` | Target architecture (`aarch64` or `x86_64`) |
-| `PKGREL` | `1` | pacman release number |
-
-For source-patched builds (with all fixes applied at the Zig source level), use the **`Build Bun from Source`** GitHub Actions workflow — it cross-compiles with NDK r27c and publishes a release automatically.
+To trigger a build manually:
+1. Go to [Actions](https://github.com/bd-loser/bun-termux/actions/workflows/build-from-source.yml)
+2. Click **"Run workflow"**
+3. Wait ~30-60 minutes
+4. Download the `.deb` from [Releases](https://github.com/bd-loser/bun-termux/releases/latest)
 
 <details>
-<summary><b>🔍 What the build does</b></summary>
+<summary><b>🔍 What the CI build does</b></summary>
 
 1. Clones `oven-sh/bun` at tag `bun-v1.3.14`
 2. Applies source patches via `scripts/apply-android-patches.sh`:
