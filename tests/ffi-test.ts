@@ -133,6 +133,8 @@ test("readCString from libc strdup", () => {
   lib.symbols.free(dup);
   console.log(`     → strdup + readCString = "${str}"`);
 });
+// Note: readCString does NOT need TinyCC — the test skip was a bug.
+// This test should pass on all builds.
 
 // ─── 3. callback — NEEDS TinyCC ────────────────────────────────────────
 console.log("");
@@ -205,18 +207,20 @@ if (typeof linkSymbols === "undefined") {
 } else {
   test("linkSymbols with C source file", () => {
     // linkSymbols expects: { symbols: {...}, source: "file.c" }
-    // First write a C file
+    // Use $TMPDIR (Termux-compatible) instead of /tmp
     const fs = require("fs");
+    const tmpdir = process.env.TMPDIR || "/tmp";
     const cSource = `
       int add(int a, int b) { return a + b; }
     `;
-    fs.writeFileSync("/tmp/ffi_test.c", cSource);
+    const cFile = `${tmpdir}/ffi_test.c`;
+    fs.writeFileSync(cFile, cSource);
 
     const lib = linkSymbols({
       symbols: {
         add: { args: ["i32", "i32"], returns: "i32" },
       },
-      source: "/tmp/ffi_test.c",
+      source: cFile,
     });
     const result = lib.symbols.add(20, 22);
     assertEqual(result, 42, "add(20, 22) should return 42");
@@ -225,19 +229,21 @@ if (typeof linkSymbols === "undefined") {
 
   test("linkSymbols with factorial", () => {
     const fs = require("fs");
+    const tmpdir = process.env.TMPDIR || "/tmp";
     const cSource = `
       int factorial(int n) {
         if (n <= 1) return 1;
         return n * factorial(n - 1);
       }
     `;
-    fs.writeFileSync("/tmp/ffi_factorial.c", cSource);
+    const cFile = `${tmpdir}/ffi_factorial.c`;
+    fs.writeFileSync(cFile, cSource);
 
     const lib = linkSymbols({
       symbols: {
         factorial: { args: ["i32"], returns: "i32" },
       },
-      source: "/tmp/ffi_factorial.c",
+      source: cFile,
     });
     const result = lib.symbols.factorial(5);
     assertEqual(result, 120, "factorial(5) should return 120");
