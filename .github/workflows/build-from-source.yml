@@ -188,24 +188,32 @@ jobs:
           echo "Bun: $(bun --version)"
           echo "Start: $(date)"
 
-          # Use ccache for faster rebuilds — keep Zig cache for incremental
-          # compilation. Only nuke the build output dir, NOT the caches.
-          # This allows patch-only changes to rebuild in ~10-15 min instead
-          # of 30-60 min from scratch.
-          echo "=== Using cached build (ccache + zig cache preserved) ==="
           BUILD_DIR="build/release"
 
+          # Run build and save FULL output (not just tail -100)
+          # so we can see TinyCC compilation and Zig flags
           bun scripts/build.ts \
             --profile=release \
             --abi=android \
             --arch=aarch64 \
-            --build-dir="$BUILD_DIR" 2>&1 | tail -100 || true
+            --build-dir="$BUILD_DIR" > /tmp/build-output.log 2>&1 || true
 
           echo "End: $(date)"
           echo ""
+          echo "=== Build output (last 200 lines) ==="
+          tail -200 /tmp/build-output.log
+          echo ""
+          echo "=== Checking for TinyCC in build output ==="
+          if grep -i "tinycc\|libtcc\|enable_tinycc" /tmp/build-output.log; then
+            echo "[OK] TinyCC was found in build output"
+          else
+            echo "[WARN] TinyCC NOT found in build output — checking if enable_tinycc=true was passed"
+            grep "enable_tinycc" /tmp/build-output.log || echo "[FAIL] enable_tinycc flag not found in build output"
+          fi
+          echo ""
           echo "=== Checking for built binary ==="
           find build -name "bun*" -type f 2>/dev/null | head -10
-          
+
           # Copy binary to expected location
           BUN_BIN=$(find build -name "bun-profile" -type f 2>/dev/null | head -1)
           if [ -z "$BUN_BIN" ]; then
@@ -243,6 +251,18 @@ jobs:
           if [ -x "$NDK_STRIP" ]; then
             "$NDK_STRIP" --strip-all /tmp/bun-patched || true
             ls -lh /tmp/bun-patched
+          fi
+
+          # Check if TinyCC is in the binary
+          echo ""
+          echo "=== Checking for TinyCC in binary ==="
+          TCC_COUNT=$(strings /tmp/bun-patched | grep -ci "tcc\|tinycc\|libtcc")
+          if [ "$TCC_COUNT" -gt 0 ]; then
+            echo "[OK] TinyCC symbols found in binary ($TCC_COUNT matches)"
+            strings /tmp/bun-patched | grep -i "tcc\|tinycc\|libtcc" | head -5
+          else
+            echo "[FAIL] No TinyCC symbols in binary — enable_tinycc was false at build time"
+            echo "  This means callback() and linkSymbols(cc:true) will not work"
           fi
 
       - name: Verify the binary is Android-native
