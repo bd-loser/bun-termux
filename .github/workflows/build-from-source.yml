@@ -188,17 +188,12 @@ jobs:
           echo "Bun: $(bun --version)"
           echo "Start: $(date)"
 
-          # Nuke ALL caches to force 100% fresh recompile
-          echo "=== Nuking ALL caches ==="
-          rm -rf build/ 2>/dev/null || true
-          rm -rf ~/.bun/build-cache/ 2>/dev/null || true
-          rm -rf /tmp/zig-cache 2>/dev/null || true
-          # Also clear Zig global cache
-          rm -rf ~/.cache/zig 2>/dev/null || true
-
-          # Use a unique build dir to prevent ANY cache reuse
-          BUILD_DIR="build/fresh-$(date +%s)"
-          echo "Using build dir: $BUILD_DIR"
+          # Use ccache for faster rebuilds — keep Zig cache for incremental
+          # compilation. Only nuke the build output dir, NOT the caches.
+          # This allows patch-only changes to rebuild in ~10-15 min instead
+          # of 30-60 min from scratch.
+          echo "=== Using cached build (ccache + zig cache preserved) ==="
+          BUILD_DIR="build/release"
 
           bun scripts/build.ts \
             --profile=release \

@@ -516,8 +516,9 @@ if [ -f "$CONFIG_TS" ]; then
         # Before:  const tinycc = ... !((windows && arm64) || abi === "android" || freebsd);
         # After:   const tinycc = ... !((windows && arm64) || freebsd);
         sed -i "s/|| abi === \"android\" || freebsd/|| freebsd/g" "$CONFIG_TS"
-        # Add marker comment
-        sed -i "s|const tinycc = partial.tinycc ??|const tinycc = partial.tinycc ?? \/\/ $PATCH_MARKER: TinyCC enabled for Android|" "$CONFIG_TS"
+        # Add marker comment on its OWN LINE (before the const) — putting it
+        # inline after '??' would turn the rest of the expression into a comment.
+        sed -i "/^  const tinycc = partial.tinycc/i\\  // $PATCH_MARKER: TinyCC enabled for Android (was disabled upstream)" "$CONFIG_TS"
         verify_patch "$CONFIG_TS" "$PATCH_MARKER" || true
     fi
 fi
