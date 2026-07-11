@@ -5,17 +5,19 @@
  * Run with:  bun run ffi-test.ts
  *
  * Tests:
- *   1. dlopen() — load .so files and call functions (works without TinyCC)
- *   2. CString functions — readCString (works without TinyCC)
- *   3. callback() — create C callbacks at runtime (NEEDS TinyCC — new!)
- *   4. linkSymbols() — compile C source file (NEEDS TinyCC — new!)
+ *   1. dlopen() — load .so files and call functions
+ *   2. CString functions — read C strings from pointers
+ *   3. JSCallback — create C callbacks at runtime (TinyCC powered!)
+ *   4. cc() — compile C source files (TinyCC powered!)
+ *
+ * NOTE: Bun 1.3.14 uses JSCallback (not callback) and cc (not linkSymbols with source).
+ * The old callback() and linkSymbols(source:...) APIs were replaced.
  */
 
 const ffi = require("bun:ffi");
-const { dlopen, readCString } = ffi;
-// callback and linkSymbols may be undefined if TinyCC is disabled
-const callback = ffi.callback;
-const linkSymbols = ffi.linkSymbols;
+const { dlopen, JSCallback, cc, CString, ptr, read, suffix } = ffi;
+const fs = require("fs");
+const os = require("os");
 
 let passed = 0;
 let failed = 0;
@@ -27,13 +29,8 @@ function test(name, fn) {
     passed++;
     console.log(`  ✅ ${name}`);
   } catch (e) {
-    if (e.message && (e.message.includes("not available in this build") || e.message.includes("is not a function"))) {
-      skipped++;
-      console.log(`  ⏭️  ${name} (skipped — TinyCC not available)`);
-    } else {
-      failed++;
-      console.log(`  ❌ ${name}: ${e.message}`);
-    }
+    failed++;
+    console.log(`  ❌ ${name}: ${e.message}`);
   }
 }
 
@@ -43,21 +40,28 @@ function assertEqual(actual, expected, msg) {
   }
 }
 
-// Helper: encode string as null-terminated buffer for cstring args
 function cstr(s) {
   return Buffer.from(s + "\0");
 }
 
+// Detect if we're on Android/Termux
+const isAndroid = fs.existsSync("/system/lib64/libc.so");
+const libcPath = isAndroid ? "/system/lib64/libc.so" : "/lib/x86_64-linux-gnu/libc.so.6";
+const libmPath = isAndroid ? "/system/lib64/libm.so" : "/lib/x86_64-linux-gnu/libm.so.6";
+
 console.log("╔══════════════════════════════════════════════╗");
 console.log("║        bun:ffi Test Suite (Bionic)          ║");
 console.log("╚══════════════════════════════════════════════╝");
+console.log(`  Platform: ${isAndroid ? "Android/Termux" : "Linux"}`);
+console.log(`  libc: ${libcPath}`);
+console.log(`  Exports: ${Object.keys(ffi).join(", ")}`);
 console.log("");
 
 // ─── 1. dlopen — load .so files ────────────────────────────────────────
 console.log("📦 Test 1: dlopen() — load shared libraries");
 
-test("load libc.so and call getpid", () => {
-  const lib = dlopen("/system/lib64/libc.so", {
+test("load libc and call getpid", () => {
+  const lib = dlopen(libcPath, {
     getpid: { args: [], returns: "i32" },
   });
   const pid = lib.symbols.getpid();
@@ -65,8 +69,8 @@ test("load libc.so and call getpid", () => {
   console.log(`     → getpid() = ${pid}`);
 });
 
-test("load libc.so and call getuid", () => {
-  const lib = dlopen("/system/lib64/libc.so", {
+test("load libc and call getuid", () => {
+  const lib = dlopen(libcPath, {
     getuid: { args: [], returns: "u32" },
   });
   const uid = lib.symbols.getuid();
@@ -74,8 +78,8 @@ test("load libc.so and call getuid", () => {
   console.log(`     → getuid() = ${uid}`);
 });
 
-test("load libm.so and call sqrt", () => {
-  const libm = dlopen("/system/lib64/libm.so", {
+test("load libm and call sqrt", () => {
+  const libm = dlopen(libmPath, {
     sqrt: { args: ["f64"], returns: "f64" },
   });
   const result = libm.symbols.sqrt(2.0);
@@ -85,8 +89,8 @@ test("load libm.so and call sqrt", () => {
   console.log(`     → sqrt(2) = ${result}`);
 });
 
-test("load libm.so and call sin/cos", () => {
-  const libm = dlopen("/system/lib64/libm.so", {
+test("load libm and call sin/cos", () => {
+  const libm = dlopen(libmPath, {
     sin: { args: ["f64"], returns: "f64" },
     cos: { args: ["f64"], returns: "f64" },
   });
@@ -97,18 +101,17 @@ test("load libm.so and call sin/cos", () => {
   console.log(`     → sin(0) = ${sin0}, cos(0) = ${cos0}`);
 });
 
-test("load libc.so and call strlen (Buffer for cstring)", () => {
-  const lib = dlopen("/system/lib64/libc.so", {
+test("load libc and call strlen", () => {
+  const lib = dlopen(libcPath, {
     strlen: { args: ["cstring"], returns: "usize" },
   });
-  // Bun requires Buffer for cstring args, not JS strings
   const len = lib.symbols.strlen(cstr("hello world"));
   assertEqual(Number(len), 11, "strlen('hello world')");
   console.log(`     → strlen("hello world") = ${len}`);
 });
 
-test("load libc.so and call strcmp (Buffer for cstring)", () => {
-  const lib = dlopen("/system/lib64/libc.so", {
+test("load libc and call strcmp", () => {
+  const lib = dlopen(libcPath, {
     strcmp: { args: ["cstring", "cstring"], returns: "i32" },
   });
   const eq = lib.symbols.strcmp(cstr("abc"), cstr("abc"));
@@ -122,134 +125,96 @@ test("load libc.so and call strcmp (Buffer for cstring)", () => {
 console.log("");
 console.log("📝 Test 2: CString functions");
 
-test("readCString from libc strdup", () => {
-  const lib = dlopen("/system/lib64/libc.so", {
+test("CString from libc strdup", () => {
+  const lib = dlopen(libcPath, {
     strdup: { args: ["cstring"], returns: "ptr" },
     free: { args: ["ptr"], returns: "void" },
   });
   const dup = lib.symbols.strdup(cstr("hello ffi"));
-  const str = readCString(dup);
-  assertEqual(str, "hello ffi", "readCString should return duplicated string");
+  const str = new CString(dup);
+  assertEqual(String(str), "hello ffi", "CString should return duplicated string");
   lib.symbols.free(dup);
-  console.log(`     → strdup + readCString = "${str}"`);
+  console.log(`     → strdup + CString = "${str}"`);
 });
-// Note: readCString does NOT need TinyCC — the test skip was a bug.
-// This test should pass on all builds.
 
-// ─── 3. callback — NEEDS TinyCC ────────────────────────────────────────
+// ─── 3. JSCallback — TinyCC powered ────────────────────────────────────
 console.log("");
-console.log("🔧 Test 3: callback() — create C callbacks (needs TinyCC)");
+console.log("🔧 Test 3: JSCallback — create C callbacks (TinyCC)");
 
-if (typeof callback === "undefined") {
-  console.log("  ⏭️  All callback tests skipped — TinyCC not available in this build");
-  console.log("     Install the new build with TinyCC patches to enable callback()");
-  skipped += 5;
-} else {
-  test("callback with no args", () => {
-    const cb = callback({ returns: "i32", args: [] }, () => 42);
-    const result = cb();
-    assertEqual(result, 42, "callback should return 42");
-    console.log(`     → callback()() = ${result}`);
+test("JSCallback with i32 arg", () => {
+  const cb = new JSCallback({ returns: "i32", args: ["i32"] }, (x) => x * 2);
+  if (!cb || typeof cb !== "object") throw new Error("JSCallback not created");
+  console.log(`     → JSCallback created (ptr type: ${typeof cb.ptr})`);
+});
+
+test("JSCallback passed to C qsort", () => {
+  const lib = dlopen(libcPath, {
+    qsort: { args: ["ptr", "usize", "usize", "ptr"], returns: "void" },
   });
 
-  test("callback with i32 arg", () => {
-    const cb = callback({ returns: "i32", args: ["i32"] }, (x) => x * 2);
-    const result = cb(21);
-    assertEqual(result, 42, "callback(21) should return 42");
-    console.log(`     → callback(21) = ${result}`);
-  });
+  const arr = new Int32Array([5, 3, 1, 4, 2]);
+  const buf = Buffer.from(arr.buffer);
 
-  test("callback with two args", () => {
-    const cb = callback({ returns: "i32", args: ["i32", "i32"] }, (a, b) => a + b);
-    const result = cb(20, 22);
-    assertEqual(result, 42, "callback(20, 22) should return 42");
-    console.log(`     → callback(20, 22) = ${result}`);
-  });
-
-  test("callback passed to C qsort", () => {
-    // THE real test — pass a JS callback to a C function (qsort)
-    const lib = dlopen("/system/lib64/libc.so", {
-      qsort: { args: ["ptr", "usize", "usize", "callback"], returns: "void" },
-    });
-
-    const arr = new Int32Array([5, 3, 1, 4, 2]);
-    const buf = Buffer.from(arr.buffer);
-
-    const compare = callback(
-      { returns: "i32", args: ["ptr", "ptr"] },
-      (a, b) => {
-        // Read i32 from the pointers (a, b are ArrayBuffer-like)
-        const av = new DataView(a).getInt32(0, true);
-        const bv = new DataView(b).getInt32(0, true);
-        return av - bv;
-      }
-    );
-
-    lib.symbols.qsort(buf, arr.length, 4, compare);
-
-    const expected = [1, 2, 3, 4, 5];
-    for (let i = 0; i < 5; i++) {
-      if (arr[i] !== expected[i]) {
-        throw new Error(`qsort failed: arr[${i}] = ${arr[i]}, expected ${expected[i]}`);
-      }
+  const compare = new JSCallback(
+    { returns: "i32", args: ["ptr", "ptr"] },
+    (a, b) => {
+      const av = new DataView(a).getInt32(0, true);
+      const bv = new DataView(b).getInt32(0, true);
+      return av - bv;
     }
-    console.log(`     → qsort([5,3,1,4,2]) = [${arr.join(",")}]`);
-  });
-}
+  );
 
-// ─── 4. linkSymbols — NEEDS TinyCC ─────────────────────────────────────
+  lib.symbols.qsort(buf, arr.length, 4, compare.ptr);
+  
+  const expected = [1, 2, 3, 4, 5];
+  for (let i = 0; i < 5; i++) {
+    if (arr[i] !== expected[i]) {
+      throw new Error(`qsort failed: arr[${i}] = ${arr[i]}, expected ${expected[i]}`);
+    }
+  }
+  console.log(`     → qsort([5,3,1,4,2]) = [${arr.join(",")}]`);
+});
+
+// ─── 4. cc() — compile C source files (TinyCC) ─────────────────────────
 console.log("");
-console.log("🔗 Test 4: linkSymbols() — compile C source (needs TinyCC)");
+console.log("🔗 Test 4: cc() — compile C source files (TinyCC)");
 
-if (typeof linkSymbols === "undefined") {
-  console.log("  ⏭️  All linkSymbols tests skipped — TinyCC not available in this build");
-  skipped += 2;
-} else {
-  test("linkSymbols with C source file", () => {
-    // linkSymbols expects: { symbols: {...}, source: "file.c" }
-    // Use $TMPDIR (Termux-compatible) instead of /tmp
-    const fs = require("fs");
-    const tmpdir = process.env.TMPDIR || "/tmp";
-    const cSource = `
-      int add(int a, int b) { return a + b; }
-    `;
-    const cFile = `${tmpdir}/ffi_test.c`;
-    fs.writeFileSync(cFile, cSource);
+test("cc with add function", () => {
+  const tmpdir = os.tmpdir();
+  const cFile = `${tmpdir}/ffi_add.c`;
+  fs.writeFileSync(cFile, "int add(int a, int b) { return a + b; }");
 
-    const lib = linkSymbols({
-      symbols: {
-        add: { args: ["i32", "i32"], returns: "i32" },
-      },
-      source: cFile,
-    });
-    const result = lib.symbols.add(20, 22);
-    assertEqual(result, 42, "add(20, 22) should return 42");
-    console.log(`     → add(20, 22) = ${result}`);
+  const lib = cc({
+    source: cFile,
+    symbols: {
+      add: { args: ["i32", "i32"], returns: "i32" },
+    },
   });
+  const result = lib.symbols.add(20, 22);
+  assertEqual(result, 42, "add(20, 22) should return 42");
+  console.log(`     → add(20, 22) = ${result}`);
+});
 
-  test("linkSymbols with factorial", () => {
-    const fs = require("fs");
-    const tmpdir = process.env.TMPDIR || "/tmp";
-    const cSource = `
-      int factorial(int n) {
-        if (n <= 1) return 1;
-        return n * factorial(n - 1);
-      }
-    `;
-    const cFile = `${tmpdir}/ffi_factorial.c`;
-    fs.writeFileSync(cFile, cSource);
+test("cc with factorial", () => {
+  const tmpdir = os.tmpdir();
+  const cFile = `${tmpdir}/ffi_factorial.c`;
+  fs.writeFileSync(cFile, `
+    int factorial(int n) {
+      if (n <= 1) return 1;
+      return n * factorial(n - 1);
+    }
+  `);
 
-    const lib = linkSymbols({
-      symbols: {
-        factorial: { args: ["i32"], returns: "i32" },
-      },
-      source: cFile,
-    });
-    const result = lib.symbols.factorial(5);
-    assertEqual(result, 120, "factorial(5) should return 120");
-    console.log(`     → factorial(5) = ${result}`);
+  const lib = cc({
+    source: cFile,
+    symbols: {
+      factorial: { args: ["i32"], returns: "i32" },
+    },
   });
-}
+  const result = lib.symbols.factorial(5);
+  assertEqual(result, 120, "factorial(5) should return 120");
+  console.log(`     → factorial(5) = ${result}`);
+});
 
 // ─── Summary ───────────────────────────────────────────────────────────
 console.log("");
@@ -265,12 +230,7 @@ console.log("");
 if (failed > 0) {
   console.log("❌ Some tests failed!");
   process.exit(1);
-} else if (skipped > 0) {
-  console.log(`⚠️  ${skipped} test(s) skipped (TinyCC not available in this build)`);
-  console.log("   dlopen works, but callback() and linkSymbols() need TinyCC.");
-  console.log("   Install the new build from the latest release.");
-  process.exit(0);
 } else {
-  console.log("🎉 All tests passed! Full bun:ffi support including callback()!");
+  console.log("🎉 All tests passed! Full bun:ffi support including JSCallback + cc()!");
   process.exit(0);
 }
