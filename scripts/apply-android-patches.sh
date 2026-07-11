@@ -61,9 +61,11 @@
 #         error if the extended segment would overlap another PT_LOAD,
 #         instead of silently producing a broken binary.
 #
-#   4. scripts/build/flags.ts — cross-compile CPU flag fix
-#   5. scripts/build/tools.ts — accept NDK clang 18
-#   6. C++ dangling-reference fix for clang 18
+#   4. scripts/build/config.ts — enable TinyCC for Android (bun:ffi callback support)
+#   5. scripts/build/deps/tinycc.ts — add Android/Bionic defines to TinyCC build
+#   6. scripts/build/flags.ts — cross-compile CPU flag fix
+#   7. scripts/build/tools.ts — accept NDK clang 18
+#   8. C++ dangling-reference fix for clang 18
 #
 set -euo pipefail
 
@@ -496,7 +498,98 @@ PYEOF
 fi
 
 # =====================================================================
-# PATCH 4: scripts/build/flags.ts — cross-compile CPU flag fix
+# PATCH 4: scripts/build/config.ts — enable TinyCC for Android
+# =====================================================================
+# Bun disables TinyCC on Android because "oven-sh/tinycc has no upstream
+# bionic support". But TinyCC DOES have Android/Bionic support in its
+# configure script (TARGETOS_ANDROID, crtbegin_so.o, /system/bin/linker64,
+# aarch64-linux-android triplet). The issue is that Bun's build system
+# never enables it. This patch removes the Android exclusion so TinyCC
+# gets built, enabling bun:ffi callback() and linkSymbols(cc:true).
+CONFIG_TS="scripts/build/config.ts"
+if [ -f "$CONFIG_TS" ]; then
+    if grep -q "$PATCH_MARKER" "$CONFIG_TS" 2>/dev/null; then
+        echo "  [SKIP] $CONFIG_TS already patched"
+    else
+        echo "  [PATCH] $CONFIG_TS (enable TinyCC for Android)"
+        # Remove the 'abi === "android" ||' from the tinycc exclusion
+        # Before:  const tinycc = ... !((windows && arm64) || abi === "android" || freebsd);
+        # After:   const tinycc = ... !((windows && arm64) || freebsd);
+        sed -i "s/|| abi === \"android\" || freebsd/|| freebsd/g" "$CONFIG_TS"
+        # Add marker comment
+        sed -i "s|const tinycc = partial.tinycc ??|const tinycc = partial.tinycc ?? \/\/ $PATCH_MARKER: TinyCC enabled for Android|" "$CONFIG_TS"
+        verify_patch "$CONFIG_TS" "$PATCH_MARKER" || true
+    fi
+fi
+
+# =====================================================================
+# PATCH 5: scripts/build/deps/tinycc.ts — add Android/Bionic defines
+# =====================================================================
+# Bun's tinycc.ts only sets TCC_TARGET_MACHO (macOS) and CONFIG_WIN32
+# (Windows). For Android, we need TARGETOS_ANDROID + the Android paths
+# (CRT files, ELF interpreter, sysroot, triplet). These defines match
+# what TinyCC's ./configure --targetos=Android --cpu=arm64 generates.
+TINYCC_TS="scripts/build/deps/tinycc.ts"
+if [ -f "$TINYCC_TS" ]; then
+    if grep -q "$PATCH_MARKER" "$TINYCC_TS" 2>/dev/null; then
+        echo "  [SKIP] $TINYCC_TS already patched"
+    else
+        echo "  [PATCH] $TINYCC_TS (add Android defines)"
+        python3 <<'PYEOF'
+import re, sys
+
+with open("scripts/build/deps/tinycc.ts", "r") as f:
+    content = f.read()
+
+# Find the line "if (cfg.windows) defines.CONFIG_WIN32 = true;"
+# and add Android defines after it
+old = '    if (cfg.windows) defines.CONFIG_WIN32 = true;'
+
+new = '''    if (cfg.windows) defines.CONFIG_WIN32 = true;
+
+    // ANDROID_TERMUX_FIX: Enable TinyCC for Android/Bionic.
+    // TinyCC has Android support in its configure script but Bun's build
+    // system never enabled it. These defines match what ./configure
+    // --targetos=Android --cpu=arm64 generates. This enables bun:ffi
+    // callback() and linkSymbols(cc:true) on Android.
+    if (cfg.linux && cfg.abi === "android") {
+      defines.TARGETOS_ANDROID = 1;
+      defines.CONFIG_NEW_DTAGS = 1;
+      defines.CONFIG_DWARF_VERSION = 4;
+      defines.CONFIG_TCC_PIE = 1;
+      if (cfg.arm64) {
+        defines.CONFIG_TCC_SYSINCLUDEPATHS = "{B}/include:{R}/include:{R}/include/aarch64-linux-android";
+        defines.CONFIG_TCC_LIBPATHS = "{B}:{R}/lib:/system/lib64";
+        defines.CONFIG_TCC_CRTPREFIX = "{R}/lib";
+        defines.CONFIG_TCC_ELFINTERP = "/system/bin/linker64";
+        defines.CONFIG_TRIPLET = "aarch64-linux-android";
+      } else if (cfg.x64) {
+        defines.CONFIG_TCC_SYSINCLUDEPATHS = "{B}/include:{R}/include:{R}/include/x86_64-linux-android";
+        defines.CONFIG_TCC_LIBPATHS = "{B}:{R}/lib:/system/lib64";
+        defines.CONFIG_TCC_CRTPREFIX = "{R}/lib";
+        defines.CONFIG_TCC_ELFINTERP = "/system/bin/linker64";
+        defines.CONFIG_TRIPLET = "x86_64-linux-android";
+      }
+    }'''
+
+if old not in content:
+    print("    [FAIL] could not find 'cfg.windows defines.CONFIG_WIN32' line")
+    sys.exit(1)
+
+content = content.replace(old, new, 1)
+
+with open("scripts/build/deps/tinycc.ts", "w") as f:
+    f.write(content)
+
+print("    [5a] Added Android/Bionic defines to tinycc.ts")
+print("    TinyCC will now build with TARGETOS_ANDROID enabled")
+PYEOF
+        verify_patch "$TINYCC_TS" "$PATCH_MARKER" || true
+    fi
+fi
+
+# =====================================================================
+# PATCH 6: scripts/build/flags.ts — cross-compile CPU flag fix
 # =====================================================================
 FLAGS_TS="scripts/build/flags.ts"
 if [ -f "$FLAGS_TS" ]; then
@@ -511,7 +604,7 @@ if [ -f "$FLAGS_TS" ]; then
 fi
 
 # =====================================================================
-# PATCH 4: scripts/build/tools.ts — accept NDK clang 18
+# PATCH 7: scripts/build/tools.ts — accept NDK clang 18
 # =====================================================================
 TOOLS_TS="scripts/build/tools.ts"
 if [ -f "$TOOLS_TS" ]; then
@@ -529,7 +622,7 @@ if [ -f "$TOOLS_TS" ]; then
 fi
 
 # =====================================================================
-# PATCH 5: EncodingTables.h — remove pragma for clang 19+ warning
+# PATCH 8: EncodingTables.h — remove pragma for clang 19+ warning
 # =====================================================================
 ENCODING_TABLES="src/jsc/bindings/EncodingTables.h"
 if [ -f "$ENCODING_TABLES" ]; then
@@ -543,7 +636,7 @@ if [ -f "$ENCODING_TABLES" ]; then
 fi
 
 # =====================================================================
-# PATCH 6: C++ dangling-reference fix for clang 18
+# PATCH 9: C++ dangling-reference fix for clang 18
 # =====================================================================
 echo "  [PATCH] searching for dangling reference pattern in C++ files..."
 PATCHED_FILES=0
@@ -568,7 +661,7 @@ echo "PATCH VERIFICATION SUMMARY"
 echo "=========================================="
 
 TOTAL_FAIL=0
-for f in src/resolver/resolver.zig src/cli/run_command.zig src/exe_format/elf.zig src/standalone_graph/StandaloneModuleGraph.zig scripts/build/flags.ts scripts/build/tools.ts; do
+for f in src/resolver/resolver.zig src/cli/run_command.zig src/exe_format/elf.zig src/standalone_graph/StandaloneModuleGraph.zig scripts/build/config.ts scripts/build/deps/tinycc.ts scripts/build/flags.ts scripts/build/tools.ts; do
     if [ -f "$f" ]; then
         if grep -q "$PATCH_MARKER" "$f" 2>/dev/null; then
             COUNT=$(grep -c "$PATCH_MARKER" "$f")

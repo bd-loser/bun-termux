@@ -114,6 +114,18 @@ jobs:
             echo "  [FAIL] elf.zig NOT patched — bun build --compile will produce broken binaries"
             PATCH_OK=false
           fi
+          if grep -q "ANDROID_TERMUX_FIX" /tmp/bun-src/scripts/build/config.ts; then
+            echo "  [OK] config.ts patched (TinyCC enabled for Android — bun:ffi callback support)"
+          else
+            echo "  [FAIL] config.ts NOT patched — bun:ffi callback() will be disabled"
+            PATCH_OK=false
+          fi
+          if grep -q "ANDROID_TERMUX_FIX" /tmp/bun-src/scripts/build/deps/tinycc.ts; then
+            echo "  [OK] tinycc.ts patched (Android/Bionic defines added)"
+          else
+            echo "  [FAIL] tinycc.ts NOT patched — TinyCC won't build correctly for Android"
+            PATCH_OK=false
+          fi
           # Verify root_path is ORIGINAL (path[0..1]) — ancestor walking preserved!
           ROOT_BLOCK=$(grep -A5 "const root_path" /tmp/bun-src/src/resolver/resolver.zig)
           if echo "$ROOT_BLOCK" | grep -q "path\[0\.\.1\]"; then
