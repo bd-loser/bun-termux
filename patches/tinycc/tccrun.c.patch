@@ -1,5 +1,5 @@
 diff --git a/tccrun.c b/tccrun.c
-index 79dfd08..21fa846 100644
+index 79dfd08..032dc8d 100644
 --- a/tccrun.c
 +++ b/tccrun.c
 @@ -1,3 +1,4 @@
@@ -7,21 +7,40 @@ index 79dfd08..21fa846 100644
  /*
   *  TCC - Tiny C Compiler - Support for -run switch
   *
-@@ -115,9 +116,14 @@ static int rt_mem(TCCState *s1, int size)
+@@ -114,21 +115,25 @@ static int rt_mem(TCCState *s1, int size)
+     int ptr_diff = 0;
  #ifdef CONFIG_SELINUX
      /* Using mmap instead of malloc */
-     void *prw;
+-    void *prw;
 -    char tmpfname[] = "/tmp/.tccrunXXXXXX";
 -    int fd = mkstemp(tmpfname);
 -    unlink(tmpfname);
-+    /* ANDROID_TERMUX_FIX: Use memfd_create instead of mkstemp.
-+       Android SELinux blocks mmap(PROT_EXEC) on files from the
-+       Termux data partition (noexec mount). memfd_create creates
-+       an anonymous in-memory file that bypasses filesystem exec
-+       checks — same approach Android's own JIT (ART, V8) uses. */
++    /* ANDROID_TERMUX_FIX: Use memfd_create + two SEPARATE mmaps (no MAP_FIXED).
++       Android SELinux blocks MAP_FIXED on PROT_EXEC regions.
++       Approach: same as older TinyCC (b91835d8) which works on Android.
++       1. memfd_create (bypasses noexec mount — Android's own JIT uses this)
++       2. mmap RW (data) — separate mapping, no fixed address
++       3. mmap EXEC (code) — separate mapping, no fixed address
++       ptr_diff = prx - ptr (calculated after both mappings) */
++    void *prx;
 +    int fd = syscall(SYS_memfd_create, "tccrun", 0);
 +    if (fd < 0)
 +        return tcc_error_noabort("tccrun: memfd_create failed");
      ftruncate(fd, size);
  
-     ptr = mmap(NULL, size * 2, PROT_READ|PROT_EXEC, MAP_SHARED, fd, 0);
+-    ptr = mmap(NULL, size * 2, PROT_READ|PROT_EXEC, MAP_SHARED, fd, 0);
+-    /* mmap RW memory at fixed distance */
+-    prw = mmap((char*)ptr + size, size, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED, fd, 0);
++    ptr = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
++    prx = mmap(NULL, size, PROT_READ|PROT_EXEC, MAP_SHARED, fd, 0);
+     close(fd);
+-    if (ptr == MAP_FAILED || prw == MAP_FAILED)
++    if (ptr == MAP_FAILED || prx == MAP_FAILED)
+ 	return tcc_error_noabort("tccrun: could not map memory");
+-    ptr_diff = (char*)prw - (char*)ptr; /* = size; */
+-    //printf("map %p %p %p\n", ptr, prw, (void*)ptr_diff);
+-    size *= 2;
++    ptr_diff = (char*)prx - (char*)ptr;
+ #else
+ # ifdef _WIN32
+     /* Generated code is page-protected below; avoid changing CRT heap pages. */
