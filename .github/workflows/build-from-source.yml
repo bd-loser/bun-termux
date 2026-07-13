@@ -140,10 +140,10 @@ jobs:
             echo "  [FAIL] ffi.zig NOT patched — cc()/JSCallback will fail with 'library c not found'"
             PATCH_OK=false
           fi
-          if grep -q "ANDROID_TERMUX_FIX" /tmp/bun-src/src/main.zig; then
-            echo "  [OK] main.zig patched (tagged addressing enabled for Android TBI)"
+          if grep -q "MEMTAG_OPTIONS=off" scripts/launcher-bun.sh; then
+            echo "  [OK] launcher-bun.sh has MEMTAG_OPTIONS=off (MTE disabled)"
           else
-            echo "  [FAIL] main.zig NOT patched — FFI will crash with 'pointer tag truncated'"
+            echo "  [FAIL] launcher-bun.sh missing MEMTAG_OPTIONS=off — FFI will crash with SIGABRT"
             PATCH_OK=false
           fi
           # Verify root_path is ORIGINAL (path[0..1]) — ancestor walking preserved!

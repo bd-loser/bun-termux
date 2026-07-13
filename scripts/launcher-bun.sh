@@ -36,6 +36,15 @@ if [ -f "$SHIM" ]; then
   fi
 fi
 
+# Disable Android's MTE (Memory Tagging Extension) for the Bun process.
+# Android 11+ scudo allocator tags heap pointers with the top byte (TBI).
+# When Bun's FFI passes these tagged pointers to free(), scudo's MTE
+# tag check aborts with SIGABRT. Setting MEMTAG_OPTIONS=off before exec
+# tells Bionic's scudo to NOT use MTE tags at all — before the process
+# even starts. This is the ONLY way to disable MTE; prctl() in main()
+# is too late because scudo has already initialized with MTE enabled.
+export MEMTAG_OPTIONS=off
+
 # Exec the patched Bun binary. argv[0] is the binary path (ending in
 # "bun"), so Bun runs in normal mode — NOT bunx mode. For bunx mode,
 # use launcher-bunx.sh which uses `exec -a "bunx"`.

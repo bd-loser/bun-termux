@@ -52,6 +52,10 @@ if [ -f "$SHIM" ]; then
   fi
 fi
 
+# Disable Android's MTE (Memory Tagging Extension) for the Bun process.
+# See launcher-bun.sh for details. Must be set before exec.
+export MEMTAG_OPTIONS=off
+
 # CRITICAL: `exec -a "bunx"` sets argv[0] to "bunx" so Bun's isBunX()
 # detection (endsWithComptime(argv0, "bunx")) returns true. Without
 # this, Bun would run in normal `bun` mode and bunx semantics break.

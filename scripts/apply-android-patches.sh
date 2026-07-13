@@ -806,84 +806,27 @@ PYEOF
 fi
 
 # =====================================================================
-# PATCH 11: src/main.zig — enable tagged addressing for Android TBI
+# PATCH 11: src/main.zig — no changes needed (MTE disabled via launcher)
 # =====================================================================
-# ROOT CAUSE: Android 11+ on aarch64 uses TBI (Top Byte Ignore). Malloc
-# returns pointers with a non-zero top byte (the MTE tag). When these
-# tagged pointers are passed to Bionic syscalls (write, read, etc.),
-# Bionic checks if tagged addressing is enabled for the process. If NOT
-# enabled, it aborts with "Pointer tag for 0x... was truncated".
+# MTE is disabled by setting MEMTAG_OPTIONS=off in the launcher scripts
+# (launcher-bun.sh and launcher-bunx.sh). This must be done BEFORE the
+# process starts — prctl() in main() is too late because Bionic's scudo
+# allocator has already initialized with MTE enabled by the time main()
+# runs.
 #
-# Previous approach (stripping tags in FFI.h/fromPtrAddress) FAILED
-# because MTE-enabled free() expects the original tagged pointer.
-# Stripping the tag causes SIGABRT on free().
+# The launcher approach:
+#   export MEMTAG_OPTIONS=off
+#   exec "$BUN_BIN" "$@"
 #
-# CORRECT FIX: Enable tagged addressing at process startup via
-# prctl(PR_SET_TAGGED_ADDR_CTRL, PR_TAGGED_ADDR_ENABLE). This tells the
-# kernel to ignore the top byte of pointers in syscalls. Tagged pointers
-# from malloc work correctly in both syscalls AND free().
+# This tells Bionic's scudo to NOT use MTE tags at all, so:
+# - malloc() returns untagged pointers (top byte = 0)
+# - free() doesn't check tags (no SIGABRT)
+# - syscalls work normally (no "pointer tag truncated")
+# - No prctl needed in main.zig
+# - No fromPtrAddress tag stripping needed
+# - No FFI.h tag stripping needed
 #
-# NOTE: On aarch64, the syscall instruction is 'svc #0', NOT 'syscall'
-# (which is the x86_64 mnemonic). The syscall number for prctl is 167.
-# This must be called VERY EARLY — before any FFI calls or malloc that
-# produces tagged pointers passed to syscalls. main() is the earliest
-# point we control.
-MAIN_ZIG="src/main.zig"
-if [ -f "$MAIN_ZIG" ]; then
-    if grep -q "$PATCH_MARKER" "$MAIN_ZIG" 2>/dev/null; then
-        echo "  [SKIP] $MAIN_ZIG already patched"
-    else
-        echo "  [PATCH] $MAIN_ZIG (enable tagged addressing for Android TBI)"
-        python3 <<'PYEOF'
-import sys
-
-with open("src/main.zig", "r") as f:
-    content = f.read()
-
-old = "pub fn main() void {\n    _bun.crash_handler.init();"
-
-new = """pub fn main() void {
-    // ANDROID_TERMUX_FIX: Enable tagged addressing AND disable MTE tag checks.
-    // Android 11+ tags heap pointers with the top byte (TBI). Scudo's MTE
-    // checks tags on free() and aborts if the tag doesn't match.
-    //
-    // prctl(PR_SET_TAGGED_ADDR_CTRL) arg2 is a bitmask:
-    //   bit 0:     PR_TAGGED_ADDR_ENABLE (1) — kernel ignores top byte in syscalls
-    //   bits 1-2:  PR_MTE_TCF (0 = none, 1 = sync, 2 = async) — tag check mode
-    //   bits 3-31: PR_MTE_TAG — excluded tags bitmap (bit set = exclude tag)
-    //
-    // We set: tagged addr ENABLE + MTE_TCF NONE + ALL tags excluded
-    //   PR_TAGGED_ADDR_ENABLE = bit 0 = 1
-    //   PR_MTE_TCF_NONE = bits 1-2 = 00
-    //   PR_MTE_TAG_MASK = bits 3-18 = 0xFFFF (all 16 tags excluded)
-    //   bits 19-31 = 0 (reserved, must be 0)
-    //   arg2 = 1 | 0 | (0xFFFF << 3) = 0x7FFF9
-    // This makes free() NOT check tags, so tagged pointers from malloc
-    // can be freed without SIGABRT.
-    if (@import("builtin").abi == .android) {
-        const c = @cImport({
-            @cInclude("sys/prctl.h");
-        });
-        // PR_TAGGED_ADDR_ENABLE=1, PR_MTE_TCF_NONE=0, all tags excluded
-        _ = c.prctl(c.PR_SET_TAGGED_ADDR_CTRL, @as(usize, 0x7FFF9), @as(usize, 0), @as(usize, 0), @as(usize, 0));
-    }
-
-    _bun.crash_handler.init();"""
-
-if old not in content:
-    print("    [FAIL] could not find main() entry point")
-    sys.exit(1)
-
-content = content.replace(old, new, 1)
-
-with open("src/main.zig", "w") as f:
-    f.write(content)
-
-print("    [OK] Added prctl(PR_SET_TAGGED_ADDR_CTRL, PR_TAGGED_ADDR_ENABLE) at start of main()")
-PYEOF
-        verify_patch "$MAIN_ZIG" "$PATCH_MARKER" || true
-    fi
-fi
+# This is the cleanest, simplest, and most reliable fix.
 
 # =====================================================================
 # FINAL VERIFICATION
@@ -894,7 +837,7 @@ echo "PATCH VERIFICATION SUMMARY"
 echo "=========================================="
 
 TOTAL_FAIL=0
-for f in src/resolver/resolver.zig src/cli/run_command.zig src/exe_format/elf.zig src/standalone_graph/StandaloneModuleGraph.zig scripts/build/config.ts scripts/build/deps/tinycc.ts scripts/build/flags.ts scripts/build/tools.ts src/runtime/ffi/ffi.zig src/main.zig; do
+for f in src/resolver/resolver.zig src/cli/run_command.zig src/exe_format/elf.zig src/standalone_graph/StandaloneModuleGraph.zig scripts/build/config.ts scripts/build/deps/tinycc.ts scripts/build/flags.ts scripts/build/tools.ts src/runtime/ffi/ffi.zig; do
     if [ -f "$f" ]; then
         if grep -q "$PATCH_MARKER" "$f" 2>/dev/null; then
             COUNT=$(grep -c "$PATCH_MARKER" "$f")
