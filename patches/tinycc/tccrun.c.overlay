@@ -115,26 +115,37 @@ static int rt_mem(TCCState *s1, int size)
     int ptr_diff = 0;
 #ifdef CONFIG_SELINUX
     /* Using mmap instead of malloc */
-/* ANDROID_TERMUX_FIX: memfd_create + two separate mmaps (no MAP_FIXED).
-   Android SELinux blocks mprotect(PROT_EXEC) on heap memory and rejects
-   MAP_FIXED across certain boundaries. memfd_create + two independent
-   mmaps (one RW, one RX) is the proven workaround used by
-   guysoft/opencode-termux. The original mkstemp/MAP_SHARED approach
-   also fails on Android because /tmp is not writable in the Termux
-   sandbox and MAP_FIXED is disallowed by the kernel's mmap_min_addr
-   + SELinux execmem policy. */
-    void *prx;
+/* ANDROID_TERMUX_FIX: memfd_create instead of mkstemp.
+   Android/Termux doesn't have /tmp, so mkstemp("/tmp/.tccrunXXXXXX")
+   fails. We use memfd_create (via syscall) to create an anonymous
+   in-memory file — no filesystem path needed.
+
+   CRITICAL: We KEEP the original MAP_FIXED layout (RX at base, RW at
+   base+size). The two-mmap-without-MAP_FIXED approach DOES NOT WORK
+   because tcc_relocate_ex() uses ptr_diff = (char*)prw - (char*)ptr
+   to adjust addresses: s->sh_addr + ptr_diff. With MAP_FIXED, the
+   two regions are exactly `size` apart, so ptr_diff = size (a small,
+   predictable value). Without MAP_FIXED, the kernel places them at
+   random addresses, ptr_diff becomes a huge value, and the address
+   arithmetic in tcc_relocate_ex produces invalid pointers → segfault.
+
+   MAP_FIXED is NOT blocked by Android SELinux. What IS blocked is
+   mprotect(PROT_EXEC) on heap memory — that's why CONFIG_SELINUX
+   uses mmap(PROT_EXEC) directly from a shared fd instead. */
+    void *prw;
     int fd = syscall(SYS_memfd_create, "tccrun", 0);
     if (fd < 0)
         return tcc_error_noabort("tccrun: memfd_create failed");
     ftruncate(fd, size);
 
-    ptr = mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
-    prx = mmap(NULL, size, PROT_READ|PROT_EXEC, MAP_SHARED, fd, 0);
+    ptr = mmap(NULL, size * 2, PROT_READ|PROT_EXEC, MAP_SHARED, fd, 0);
+    /* mmap RW memory at fixed distance */
+    prw = mmap((char*)ptr + size, size, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_FIXED, fd, 0);
     close(fd);
-    if (ptr == MAP_FAILED || prx == MAP_FAILED)
+    if (ptr == MAP_FAILED || prw == MAP_FAILED)
         return tcc_error_noabort("tccrun: could not map memory");
-    ptr_diff = (char*)prx - (char*)ptr;
+    ptr_diff = (char*)prw - (char*)ptr; /* = size; */
+    size *= 2;
 #else
     ptr = tcc_malloc(size += PAGESIZE); /* one extra page to align malloc memory */
 #endif
