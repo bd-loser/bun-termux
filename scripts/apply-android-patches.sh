@@ -850,18 +850,9 @@ new = """pub fn main() void {
     // prctl(PR_SET_TAGGED_ADDR_CTRL, PR_TAGGED_ADDR_ENABLE) tells the
     // kernel to ignore the top byte, so tagged pointers work in syscalls.
     // PR_SET_TAGGED_ADDR_CTRL = 55, PR_TAGGED_ADDR_ENABLE = 1 (bit 0).
-    // On aarch64, prctl is syscall 167, invoked via 'svc #0' (not 'syscall'
-    // which is the x86_64 mnemonic).
     if (@import("builtin").abi == .android) {
-        _ = asm volatile ("svc #0"
-            : [ret] "={x0}" (-> usize),
-            : [number] "{x8}" (@as(usize, 167)),
-              [arg1] "{x0}" (@as(usize, 55)),
-              [arg2] "{x1}" (@as(usize, 1)),
-              [arg3] "{x2}" (@as(usize, 0)),
-              [arg4] "{x3}" (@as(usize, 0)),
-              [arg5] "{x4}" (@as(usize, 0)),
-        );
+        extern "c" fn prctl(option: c_int, arg2: usize, arg3: usize, arg4: usize, arg5: usize) c_int;
+        _ = prctl(55, 1, 0, 0, 0);
     }
 
     _bun.crash_handler.init();"""
