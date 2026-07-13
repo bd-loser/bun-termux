@@ -1,18 +1,27 @@
 diff --git a/tccrun.c b/tccrun.c
-old mode 100644
-new mode 100755
-index 79dfd08..eb779f1
+index 79dfd08..21fa846 100644
 --- a/tccrun.c
 +++ b/tccrun.c
-@@ -115,7 +115,10 @@ static int rt_mem(TCCState *s1, int size)
+@@ -1,3 +1,4 @@
++#include <sys/syscall.h>
+ /*
+  *  TCC - Tiny C Compiler - Support for -run switch
+  *
+@@ -115,9 +116,14 @@ static int rt_mem(TCCState *s1, int size)
  #ifdef CONFIG_SELINUX
      /* Using mmap instead of malloc */
      void *prw;
 -    char tmpfname[] = "/tmp/.tccrunXXXXXX";
-+    const char *tmpdir = getenv("TMPDIR");
-+    if (!tmpdir || !*tmpdir) tmpdir = "/tmp";
-+    char tmpfname[256];
-+    snprintf(tmpfname, sizeof(tmpfname), "%s/.tccrunXXXXXX", tmpdir);
-     int fd = mkstemp(tmpfname);
-     unlink(tmpfname);
+-    int fd = mkstemp(tmpfname);
+-    unlink(tmpfname);
++    /* ANDROID_TERMUX_FIX: Use memfd_create instead of mkstemp.
++       Android SELinux blocks mmap(PROT_EXEC) on files from the
++       Termux data partition (noexec mount). memfd_create creates
++       an anonymous in-memory file that bypasses filesystem exec
++       checks — same approach Android's own JIT (ART, V8) uses. */
++    int fd = syscall(SYS_memfd_create, "tccrun", 0);
++    if (fd < 0)
++        return tcc_error_noabort("tccrun: memfd_create failed");
      ftruncate(fd, size);
+ 
+     ptr = mmap(NULL, size * 2, PROT_READ|PROT_EXEC, MAP_SHARED, fd, 0);
