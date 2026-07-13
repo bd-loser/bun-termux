@@ -584,6 +584,16 @@ else:
 with open("scripts/build/deps/tinycc.ts", "w") as f:
     f.write(content)
 PYEOF
+        # CRITICAL: Copy the tccrun.c.patch file into the bun source tree
+        # The patches: array in tinycc.ts expects the file at
+        # patches/tinycc/tccrun.c.patch RELATIVE TO THE BUN SOURCE ROOT.
+        # Our patch file is in the bun-termux repo, not in bun-src.
+        # We need to copy it there during patch application.
+        SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+        mkdir -p "$BUN_SRC/patches/tinycc"
+        cp "$REPO_DIR/patches/tinycc/tccrun.c.patch" "$BUN_SRC/patches/tinycc/tccrun.c.patch"
+        echo "    [5b] Copied tccrun.c.patch to bun source tree"
         verify_patch "$TINYCC_TS" "$PATCH_MARKER" || true
     fi
 fi
