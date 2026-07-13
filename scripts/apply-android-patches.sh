@@ -823,6 +823,8 @@ fi
 # kernel to ignore the top byte of pointers in syscalls. Tagged pointers
 # from malloc work correctly in both syscalls AND free().
 #
+# NOTE: On aarch64, the syscall instruction is 'svc #0', NOT 'syscall'
+# (which is the x86_64 mnemonic). The syscall number for prctl is 167.
 # This must be called VERY EARLY — before any FFI calls or malloc that
 # produces tagged pointers passed to syscalls. main() is the earliest
 # point we control.
@@ -848,9 +850,10 @@ new = """pub fn main() void {
     // prctl(PR_SET_TAGGED_ADDR_CTRL, PR_TAGGED_ADDR_ENABLE) tells the
     // kernel to ignore the top byte, so tagged pointers work in syscalls.
     // PR_SET_TAGGED_ADDR_CTRL = 55, PR_TAGGED_ADDR_ENABLE = 1 (bit 0).
-    // On aarch64, prctl is syscall 167.
+    // On aarch64, prctl is syscall 167, invoked via 'svc #0' (not 'syscall'
+    // which is the x86_64 mnemonic).
     if (@import("builtin").abi == .android) {
-        _ = asm volatile ("syscall"
+        _ = asm volatile ("svc #0"
             : [ret] "={x0}" (-> usize),
             : [number] "{x8}" (@as(usize, 167)),
               [arg1] "{x0}" (@as(usize, 55)),
