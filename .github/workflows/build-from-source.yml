@@ -152,6 +152,12 @@ jobs:
             echo "  [FAIL] FFIObject.zig NOT patched — ptr()/toArrayBuffer will pass tagged pointers"
             PATCH_OK=false
           fi
+          if grep -q "ANDROID_TERMUX_FIX" /tmp/bun-src/src/jsc/JSValue.zig; then
+            echo "  [OK] JSValue.zig patched (TBI untagging in fromPtrAddress)"
+          else
+            echo "  [FAIL] JSValue.zig NOT patched — dlopen ptr returns will lose TBI tag in double conversion"
+            PATCH_OK=false
+          fi
           # Verify root_path is ORIGINAL (path[0..1]) — ancestor walking preserved!
           ROOT_BLOCK=$(grep -A5 "const root_path" /tmp/bun-src/src/resolver/resolver.zig)
           if echo "$ROOT_BLOCK" | grep -q "path\[0\.\.1\]"; then
