@@ -1,13 +1,11 @@
-diff --git a/tccrun.c b/tccrun.c
-index 79dfd08..032dc8d 100644
---- a/tccrun.c
-+++ b/tccrun.c
+--- tccrun.c.orig	2026-07-13 04:45:34.836547492 +0000
++++ tccrun.c	2026-07-13 04:45:34.849547491 +0000
 @@ -1,3 +1,4 @@
 +#include <sys/syscall.h>
  /*
   *  TCC - Tiny C Compiler - Support for -run switch
   *
-@@ -114,21 +115,25 @@ static int rt_mem(TCCState *s1, int size)
+@@ -114,21 +115,19 @@
      int ptr_diff = 0;
  #ifdef CONFIG_SELINUX
      /* Using mmap instead of malloc */
@@ -15,17 +13,11 @@ index 79dfd08..032dc8d 100644
 -    char tmpfname[] = "/tmp/.tccrunXXXXXX";
 -    int fd = mkstemp(tmpfname);
 -    unlink(tmpfname);
-+    /* ANDROID_TERMUX_FIX: Use memfd_create + two SEPARATE mmaps (no MAP_FIXED).
-+       Android SELinux blocks MAP_FIXED on PROT_EXEC regions.
-+       Approach: same as older TinyCC (b91835d8) which works on Android.
-+       1. memfd_create (bypasses noexec mount — Android's own JIT uses this)
-+       2. mmap RW (data) — separate mapping, no fixed address
-+       3. mmap EXEC (code) — separate mapping, no fixed address
-+       ptr_diff = prx - ptr (calculated after both mappings) */
++    /* ANDROID_TERMUX_FIX: memfd_create + two separate mmaps (no MAP_FIXED) */
 +    void *prx;
 +    int fd = syscall(SYS_memfd_create, "tccrun", 0);
 +    if (fd < 0)
-+        return tcc_error_noabort("tccrun: memfd_create failed");
++	return tcc_error_noabort("tccrun: memfd_create failed");
      ftruncate(fd, size);
  
 -    ptr = mmap(NULL, size * 2, PROT_READ|PROT_EXEC, MAP_SHARED, fd, 0);
