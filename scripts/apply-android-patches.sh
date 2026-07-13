@@ -572,32 +572,33 @@ if old not in content:
 
 content = content.replace(old, new, 1)
 
-# Also add the tccrun.c patch to the patches array
+# Also add the tccrun.c overlay to the patches array
+# Using OVERLAY (not .patch) because git apply --no-index fails on
+# tab characters in context lines. Overlay = copy entire file.
 old_patches = 'patches: ["patches/tinycc/tcc.h.patch"],'
-new_patches = 'patches: ["patches/tinycc/tcc.h.patch", "patches/tinycc/tccrun.c.patch"],'
+new_patches = 'patches: ["patches/tinycc/tcc.h.patch", "patches/tinycc/tccrun.c"],'
 if old_patches in content:
     content = content.replace(old_patches, new_patches, 1)
-    print("    [5a] Added CONFIG_SELINUX=1 + tccrun.c.patch to tinycc.ts")
+    print("    [5a] Added CONFIG_SELINUX=1 + tccrun.c overlay to tinycc.ts")
 else:
-    print("    [5a] Added CONFIG_SELINUX=1 (tccrun.c.patch already in patches array?)")
+    print("    [5a] Added CONFIG_SELINUX=1 (tccrun.c overlay already in patches array?)")
 
 with open("scripts/build/deps/tinycc.ts", "w") as f:
     f.write(content)
 PYEOF
-        # CRITICAL: Copy the tccrun.c.patch file into the bun source tree
-        # The patches: array in tinycc.ts expects the file at
-        # patches/tinycc/tccrun.c.patch RELATIVE TO THE BUN SOURCE ROOT.
-        # Our patch file is in the bun-termux repo (the checkout dir).
-        # In CI: GITHUB_WORKSPACE = bun-termux repo, BUN_SRC = /tmp/bun-src
+        # CRITICAL: Copy the tccrun.c overlay file into the bun source tree
+        # Using OVERLAY (complete file copy) instead of .patch because
+        # git apply --no-index fails on tab characters in context lines.
+        # Bun's build system treats non-.patch files as overlays (copied as-is).
         REPO_DIR="${GITHUB_WORKSPACE:-$(cd "$(dirname "$0")/../.." && pwd)}"
         mkdir -p "$BUN_SRC/patches/tinycc"
-        if [ -f "$REPO_DIR/patches/tinycc/tccrun.c.patch" ]; then
-          cp "$REPO_DIR/patches/tinycc/tccrun.c.patch" "$BUN_SRC/patches/tinycc/tccrun.c.patch"
-          echo "    [5b] Copied tccrun.c.patch to bun source tree"
+        if [ -f "$REPO_DIR/patches/tinycc/tccrun.c.overlay" ]; then
+          cp "$REPO_DIR/patches/tinycc/tccrun.c.overlay" "$BUN_SRC/patches/tinycc/tccrun.c"
+          echo "    [5b] Copied tccrun.c overlay to bun source tree"
         else
-          echo "    [FAIL] tccrun.c.patch not found at $REPO_DIR/patches/tinycc/"
+          echo "    [FAIL] tccrun.c.overlay not found at $REPO_DIR/patches/tinycc/"
           echo "    Searching for it..."
-          find "$REPO_DIR" -name "tccrun.c.patch" 2>/dev/null | head -5
+          find "$REPO_DIR" -name "tccrun.c*" 2>/dev/null | head -5
           exit 1
         fi
         verify_patch "$TINYCC_TS" "$PATCH_MARKER" || true
