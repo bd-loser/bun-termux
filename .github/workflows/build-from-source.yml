@@ -146,6 +146,12 @@ jobs:
             echo "  [FAIL] main.zig NOT patched — FFI will crash with 'pointer tag truncated'"
             PATCH_OK=false
           fi
+          if grep -q "ANDROID_TERMUX_FIX" /tmp/bun-src/src/jsc/JSValue.zig; then
+            echo "  [OK] JSValue.zig patched (TBI tag stripped in fromPtrAddress)"
+          else
+            echo "  [FAIL] JSValue.zig NOT patched — ptr returns will lose precision in double conversion"
+            PATCH_OK=false
+          fi
           # Verify root_path is ORIGINAL (path[0..1]) — ancestor walking preserved!
           ROOT_BLOCK=$(grep -A5 "const root_path" /tmp/bun-src/src/resolver/resolver.zig)
           if echo "$ROOT_BLOCK" | grep -q "path\[0\.\.1\]"; then
