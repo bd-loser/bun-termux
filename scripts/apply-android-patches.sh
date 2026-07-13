@@ -850,7 +850,7 @@ new = """pub fn main() void {
     // PR_SET_TAGGED_ADDR_CTRL = 55, PR_TAGGED_ADDR_ENABLE = 1 (bit 0).
     // On aarch64, prctl is syscall 167.
     if (@import("builtin").abi == .android) {
-        asm volatile ("syscall"
+        _ = asm volatile ("syscall"
             : [ret] "={x0}" (-> usize),
             : [number] "{x8}" (@as(usize, 167)),
               [arg1] "{x0}" (@as(usize, 55)),
