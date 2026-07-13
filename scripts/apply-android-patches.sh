@@ -853,7 +853,11 @@ new = """pub fn main() void {
     //   bits 3-31: PR_MTE_TAG — excluded tags bitmap (bit set = exclude tag)
     //
     // We set: tagged addr ENABLE + MTE_TCF NONE + ALL tags excluded
-    //   arg2 = 1 | (0 << 1) | 0xFFFFFFF8 = 0xFFFFFFFF
+    //   PR_TAGGED_ADDR_ENABLE = bit 0 = 1
+    //   PR_MTE_TCF_NONE = bits 1-2 = 00
+    //   PR_MTE_TAG_MASK = bits 3-18 = 0xFFFF (all 16 tags excluded)
+    //   bits 19-31 = 0 (reserved, must be 0)
+    //   arg2 = 1 | 0 | (0xFFFF << 3) = 0x7FFF9
     // This makes free() NOT check tags, so tagged pointers from malloc
     // can be freed without SIGABRT.
     if (@import("builtin").abi == .android) {
@@ -861,7 +865,7 @@ new = """pub fn main() void {
             @cInclude("sys/prctl.h");
         });
         // PR_TAGGED_ADDR_ENABLE=1, PR_MTE_TCF_NONE=0, all tags excluded
-        _ = c.prctl(c.PR_SET_TAGGED_ADDR_CTRL, @as(usize, 0xFFFFFFFF), @as(usize, 0), @as(usize, 0), @as(usize, 0));
+        _ = c.prctl(c.PR_SET_TAGGED_ADDR_CTRL, @as(usize, 0x7FFF9), @as(usize, 0), @as(usize, 0), @as(usize, 0));
     }
 
     _bun.crash_handler.init();"""
