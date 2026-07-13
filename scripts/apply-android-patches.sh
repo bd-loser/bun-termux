@@ -806,6 +806,80 @@ PYEOF
 fi
 
 # =====================================================================
+# PATCH 11: src/main.zig — enable tagged addressing for Android TBI
+# =====================================================================
+# ROOT CAUSE: Android 11+ on aarch64 uses TBI (Top Byte Ignore). Malloc
+# returns pointers with a non-zero top byte (the MTE tag). When these
+# tagged pointers are passed to Bionic syscalls (write, read, etc.),
+# Bionic checks if tagged addressing is enabled for the process. If NOT
+# enabled, it aborts with "Pointer tag for 0x... was truncated".
+#
+# Previous approach (stripping tags in FFI.h/fromPtrAddress) FAILED
+# because MTE-enabled free() expects the original tagged pointer.
+# Stripping the tag causes SIGABRT on free().
+#
+# CORRECT FIX: Enable tagged addressing at process startup via
+# prctl(PR_SET_TAGGED_ADDR_CTRL, PR_TAGGED_ADDR_ENABLE). This tells the
+# kernel to ignore the top byte of pointers in syscalls. Tagged pointers
+# from malloc work correctly in both syscalls AND free().
+#
+# This must be called VERY EARLY — before any FFI calls or malloc that
+# produces tagged pointers passed to syscalls. main() is the earliest
+# point we control.
+MAIN_ZIG="src/main.zig"
+if [ -f "$MAIN_ZIG" ]; then
+    if grep -q "$PATCH_MARKER" "$MAIN_ZIG" 2>/dev/null; then
+        echo "  [SKIP] $MAIN_ZIG already patched"
+    else
+        echo "  [PATCH] $MAIN_ZIG (enable tagged addressing for Android TBI)"
+        python3 <<'PYEOF'
+import sys
+
+with open("src/main.zig", "r") as f:
+    content = f.read()
+
+old = "pub fn main() void {\n    _bun.crash_handler.init();"
+
+new = """pub fn main() void {
+    // ANDROID_TERMUX_FIX: Enable tagged addressing for Android TBI/MTE.
+    // Android 11+ tags heap pointers with the top byte. Without tagged
+    // addressing enabled, Bionic aborts with "Pointer tag truncated" when
+    // tagged pointers are passed to syscalls (write, read, etc.).
+    // prctl(PR_SET_TAGGED_ADDR_CTRL, PR_TAGGED_ADDR_ENABLE) tells the
+    // kernel to ignore the top byte, so tagged pointers work in syscalls.
+    // PR_SET_TAGGED_ADDR_CTRL = 55, PR_TAGGED_ADDR_ENABLE = 1 (bit 0).
+    // On aarch64, prctl is syscall 167.
+    if (@import("builtin").abi == .android) {
+        asm volatile ("syscall"
+            : [ret] "={x0}" (-> usize),
+            : [number] "{x8}" (@as(usize, 167)),
+              [arg1] "{x0}" (@as(usize, 55)),
+              [arg2] "{x1}" (@as(usize, 1)),
+              [arg3] "{x2}" (@as(usize, 0)),
+              [arg4] "{x3}" (@as(usize, 0)),
+              [arg5] "{x4}" (@as(usize, 0)),
+            : "memory", "cc"
+        );
+    }
+
+    _bun.crash_handler.init();"""
+
+if old not in content:
+    print("    [FAIL] could not find main() entry point")
+    sys.exit(1)
+
+content = content.replace(old, new, 1)
+
+with open("src/main.zig", "w") as f:
+    f.write(content)
+
+print("    [OK] Added prctl(PR_SET_TAGGED_ADDR_CTRL, PR_TAGGED_ADDR_ENABLE) at start of main()")
+PYEOF
+        verify_patch "$MAIN_ZIG" "$PATCH_MARKER" || true
+    fi
+fi
+
+# =====================================================================
 # FINAL VERIFICATION
 # =====================================================================
 echo ""
@@ -814,7 +888,7 @@ echo "PATCH VERIFICATION SUMMARY"
 echo "=========================================="
 
 TOTAL_FAIL=0
-for f in src/resolver/resolver.zig src/cli/run_command.zig src/exe_format/elf.zig src/standalone_graph/StandaloneModuleGraph.zig scripts/build/config.ts scripts/build/deps/tinycc.ts scripts/build/flags.ts scripts/build/tools.ts src/runtime/ffi/ffi.zig; do
+for f in src/resolver/resolver.zig src/cli/run_command.zig src/exe_format/elf.zig src/standalone_graph/StandaloneModuleGraph.zig scripts/build/config.ts scripts/build/deps/tinycc.ts scripts/build/flags.ts scripts/build/tools.ts src/runtime/ffi/ffi.zig src/main.zig; do
     if [ -f "$f" ]; then
         if grep -q "$PATCH_MARKER" "$f" 2>/dev/null; then
             COUNT=$(grep -c "$PATCH_MARKER" "$f")
