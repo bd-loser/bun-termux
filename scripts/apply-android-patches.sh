@@ -553,11 +553,17 @@ new = '''    if (cfg.windows) defines.CONFIG_WIN32 = true;
     // system never enabled it. These defines match what ./configure
     // --targetos=Android --cpu=arm64 generates. This enables bun:ffi
     // callback() and linkSymbols(cc:true) on Android.
+    //
+    // CRITICAL: CONFIG_SYSROOT must be set so {R} in path templates
+    // resolves to the Termux prefix at runtime. Without this, TinyCC
+    // can't find CRT files (crtbegin_so.o) and JSCallback returns
+    // ptr=undefined, causing segfaults.
     if (cfg.linux && cfg.abi === "android") {
       defines.TARGETOS_ANDROID = 1;
       defines.CONFIG_NEW_DTAGS = 1;
       defines.CONFIG_DWARF_VERSION = 4;
       defines.CONFIG_TCC_PIE = 1;
+      defines.CONFIG_SYSROOT = "/data/data/com.termux/files/usr";
       if (cfg.arm64) {
         defines.CONFIG_TCC_SYSINCLUDEPATHS = "{B}/include:{R}/include:{R}/include/aarch64-linux-android";
         defines.CONFIG_TCC_LIBPATHS = "{B}:{R}/lib:/system/lib64";
