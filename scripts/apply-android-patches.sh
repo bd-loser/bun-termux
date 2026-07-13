@@ -858,7 +858,6 @@ new = """pub fn main() void {
               [arg3] "{x2}" (@as(usize, 0)),
               [arg4] "{x3}" (@as(usize, 0)),
               [arg5] "{x4}" (@as(usize, 0)),
-            : "memory", "cc"
         );
     }
 
