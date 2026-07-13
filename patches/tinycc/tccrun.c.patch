@@ -1,0 +1,15 @@
+--- tccrun.c
++++ tccrun.c
+@@ -113,8 +113,14 @@ static int rt_mem(TCCState *s1, int size)
+ #ifdef CONFIG_SELINUX
+     /* Using mmap instead of malloc */
+     void *prw;
+-    char tmpfname[] = "/tmp/.tccrunXXXXXX";
++    /* ANDROID_TERMUX_FIX: Use TMPDIR instead of /tmp (Termux doesn't have /tmp) */
++    const char *tmpdir = getenv("TMPDIR");
++    if (!tmpdir || !*tmpdir) tmpdir = "/tmp";
++    char tmpfname[256];
++    snprintf(tmpfname, sizeof(tmpfname), "%s/.tccrunXXXXXX", tmpdir);
+     int fd = mkstemp(tmpfname);
+     unlink(tmpfname);
+     ftruncate(fd, size);

@@ -572,64 +572,19 @@ if old not in content:
 
 content = content.replace(old, new, 1)
 
+# Also add the tccrun.c patch to the patches array
+old_patches = 'patches: ["patches/tinycc/tcc.h.patch"],'
+new_patches = 'patches: ["patches/tinycc/tcc.h.patch", "patches/tinycc/tccrun.c.patch"],'
+if old_patches in content:
+    content = content.replace(old_patches, new_patches, 1)
+    print("    [5a] Added CONFIG_SELINUX=1 + tccrun.c.patch to tinycc.ts")
+else:
+    print("    [5a] Added CONFIG_SELINUX=1 (tccrun.c.patch already in patches array?)")
+
 with open("scripts/build/deps/tinycc.ts", "w") as f:
     f.write(content)
-
-print("    [5a] Added Android/Bionic defines to tinycc.ts")
-print("    TinyCC will now build with TARGETOS_ANDROID enabled")
 PYEOF
         verify_patch "$TINYCC_TS" "$PATCH_MARKER" || true
-    fi
-fi
-
-# =====================================================================
-# PATCH 5b: vendor/tinycc/tccrun.c — fix /tmp path for Termux
-# =====================================================================
-# TinyCC's CONFIG_SELINUX path creates a tmpfile at /tmp/.tccrunXXXXXX
-# for mmap(PROT_EXEC). Termux doesn't have /tmp — it uses $TMPDIR
-# (typically /data/data/com.termux/files/usr/tmp).
-# This patch uses getenv("TMPDIR") with fallback to /tmp.
-TCCRUN_C="vendor/tinycc/tccrun.c"
-if [ -f "$TCCRUN_C" ]; then
-    if grep -q "$PATCH_MARKER" "$TCCRUN_C" 2>/dev/null; then
-        echo "  [SKIP] $TCCRUN_C already patched"
-    else
-        echo "  [PATCH] $TCCRUN_C (fix /tmp → TMPDIR for Termux)"
-        # Replace the hardcoded /tmp path with a TMPDIR-aware version
-        python3 <<'PYEOF'
-import sys
-
-with open("vendor/tinycc/tccrun.c", "r") as f:
-    content = f.read()
-
-old = '    char tmpfname[] = "/tmp/.tccrunXXXXXX";\n    int fd = mkstemp(tmpfname);'
-
-new = '''    // ANDROID_TERMUX_FIX: Use TMPDIR instead of /tmp (Termux doesn't have /tmp)
-    const char *tmpdir = getenv("TMPDIR");
-    if (!tmpdir || !*tmpdir) tmpdir = "/tmp";
-    char tmpfname[256];
-    snprintf(tmpfname, sizeof(tmpfname), "%s/.tccrunXXXXXX", tmpdir);
-    int fd = mkstemp(tmpfname);'''
-
-if old not in content:
-    print("    [FAIL] could not find tmpfname pattern in tccrun.c")
-    sys.exit(1)
-
-content = content.replace(old, new, 1)
-
-# Also add #include <stdlib.h> and <stdio.h> if not already present
-# (for getenv and snprintf)
-if '#include <stdlib.h>' not in content:
-    content = '#include <stdlib.h>\n' + content
-if '#include <stdio.h>' not in content:
-    content = '#include <stdio.h>\n' + content
-
-with open("vendor/tinycc/tccrun.c", "w") as f:
-    f.write(content)
-
-print("    [5b] Fixed /tmp → TMPDIR in tccrun.c")
-PYEOF
-        verify_patch "$TCCRUN_C" "$PATCH_MARKER" || true
     fi
 fi
 
