@@ -670,7 +670,7 @@ done < <(find src -type f \( -name "*.cpp" -o -name "*.h" \) -print0 2>/dev/null
 echo "  [OK] patched $PATCHED_FILES C++ files with dangling reference fix"
 
 # =====================================================================
-# PATCH 10: src/runtime/ffi/ffi_body.rs — add Android/Termux library + include paths
+# PATCH 10: src/runtime/ffi/ffi.zig — add Android/Termux library + include paths
 # =====================================================================
 # Bun's cc() and JSCallback use TinyCC to compile C code at runtime.
 # TinyCC needs to find libc.so for linking and system headers for includes.
@@ -688,101 +688,120 @@ echo "  [OK] patched $PATCHED_FILES C++ files with dangling reference fix"
 # The fix adds /system/lib64 + Termux $PREFIX/lib as library paths and
 # $PREFIX/include + $PREFIX/include/aarch64-linux-android as system include
 # paths, specifically for Android targets.
-FFI_BODY="src/runtime/ffi/ffi_body.rs"
-if [ -f "$FFI_BODY" ]; then
-    if grep -q "$PATCH_MARKER" "$FFI_BODY" 2>/dev/null; then
-        echo "  [SKIP] $FFI_BODY already patched"
+FFI_ZIG="src/runtime/ffi/ffi.zig"
+if [ -f "$FFI_ZIG" ]; then
+    if grep -q "$PATCH_MARKER" "$FFI_ZIG" 2>/dev/null; then
+        echo "  [SKIP] $FFI_ZIG already patched"
     else
-        echo "  [PATCH] $FFI_BODY (add Android library + include paths for TinyCC)"
+        echo "  [PATCH] $FFI_ZIG (add Android library + include paths for TinyCC)"
         python3 <<'PYEOF'
 import sys
 
-with open("src/runtime/ffi/ffi_body.rs", "r") as f:
+with open("src/runtime/ffi/ffi.zig", "r") as f:
     content = f.read()
 
-# Find the existing Linux/Android block where library paths are added.
-# We insert our Android-specific paths BEFORE this block so TinyCC finds
-# Android's libc.so first.
+# The anchor is the end of the Environment.isLinux block in the compile()
+# function. We insert our Android-specific block right after it, before
+# the Environment.isPosix block.
 #
-# The anchor is:
-#         #[cfg(any(target_os = "linux", target_os = "android"))]
-#         {
-#             if let Some(include_dir) = Self::get_system_include_dir() {
+# In Bun v1.3.14's ffi.zig, the code looks like:
+#             } else if (Environment.isLinux) {
+#                 if (getSystemIncludeDir()) |include_dir| {
+#                     state.addSysIncludePath(include_dir) catch {
+#                         debug("TinyCC failed to add sysinclude path", .{});
+#                     };
+#                 }
 #
-# We insert a new #[cfg(target_os = "android")] block right before it.
+#                 if (getSystemLibraryDir()) |library_dir| {
+#                     state.addLibraryPath(library_dir) catch {
+#                         debug("TinyCC failed to add library path", .{});
+#                     };
+#                 }
+#             }
+#
+#             if (Environment.isPosix) {
 
-anchor = '''        #[cfg(any(target_os = "linux", target_os = "android"))]
-        {
-            if let Some(include_dir) = Self::get_system_include_dir() {'''
+anchor = '''                if (getSystemLibraryDir()) |library_dir| {
+                    state.addLibraryPath(library_dir) catch {
+                        debug("TinyCC failed to add library path", .{});
+                    };
+                }
+            }
+
+            if (Environment.isPosix) {'''
 
 if anchor not in content:
-    print("    [FAIL] could not find the Linux/Android library path anchor in ffi_body.rs")
+    print("    [FAIL] could not find the Linux library path anchor in ffi.zig")
+    print("    The file structure may have changed. Aborting.")
     sys.exit(1)
 
-android_block = '''        // ANDROID_TERMUX_FIX: Add Android/Termux library + include paths for TinyCC.
-        // On Android, libc.so is at /system/lib64 (not /usr/lib). Without this,
-        // cc() fails with "tcc: error: library 'c' not found" and JSCallback
-        // fails with "tcc_relocate returned a negative value".
-        // Termux's $PREFIX/lib and $PREFIX/include provide the userspace
-        // libraries and headers (e.g., for #include <stdint.h>).
-        #[cfg(target_os = "android")]
-        {
-            // System Bionic libraries: libc.so, libm.so, libdl.so
-            if dir_exists(b"/system/lib64") {
-                if state.add_library_path(zstr!("/system/lib64")).is_err() {
-                    bun_output::scoped_log!(TCC, "TinyCC failed to add /system/lib64");
+android_block = '''                if (getSystemLibraryDir()) |library_dir| {
+                    state.addLibraryPath(library_dir) catch {
+                        debug("TinyCC failed to add library path", .{});
+                    };
                 }
             }
-            if dir_exists(b"/system/lib") {
-                if state.add_library_path(zstr!("/system/lib")).is_err() {
-                    bun_output::scoped_log!(TCC, "TinyCC failed to add /system/lib");
+
+            // ANDROID_TERMUX_FIX: Add Android/Termux library + include paths for TinyCC.
+            // On Android, libc.so is at /system/lib64 (not /usr/lib). Without this,
+            // cc() fails with "tcc: error: library 'c' not found" and JSCallback
+            // fails with "tcc_relocate returned a negative value".
+            if (Environment.isAndroid) {
+                // System Bionic libraries: libc.so, libm.so, libdl.so
+                if (bun.FD.cwd().directoryExistsAt("/system/lib64").isTrue()) {
+                    state.addLibraryPath("/system/lib64") catch {
+                        debug("TinyCC failed to add /system/lib64", .{});
+                    };
+                }
+                if (bun.FD.cwd().directoryExistsAt("/system/lib").isTrue()) {
+                    state.addLibraryPath("/system/lib") catch {
+                        debug("TinyCC failed to add /system/lib", .{});
+                    };
+                }
+                // Termux PREFIX library + include paths
+                // $PREFIX is typically /data/data/com.termux/files/usr
+                if (std.c.getenv("PREFIX")) |prefix_c| {
+                    const prefix = bun.sliceTo(prefix_c, 0);
+                    // $PREFIX/lib
+                    {
+                        const prefix_lib = bun.path.joinAbsStringBufZ(prefix, &pathbuf, &.{"lib"}, .auto);
+                        if (bun.FD.cwd().directoryExistsAt(prefix_lib).isTrue()) {
+                            state.addLibraryPath(prefix_lib) catch {
+                                debug("TinyCC failed to add Termux lib path", .{});
+                            };
+                        }
+                    }
+                    // $PREFIX/include
+                    {
+                        const prefix_include = bun.path.joinAbsStringBufZ(prefix, &pathbuf, &.{"include"}, .auto);
+                        if (bun.FD.cwd().directoryExistsAt(prefix_include).isTrue()) {
+                            state.addSysIncludePath(prefix_include) catch {
+                                debug("TinyCC failed to add Termux include path", .{});
+                            };
+                        }
+                    }
+                    // $PREFIX/include/aarch64-linux-android (asm headers)
+                    {
+                        const asm_include = bun.path.joinAbsStringBufZ(prefix, &pathbuf, &.{ "include", "aarch64-linux-android" }, .auto);
+                        if (bun.FD.cwd().directoryExistsAt(asm_include).isTrue()) {
+                            state.addSysIncludePath(asm_include) catch {
+                                debug("TinyCC failed to add Termux asm include path", .{});
+                            };
+                        }
+                    }
                 }
             }
-            // Termux PREFIX library + include paths
-            // $PREFIX is typically /data/data/com.termux/files/usr
-            if let Some(prefix) = std::env::var_os("PREFIX") {
-                let prefix_path = std::path::Path::new(&prefix);
-                let lib_dir = prefix_path.join("lib");
-                if lib_dir.exists() {
-                    let mut path_vec = lib_dir.to_string_lossy().into_owned().into_bytes();
-                    path_vec.push(0);
-                    let path_z = bun_core::ZBox::from_vec_with_nul(path_vec);
-                    if state.add_library_path(&path_z).is_err() {
-                        bun_output::scoped_log!(TCC, "TinyCC failed to add Termux lib path");
-                    }
-                }
-                let include_dir = prefix_path.join("include");
-                if include_dir.exists() {
-                    let mut path_vec = include_dir.to_string_lossy().into_owned().into_bytes();
-                    path_vec.push(0);
-                    let path_z = bun_core::ZBox::from_vec_with_nul(path_vec);
-                    if state.add_sys_include_path(&path_z).is_err() {
-                        bun_output::scoped_log!(TCC, "TinyCC failed to add Termux include path");
-                    }
-                }
-                // Arch-specific asm headers (asm/sigcontext.h, asm/types.h)
-                let asm_include = include_dir.join("aarch64-linux-android");
-                if asm_include.exists() {
-                    let mut path_vec = asm_include.to_string_lossy().into_owned().into_bytes();
-                    path_vec.push(0);
-                    let path_z = bun_core::ZBox::from_vec_with_nul(path_vec);
-                    if state.add_sys_include_path(&path_z).is_err() {
-                        bun_output::scoped_log!(TCC, "TinyCC failed to add Termux asm include path");
-                    }
-                }
-            }
-        }
 
-'''
+            if (Environment.isPosix) {'''
 
-content = content.replace(anchor, android_block + anchor, 1)
+content = content.replace(anchor, android_block, 1)
 
-with open("src/runtime/ffi/ffi_body.rs", "w") as f:
+with open("src/runtime/ffi/ffi.zig", "w") as f:
     f.write(content)
 
-print("    [OK] Added Android library + include paths to ffi_body.rs")
+print("    [OK] Added Android library + include paths to ffi.zig")
 PYEOF
-        verify_patch "$FFI_BODY" "$PATCH_MARKER" || true
+        verify_patch "$FFI_ZIG" "$PATCH_MARKER" || true
     fi
 fi
 
@@ -795,7 +814,7 @@ echo "PATCH VERIFICATION SUMMARY"
 echo "=========================================="
 
 TOTAL_FAIL=0
-for f in src/resolver/resolver.zig src/cli/run_command.zig src/exe_format/elf.zig src/standalone_graph/StandaloneModuleGraph.zig scripts/build/config.ts scripts/build/deps/tinycc.ts scripts/build/flags.ts scripts/build/tools.ts src/runtime/ffi/ffi_body.rs; do
+for f in src/resolver/resolver.zig src/cli/run_command.zig src/exe_format/elf.zig src/standalone_graph/StandaloneModuleGraph.zig scripts/build/config.ts scripts/build/deps/tinycc.ts scripts/build/flags.ts scripts/build/tools.ts src/runtime/ffi/ffi.zig; do
     if [ -f "$f" ]; then
         if grep -q "$PATCH_MARKER" "$f" 2>/dev/null; then
             COUNT=$(grep -c "$PATCH_MARKER" "$f")
