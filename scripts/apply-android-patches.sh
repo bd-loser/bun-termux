@@ -854,7 +854,7 @@ new = """pub fn main() void {
         const c = @cImport({
             @cInclude("sys/prctl.h");
         });
-        _ = c.prctl(c.PR_SET_TAGGED_ADDR_CTRL, c.PR_TAGGED_ADDR_ENABLE, 0, 0, 0);
+        _ = c.prctl(c.PR_SET_TAGGED_ADDR_CTRL, c.PR_TAGGED_ADDR_ENABLE, @as(usize, 0), @as(usize, 0), @as(usize, 0));
     }
 
     _bun.crash_handler.init();"""
