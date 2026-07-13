@@ -134,6 +134,12 @@ jobs:
             echo "  [FAIL] tinycc.ts NOT patched — TinyCC won't build correctly for Android"
             PATCH_OK=false
           fi
+          if grep -q "ANDROID_TERMUX_FIX" /tmp/bun-src/src/runtime/ffi/ffi_body.rs; then
+            echo "  [OK] ffi_body.rs patched (Android library + include paths for TinyCC)"
+          else
+            echo "  [FAIL] ffi_body.rs NOT patched — cc()/JSCallback will fail with 'library c not found'"
+            PATCH_OK=false
+          fi
           # Verify root_path is ORIGINAL (path[0..1]) — ancestor walking preserved!
           ROOT_BLOCK=$(grep -A5 "const root_path" /tmp/bun-src/src/resolver/resolver.zig)
           if echo "$ROOT_BLOCK" | grep -q "path\[0\.\.1\]"; then
