@@ -875,71 +875,6 @@ PYEOF
 fi
 
 # =====================================================================
-# PATCH 12: src/jsc/JSValue.zig — strip TBI tag in fromPtrAddress()
-# =====================================================================
-# ROOT CAUSE: Android's scudo allocator tags heap pointers with the top
-# byte (TBI). Example: yogaNodeCreateForOpenTUI returns 0xb400007d32655000
-# (tag = 0xb4). This value = 12970367464543440000 which EXCEEDS double's
-# safe integer range (2^53 - 1 = 9007199254740991). The double conversion
-# in fromPtrAddress() loses precision → wrong pointer → SIGSEGV.
-#
-# FIX: Strip the top byte before converting to double. The untagged pointer
-# (0x0000007d32655000 = 535028765696) is within double's safe range and
-# works correctly because tagged addressing is enabled (prctl in main.zig)
-# — the kernel ignores the top byte in syscalls.
-#
-# This is SAFE because:
-# - prctl(PR_SET_TAGGED_ADDR_CTRL) is called at startup (PATCH 11)
-# - The kernel ignores the top byte for untagged pointers too
-# - free() works because scudo tracks by address, not tag
-JSVALUE_ZIG="src/jsc/JSValue.zig"
-if [ -f "$JSVALUE_ZIG" ]; then
-    if grep -q "$PATCH_MARKER" "$JSVALUE_ZIG" 2>/dev/null; then
-        echo "  [SKIP] $JSVALUE_ZIG already patched"
-    else
-        echo "  [PATCH] $JSVALUE_ZIG (strip TBI tag in fromPtrAddress)"
-        python3 <<'PYEOF'
-import sys
-
-with open("src/jsc/JSValue.zig", "r") as f:
-    content = f.read()
-
-old = '''    /// Encodes addr as a double. Resulting value can be passed to asPtrAddress.
-    pub fn fromPtrAddress(addr: usize) JSValue {
-        return jsDoubleNumber(@floatFromInt(addr));
-    }'''
-
-new = '''    /// Encodes addr as a double. Resulting value can be passed to asPtrAddress.
-    /// ANDROID_TERMUX_FIX: Strip TBI tag (top byte) before converting to double.
-    /// Android's scudo allocator tags heap pointers with the top byte (e.g.
-    /// 0xb400007d32655000). Tagged pointers exceed double's 52-bit mantissa
-    /// range, causing precision loss → wrong pointer → SIGSEGV. Untagging
-    /// keeps the pointer within the safe integer range. This is safe because
-    /// tagged addressing is enabled at startup (prctl in main.zig).
-    pub fn fromPtrAddress(addr: usize) JSValue {
-        const untagged = if (@import("builtin").abi == .android)
-            addr & 0x00FFFFFFFFFFFFFF
-        else
-            addr;
-        return jsDoubleNumber(@floatFromInt(untagged));
-    }'''
-
-if old not in content:
-    print("    [FAIL] could not find fromPtrAddress")
-    sys.exit(1)
-
-content = content.replace(old, new, 1)
-
-with open("src/jsc/JSValue.zig", "w") as f:
-    f.write(content)
-
-print("    [OK] Patched fromPtrAddress to strip TBI tag")
-PYEOF
-        verify_patch "$JSVALUE_ZIG" "$PATCH_MARKER" || true
-    fi
-fi
-
-# =====================================================================
 # FINAL VERIFICATION
 # =====================================================================
 echo ""
@@ -948,7 +883,7 @@ echo "PATCH VERIFICATION SUMMARY"
 echo "=========================================="
 
 TOTAL_FAIL=0
-for f in src/resolver/resolver.zig src/cli/run_command.zig src/exe_format/elf.zig src/standalone_graph/StandaloneModuleGraph.zig scripts/build/config.ts scripts/build/deps/tinycc.ts scripts/build/flags.ts scripts/build/tools.ts src/runtime/ffi/ffi.zig src/main.zig src/jsc/JSValue.zig; do
+for f in src/resolver/resolver.zig src/cli/run_command.zig src/exe_format/elf.zig src/standalone_graph/StandaloneModuleGraph.zig scripts/build/config.ts scripts/build/deps/tinycc.ts scripts/build/flags.ts scripts/build/tools.ts src/runtime/ffi/ffi.zig src/main.zig; do
     if [ -f "$f" ]; then
         if grep -q "$PATCH_MARKER" "$f" 2>/dev/null; then
             COUNT=$(grep -c "$PATCH_MARKER" "$f")
