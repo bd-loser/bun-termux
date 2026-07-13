@@ -843,18 +843,25 @@ with open("src/main.zig", "r") as f:
 old = "pub fn main() void {\n    _bun.crash_handler.init();"
 
 new = """pub fn main() void {
-    // ANDROID_TERMUX_FIX: Enable tagged addressing for Android TBI/MTE.
-    // Android 11+ tags heap pointers with the top byte. Without tagged
-    // addressing enabled, Bionic aborts with "Pointer tag truncated" when
-    // tagged pointers are passed to syscalls (write, read, etc.).
-    // prctl(PR_SET_TAGGED_ADDR_CTRL, PR_TAGGED_ADDR_ENABLE) tells the
-    // kernel to ignore the top byte, so tagged pointers work in syscalls.
-    // PR_SET_TAGGED_ADDR_CTRL = 55, PR_TAGGED_ADDR_ENABLE = 1 (bit 0).
+    // ANDROID_TERMUX_FIX: Enable tagged addressing AND disable MTE tag checks.
+    // Android 11+ tags heap pointers with the top byte (TBI). Scudo's MTE
+    // checks tags on free() and aborts if the tag doesn't match.
+    //
+    // prctl(PR_SET_TAGGED_ADDR_CTRL) arg2 is a bitmask:
+    //   bit 0:     PR_TAGGED_ADDR_ENABLE (1) — kernel ignores top byte in syscalls
+    //   bits 1-2:  PR_MTE_TCF (0 = none, 1 = sync, 2 = async) — tag check mode
+    //   bits 3-31: PR_MTE_TAG — excluded tags bitmap (bit set = exclude tag)
+    //
+    // We set: tagged addr ENABLE + MTE_TCF NONE + ALL tags excluded
+    //   arg2 = 1 | (0 << 1) | 0xFFFFFFF8 = 0xFFFFFFFF
+    // This makes free() NOT check tags, so tagged pointers from malloc
+    // can be freed without SIGABRT.
     if (@import("builtin").abi == .android) {
         const c = @cImport({
             @cInclude("sys/prctl.h");
         });
-        _ = c.prctl(c.PR_SET_TAGGED_ADDR_CTRL, c.PR_TAGGED_ADDR_ENABLE, @as(usize, 0), @as(usize, 0), @as(usize, 0));
+        // PR_TAGGED_ADDR_ENABLE=1, PR_MTE_TCF_NONE=0, all tags excluded
+        _ = c.prctl(c.PR_SET_TAGGED_ADDR_CTRL, @as(usize, 0xFFFFFFFF), @as(usize, 0), @as(usize, 0), @as(usize, 0));
     }
 
     _bun.crash_handler.init();"""
