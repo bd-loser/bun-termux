@@ -551,19 +551,19 @@ new = '''    if (cfg.windows) defines.CONFIG_WIN32 = true;
     // ANDROID_TERMUX_FIX: Enable TinyCC for Android/Bionic.
     // Based on guysoft/opencode-termux's proven approach: use MINIMAL
     // defines. Don't set TARGETOS_ANDROID, CONFIG_SYSROOT, or Android
-    // CRT/lib paths — those cause tcc_relocate() to fail on Bionic
-    // because it tries to use Android CRT files for in-memory relocation.
+    // CRT/lib paths.
     //
-    // JSCallback uses TCC_OUTPUT_MEMORY with -nostdlib, which compiles
-    // C code in memory and mmaps it as executable. This doesn't need
-    // CRT files or system libraries — just the bare TCC_TARGET_ARM64.
+    // CRITICAL: CONFIG_SELINUX=1 is the KEY define that makes JSCallback
+    // work on Android. Without it, TinyCC uses tcc_malloc() + mprotect()
+    // for executable memory. Android SELinux BLOCKS mprotect(PROT_EXEC)
+    // on heap memory. With CONFIG_SELINUX=1, TinyCC uses mmap(PROT_EXEC)
+    // directly via a tmpfile — which Android SELinux allows.
     //
-    // The opencode-termux project proved this works with just:
-    //   TCC_TARGET_ARM64 + ONE_SOURCE=0 + minimal config.h
+    // This is why opencode-termux works: their TinyCC build (commit
+    // b91835d8) has HAVE_SELINUX enabled by default. Our newer TinyCC
+    // (commit 12882eee) has CONFIG_SELINUX commented out.
     if (cfg.linux && cfg.abi === "android" && cfg.arm64) {
-      // TCC_TARGET_ARM64 is already set by the arch detection above
-      // (sources.push("arm64-gen.c", "arm64-link.c", "arm64-asm.c"))
-      // Just need to ensure config.h has the right stub
+      defines.CONFIG_SELINUX = 1;
     }'''
 
 if old not in content:
