@@ -1018,70 +1018,6 @@ PYEOF
 fi
 
 # =====================================================================
-# PATCH 13: src/jsc/JSValue.zig — untag TBI pointers in fromPtrAddress
-# =====================================================================
-# ROOT CAUSE: When dlopen symbols return "ptr", Bun converts the native
-# pointer to a JS number via JSValue.fromPtrAddress(). This uses:
-#   jsDoubleNumber(@floatFromInt(addr))
-# A double only has 52 bits of mantissa. Android's tagged pointers use
-# bits 56-63 for the TBI tag. The tag is LOST in the double conversion,
-# producing an invalid pointer when asPtrAddress() converts it back.
-#
-# Example: yoga's YGNodeNewWithConfig returns a tagged pointer like
-# 0x3c0000700000. fromPtrAddress converts it to a double, losing the
-# 0x3c tag. When JS passes it back to native code, the pointer is
-# 0x000000700000 — wrong address → SIGSEGV.
-#
-# FIX: Strip the top byte in fromPtrAddress() before the double
-# conversion. The untagged pointer (0x000000700000) is valid because
-# aarch64's TBI means the CPU ignores the top byte in memory accesses.
-JSVALUE_ZIG="src/jsc/JSValue.zig"
-if [ -f "$JSVALUE_ZIG" ]; then
-    if grep -q "$PATCH_MARKER" "$JSVALUE_ZIG" 2>/dev/null; then
-        echo "  [SKIP] $JSVALUE_ZIG already patched"
-    else
-        echo "  [PATCH] $JSVALUE_ZIG (untag TBI in fromPtrAddress)"
-        python3 <<'PYEOF'
-import sys
-
-with open("src/jsc/JSValue.zig", "r") as f:
-    content = f.read()
-
-old = '''    /// Encodes addr as a double. Resulting value can be passed to asPtrAddress.
-    pub fn fromPtrAddress(addr: usize) JSValue {
-        return jsDoubleNumber(@floatFromInt(addr));
-    }'''
-
-new = '''    /// Encodes addr as a double. Resulting value can be passed to asPtrAddress.
-    /// ANDROID_TERMUX_FIX: Strip TBI tag (top byte) before converting to double.
-    /// Android 11+ tags heap pointers with the top byte for MTE. A double only
-    /// has 52 bits of mantissa, so the tag would be lost in the conversion,
-    /// producing an invalid pointer when asPtrAddress() converts it back.
-    /// Untagging here ensures the pointer survives the double round-trip.
-    pub fn fromPtrAddress(addr: usize) JSValue {
-        const untagged = if (@import("builtin").abi == .android)
-            addr & 0x00FFFFFFFFFFFFFF
-        else
-            addr;
-        return jsDoubleNumber(@floatFromInt(untagged));
-    }'''
-
-if old not in content:
-    print("    [FAIL] could not find fromPtrAddress")
-    sys.exit(1)
-
-content = content.replace(old, new, 1)
-
-with open("src/jsc/JSValue.zig", "w") as f:
-    f.write(content)
-
-print("    [OK] Patched fromPtrAddress to untag TBI pointers")
-PYEOF
-        verify_patch "$JSVALUE_ZIG" "$PATCH_MARKER" || true
-    fi
-fi
-
-# =====================================================================
 # FINAL VERIFICATION
 # =====================================================================
 echo ""
@@ -1090,7 +1026,7 @@ echo "PATCH VERIFICATION SUMMARY"
 echo "=========================================="
 
 TOTAL_FAIL=0
-for f in src/resolver/resolver.zig src/cli/run_command.zig src/exe_format/elf.zig src/standalone_graph/StandaloneModuleGraph.zig scripts/build/config.ts scripts/build/deps/tinycc.ts scripts/build/flags.ts scripts/build/tools.ts src/runtime/ffi/ffi.zig src/runtime/ffi/FFI.h src/runtime/ffi/FFIObject.zig src/jsc/JSValue.zig; do
+for f in src/resolver/resolver.zig src/cli/run_command.zig src/exe_format/elf.zig src/standalone_graph/StandaloneModuleGraph.zig scripts/build/config.ts scripts/build/deps/tinycc.ts scripts/build/flags.ts scripts/build/tools.ts src/runtime/ffi/ffi.zig src/runtime/ffi/FFI.h src/runtime/ffi/FFIObject.zig; do
     if [ -f "$f" ]; then
         if grep -q "$PATCH_MARKER" "$f" 2>/dev/null; then
             COUNT=$(grep -c "$PATCH_MARKER" "$f")
