@@ -549,34 +549,21 @@ old = '    if (cfg.windows) defines.CONFIG_WIN32 = true;'
 new = '''    if (cfg.windows) defines.CONFIG_WIN32 = true;
 
     // ANDROID_TERMUX_FIX: Enable TinyCC for Android/Bionic.
-    // TinyCC has Android support in its configure script but Bun's build
-    // system never enabled it. These defines match what ./configure
-    // --targetos=Android --cpu=arm64 generates. This enables bun:ffi
-    // callback() and linkSymbols(cc:true) on Android.
+    // Based on guysoft/opencode-termux's proven approach: use MINIMAL
+    // defines. Don't set TARGETOS_ANDROID, CONFIG_SYSROOT, or Android
+    // CRT/lib paths — those cause tcc_relocate() to fail on Bionic
+    // because it tries to use Android CRT files for in-memory relocation.
     //
-    // CRITICAL: CONFIG_SYSROOT must be set so {R} in path templates
-    // resolves to the Termux prefix at runtime. Without this, TinyCC
-    // can't find CRT files (crtbegin_so.o) and JSCallback returns
-    // ptr=undefined, causing segfaults.
-    if (cfg.linux && cfg.abi === "android") {
-      defines.TARGETOS_ANDROID = 1;
-      defines.CONFIG_NEW_DTAGS = 1;
-      defines.CONFIG_DWARF_VERSION = 4;
-      defines.CONFIG_TCC_PIE = 1;
-      defines.CONFIG_SYSROOT = "/data/data/com.termux/files/usr";
-      if (cfg.arm64) {
-        defines.CONFIG_TCC_SYSINCLUDEPATHS = "{B}/include:{R}/include:{R}/include/aarch64-linux-android";
-        defines.CONFIG_TCC_LIBPATHS = "{B}:{R}/lib:/system/lib64";
-        defines.CONFIG_TCC_CRTPREFIX = "{R}/lib";
-        defines.CONFIG_TCC_ELFINTERP = "/system/bin/linker64";
-        defines.CONFIG_TRIPLET = "aarch64-linux-android";
-      } else if (cfg.x64) {
-        defines.CONFIG_TCC_SYSINCLUDEPATHS = "{B}/include:{R}/include:{R}/include/x86_64-linux-android";
-        defines.CONFIG_TCC_LIBPATHS = "{B}:{R}/lib:/system/lib64";
-        defines.CONFIG_TCC_CRTPREFIX = "{R}/lib";
-        defines.CONFIG_TCC_ELFINTERP = "/system/bin/linker64";
-        defines.CONFIG_TRIPLET = "x86_64-linux-android";
-      }
+    // JSCallback uses TCC_OUTPUT_MEMORY with -nostdlib, which compiles
+    // C code in memory and mmaps it as executable. This doesn't need
+    // CRT files or system libraries — just the bare TCC_TARGET_ARM64.
+    //
+    // The opencode-termux project proved this works with just:
+    //   TCC_TARGET_ARM64 + ONE_SOURCE=0 + minimal config.h
+    if (cfg.linux && cfg.abi === "android" && cfg.arm64) {
+      // TCC_TARGET_ARM64 is already set by the arch detection above
+      // (sources.push("arm64-gen.c", "arm64-link.c", "arm64-asm.c"))
+      // Just need to ensure config.h has the right stub
     }'''
 
 if old not in content:
