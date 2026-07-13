@@ -851,8 +851,10 @@ new = """pub fn main() void {
     // kernel to ignore the top byte, so tagged pointers work in syscalls.
     // PR_SET_TAGGED_ADDR_CTRL = 55, PR_TAGGED_ADDR_ENABLE = 1 (bit 0).
     if (@import("builtin").abi == .android) {
-        extern "c" fn prctl(option: c_int, arg2: usize, arg3: usize, arg4: usize, arg5: usize) c_int;
-        _ = prctl(55, 1, 0, 0, 0);
+        const c = @cImport({
+            @cInclude("sys/prctl.h");
+        });
+        _ = c.prctl(c.PR_SET_TAGGED_ADDR_CTRL, c.PR_TAGGED_ADDR_ENABLE, 0, 0, 0);
     }
 
     _bun.crash_handler.init();"""
