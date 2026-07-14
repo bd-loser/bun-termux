@@ -861,10 +861,13 @@ if anchor not in content:
     print("    [FAIL] could not find MAX_INT32 anchor")
     sys.exit(1)
 
-debug_code = '''#include <unistd.h>
-
-// ANDROID_TERMUX_FIX: Debug logging for JSVALUE_TO_PTR
+debug_code = '''// ANDROID_TERMUX_FIX: Debug logging for JSVALUE_TO_PTR
 // Set BUN_FFI_DEBUG_PTR=1 to enable
+// NOTE: No #include — TinyCC can't find system headers. Use extern.
+extern int write(int, const void*, unsigned long);
+extern char* getenv(const char*);
+extern int snprintf(char*, unsigned long, const char*, ...);
+
 static int ffi_debug_ptr_enabled = -1;
 static void ffi_debug_ptr_log(const char* path, int64_t input, uint64_t output) {
     if (ffi_debug_ptr_enabled == -1) {
