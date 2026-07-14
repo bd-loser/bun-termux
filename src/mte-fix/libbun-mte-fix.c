@@ -140,17 +140,42 @@ static void init_disable_heap_tagging(void) {
         fprintf(stderr, "[mte-fix] android_mallopt(SET_HEAP_TAGGING_LEVEL, NONE) OK\n");
     }
 
-    /* Step 2: Disable MTE via prctl.
-     * This disables hardware MTE tag checking for the current thread.
-     * PR_MTE_TCF_NONE = no tag checking (not even async). */
-    unsigned long ctrl = 0;  /* PR_TAGGED_ADDR_ENABLE = 0, PR_MTE_TCF_NONE */
+    /* Step 2: Disable MTE hardware tag checking via prctl.
+     *
+     * CRITICAL: We must KEEP PR_TAGGED_ADDR_ENABLE = 1 (so the kernel
+     * ignores the top byte of tagged pointers). If we set it to 0,
+     * the kernel uses the FULL 64-bit address, but scudo's internal
+     * data structures already contain tagged pointers (0xb4...).
+     * Dereferencing them would use address 0xb4...xxxx instead of
+     * 0x00...xxxx → SEGFAULT, and the process dies immediately.
+     *
+     * So we set:
+     *   PR_TAGGED_ADDR_ENABLE = 1  (keep ignoring top byte)
+     *   PR_MTE_TCF_NONE       = 0  (no MTE hardware tag check)
+     *   PR_MTE_TAG_MASK       = all bits set (allow all tags)
+     *
+     * This means: the kernel still ignores the top byte (so existing
+     * tagged pointers work), but MTE hardware no longer checks tags
+     * (so scudo's chunk header access at untag(ptr)-16 doesn't fault).
+     */
+    unsigned long ctrl = PR_TAGGED_ADDR_ENABLE;  /* keep tagged addressing ON */
+    /* PR_MTE_TCF_NONE = 0 by default (bits 1-2 = 00) */
+    /* Set tag mask to allow all tags (bits 3-18 = all 1s) */
+    #ifndef PR_MTE_TAG_SHIFT
+    #define PR_MTE_TAG_SHIFT 3
+    #endif
+    #ifndef PR_MTE_TAG_MASK
+    #define PR_MTE_TAG_MASK (0xffffUL << PR_MTE_TAG_SHIFT)
+    #endif
+    ctrl |= PR_MTE_TAG_MASK;
     result = prctl(PR_SET_TAGGED_ADDR_CTRL, ctrl, 0, 0, 0);
     if (result != 0) {
-        fprintf(stderr, "[mte-fix] prctl(PR_SET_TAGGED_ADDR_CTRL, 0) FAILED (ret=%d, errno=%d)\n",
-                result, errno);
+        fprintf(stderr, "[mte-fix] prctl(PR_SET_TAGGED_ADDR_CTRL, 0x%lx) FAILED (ret=%d, errno=%d)\n",
+                ctrl, result, errno);
         errors++;
     } else {
-        fprintf(stderr, "[mte-fix] prctl(PR_SET_TAGGED_ADDR_CTRL, 0) OK — MTE disabled\n");
+        fprintf(stderr, "[mte-fix] prctl(PR_SET_TAGGED_ADDR_CTRL, 0x%lx) OK — MTE HW check disabled\n",
+                ctrl);
     }
 
     /* Step 3: Also check MEMTAG_OPTIONS (in case it helps on some devices) */
