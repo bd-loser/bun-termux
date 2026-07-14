@@ -45,6 +45,8 @@
  */
 
 #define _GNU_SOURCE
+#include <errno.h>
+#include <malloc.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -54,21 +56,21 @@
 #include <unistd.h>
 #include <sys/prctl.h>
 
-/* ─── Bionic mallopt constants ──────────────────────────────────── */
-/* These are defined in Bionic's malloc.h but may not be in the NDK
- * headers we're building with. Define them ourselves. */
-
-/* android_mallopt function signature:
+/* ─── Bionic mallopt ────────────────────────────────────────────── */
+/* android_mallopt() and the M_BIONIC_* / M_HEAP_TAGGING_LEVEL_*
+ * constants are defined in Bionic's <malloc.h> (included above).
+ *
+ * Function signature:
  *   int android_mallopt(int opcode, void *arg, size_t arg_size);
- */
+ *
+ * Key constants from <malloc.h>:
+ *   M_BIONIC_SET_HEAP_TAGGING_LEVEL  = -204  (opcode)
+ *   M_HEAP_TAGGING_LEVEL_NONE        = 0     (disable all tagging)
+ *   M_HEAP_TAGGING_LEVEL_TBI         = 1     (TBI only, no MTE)
+ *
+ * If <malloc.h> doesn't declare android_mallopt (older NDK), declare
+ * it ourselves. */
 extern int android_mallopt(int opcode, void *arg, size_t arg_size);
-
-/* Opcode to set heap tagging level */
-#define M_BIONIC_SET_HEAP_TAGGING_LEVEL 4
-
-/* Tagging levels */
-#define M_HEAP_TAGGING_LEVEL_NONE 0
-#define M_HEAP_TAGGING_LEVEL_TBI  1
 
 /* ─── prctl constants for MTE ───────────────────────────────────── */
 /* PR_SET_TAGGED_ADDR_CTRL allows disabling MTE for the current thread.
@@ -119,29 +121,36 @@ static void init_disable_heap_tagging(void) {
     int result;
     int errors = 0;
 
+    /* Always print init status to stderr (not gated by BUN_MTE_FIX_DEBUG)
+     * so we can always see whether the shim loaded and what happened. */
+    fprintf(stderr, "[mte-fix] constructor running (pid=%d)\n", getpid());
+
     /* Step 1: Disable heap tagging via android_mallopt.
-     * This tells scudo to NOT tag pointers and to NOT check tags in free. */
+     * This tells scudo to NOT tag pointers and to NOT check tags in free.
+     * M_BIONIC_SET_HEAP_TAGGING_LEVEL = -204
+     * M_HEAP_TAGGING_LEVEL_NONE = 0 (from <malloc.h>) */
     int level = M_HEAP_TAGGING_LEVEL_NONE;
     result = android_mallopt(M_BIONIC_SET_HEAP_TAGGING_LEVEL,
                               &level, sizeof(level));
     if (result != 0) {
-        debug_log("[mte-fix] android_mallopt(SET_HEAP_TAGGING_LEVEL, NONE) FAILED (ret=%d)\n", result);
+        fprintf(stderr, "[mte-fix] android_mallopt(SET_HEAP_TAGGING_LEVEL, NONE) FAILED (ret=%d, errno=%d)\n",
+                result, errno);
         errors++;
     } else {
-        debug_log("[mte-fix] android_mallopt(SET_HEAP_TAGGING_LEVEL, NONE) OK\n");
+        fprintf(stderr, "[mte-fix] android_mallopt(SET_HEAP_TAGGING_LEVEL, NONE) OK\n");
     }
 
     /* Step 2: Disable MTE via prctl.
      * This disables hardware MTE tag checking for the current thread.
      * PR_MTE_TCF_NONE = no tag checking (not even async). */
-    /* First, clear the tagged address enable bit and set TCF to NONE */
     unsigned long ctrl = 0;  /* PR_TAGGED_ADDR_ENABLE = 0, PR_MTE_TCF_NONE */
     result = prctl(PR_SET_TAGGED_ADDR_CTRL, ctrl, 0, 0, 0);
     if (result != 0) {
-        debug_log("[mte-fix] prctl(PR_SET_TAGGED_ADDR_CTRL, 0) FAILED (ret=%d)\n", result);
+        fprintf(stderr, "[mte-fix] prctl(PR_SET_TAGGED_ADDR_CTRL, 0) FAILED (ret=%d, errno=%d)\n",
+                result, errno);
         errors++;
     } else {
-        debug_log("[mte-fix] prctl(PR_SET_TAGGED_ADDR_CTRL, 0) OK — MTE disabled\n");
+        fprintf(stderr, "[mte-fix] prctl(PR_SET_TAGGED_ADDR_CTRL, 0) OK — MTE disabled\n");
     }
 
     /* Step 3: Also check MEMTAG_OPTIONS (in case it helps on some devices) */
