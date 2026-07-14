@@ -41,16 +41,26 @@ fi
 
 # Load the LD_PRELOAD shim if it exists (built by build-shim.sh / CI).
 # Don't double-load if it's already in LD_PRELOAD.
-if [ -f "$SHIM" ]; then
-  if [ -z "${LD_PRELOAD:-}" ]; then
-    export LD_PRELOAD="$SHIM"
-  else
-    case ":$LD_PRELOAD:" in
-      *":$SHIM:"*) ;;            # already loaded, skip
-      *) export LD_PRELOAD="$SHIM:$LD_PRELOAD" ;;
-    esac
+add_preload() {
+  local lib="$1"
+  if [ -f "$lib" ]; then
+    if [ -z "${LD_PRELOAD:-}" ]; then
+      export LD_PRELOAD="$lib"
+    else
+      case ":$LD_PRELOAD:" in
+        *":$lib:"*) ;;            # already loaded, skip
+        *) export LD_PRELOAD="$lib:$LD_PRELOAD" ;;
+      esac
+    fi
   fi
-fi
+}
+
+# Load the MTE fix shim FIRST (see launcher-bun.sh for details).
+MTE_FIX="/data/data/com.termux/files/usr/lib/bun-termux/libbun-mte-fix.so"
+add_preload "$MTE_FIX"
+
+# Load the android-fix shim
+add_preload "$SHIM"
 
 # Disable Android's MTE (Memory Tagging Extension) for the Bun process.
 # See launcher-bun.sh for details. Must be set before exec.
