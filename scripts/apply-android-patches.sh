@@ -827,7 +827,7 @@ if [ -f "$JSVALUE_ZIG" ]; then
     if grep -q "$PATCH_MARKER" "$JSVALUE_ZIG" 2>/dev/null; then
         echo "  [SKIP] $JSVALUE_ZIG already patched"
     else
-        echo "  [PATCH] $JSVALUE_ZIG (strip TBI tag in fromPtrAddress)"
+        echo "  [PATCH] $JSVALUE_Zig (strip TBI tag in fromPtrAddress)"
         python3 <<'PYEOF'
 import sys
 
