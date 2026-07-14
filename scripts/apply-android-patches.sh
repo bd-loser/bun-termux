@@ -813,27 +813,73 @@ PYEOF
 fi
 
 # =====================================================================
-# PATCH 11: src/main.zig — no changes needed (MTE disabled via launcher)
+# PATCH 11: src/main.zig — disable scudo heap tagging at process start
 # =====================================================================
-# MTE is disabled by setting MEMTAG_OPTIONS=off in the launcher scripts
-# (launcher-bun.sh and launcher-bunx.sh). This must be done BEFORE the
-# process starts — prctl() in main() is too late because Bionic's scudo
-# allocator has already initialized with MTE enabled by the time main()
-# runs.
+# ROOT CAUSE: On Android, scudo's heap tagging (TBI) tags malloc'd
+# pointers with a non-zero top byte (0xb4). When free() receives a
+# tagged pointer, it checks the tag and SIGABRTs if it doesn't match.
 #
-# The launcher approach:
-#   export MEMTAG_OPTIONS=off
-#   exec "$BUN_BIN" "$@"
+# MEMTAG_OPTIONS=off in the launcher doesn't work on all devices.
+# The LD_PRELOAD shim runs too late (scudo already initialized).
 #
-# This tells Bionic's scudo to NOT use MTE tags at all, so:
-# - malloc() returns untagged pointers (top byte = 0)
-# - free() doesn't check tags (no SIGABRT)
-# - syscalls work normally (no "pointer tag truncated")
-# - No prctl needed in main.zig
-# - No fromPtrAddress tag stripping needed
-# - No FFI.h tag stripping needed
+# FIX: Call android_mallopt(M_BIONIC_SET_HEAP_TAGGING_LEVEL, NONE) at
+# the VERY FIRST LINE of main(), before crash_handler.init() and before
+# any heap allocation. This tells scudo to stop tagging pointers.
 #
-# This is the cleanest, simplest, and most reliable fix.
+# M_BIONIC_SET_HEAP_TAGGING_LEVEL = -204 (from Bionic's malloc.h)
+# M_HEAP_TAGGING_LEVEL_NONE = 0
+#
+MAIN_ZIG="src/main.zig"
+if [ -f "$MAIN_ZIG" ]; then
+    if grep -q "ANDROID_TERMUX_FIX_HEAP_TAGGING" "$MAIN_ZIG" 2>/dev/null; then
+        echo "  [SKIP] $MAIN_ZIG already patched for heap tagging"
+    else
+        echo "  [PATCH] $MAIN_ZIG (disable scudo heap tagging at startup)"
+        python3 <<'PYEOF'
+import sys
+
+with open("src/main.zig", "r") as f:
+    content = f.read()
+
+# 1. Add extern fn declaration after the existing extern declarations
+old_externs = 'pub extern "c" var environ: ?*anyopaque;'
+new_externs = '''pub extern "c" var environ: ?*anyopaque;
+
+// ANDROID_TERMUX_FIX_HEAP_TAGGING: Disable scudo heap tagging at startup.
+// Must be called before ANY heap allocation.
+extern fn android_mallopt(opcode: c_int, arg: *anyopaque, arg_size: usize) c_int;'''
+
+if old_externs not in content:
+    print("    [FAIL] could not find extern environ declaration")
+    sys.exit(1)
+content = content.replace(old_externs, new_externs, 1)
+
+# 2. Insert android_mallopt call at the very first line of main()
+old_main = 'pub fn main() void {\n    _bun.crash_handler.init();'
+new_main = '''pub fn main() void {
+    // ANDROID_TERMUX_FIX_HEAP_TAGGING: Disable scudo heap tagging BEFORE
+    // anything else. M_BIONIC_SET_HEAP_TAGGING_LEVEL = -204,
+    // M_HEAP_TAGGING_LEVEL_NONE = 0. This must run before any heap
+    // allocation (including crash_handler.init()).
+    if (Environment.isAndroid) {
+        var level: c_int = 0;
+        _ = android_mallopt(-204, @ptrCast(&level), @sizeOf(c_int));
+    }
+    _bun.crash_handler.init();'''
+
+if old_main not in content:
+    print("    [FAIL] could not find main() function start")
+    sys.exit(1)
+content = content.replace(old_main, new_main, 1)
+
+with open("src/main.zig", "w") as f:
+    f.write(content)
+
+print("    [OK] Added android_mallopt(SET_HEAP_TAGGING_LEVEL, NONE) to main()")
+PYEOF
+        verify_patch "$MAIN_ZIG" "ANDROID_TERMUX_FIX_HEAP_TAGGING" || true
+    fi
+fi
 
 # =====================================================================
 # PATCH 12: src/runtime/ffi/FFI.h — DEBUG: log JSVALUE_TO_PTR input/output
@@ -990,7 +1036,7 @@ echo "PATCH VERIFICATION SUMMARY"
 echo "=========================================="
 
 TOTAL_FAIL=0
-for f in src/resolver/resolver.zig src/cli/run_command.zig src/exe_format/elf.zig src/standalone_graph/StandaloneModuleGraph.zig scripts/build/config.ts scripts/build/deps/tinycc.ts scripts/build/flags.ts scripts/build/tools.ts src/runtime/ffi/ffi.zig src/runtime/ffi/FFI.h; do
+for f in src/resolver/resolver.zig src/cli/run_command.zig src/exe_format/elf.zig src/standalone_graph/StandaloneModuleGraph.zig scripts/build/config.ts scripts/build/deps/tinycc.ts scripts/build/flags.ts scripts/build/tools.ts src/runtime/ffi/ffi.zig src/runtime/ffi/FFI.h src/main.zig; do
     if [ -f "$f" ]; then
         if grep -q "$PATCH_MARKER" "$f" 2>/dev/null; then
             COUNT=$(grep -c "$PATCH_MARKER" "$f")
