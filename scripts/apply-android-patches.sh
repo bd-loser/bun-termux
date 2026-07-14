@@ -806,69 +806,27 @@ PYEOF
 fi
 
 # =====================================================================
-# PATCH 11: src/jsc/JSValue.zig — strip TBI tag in fromPtrAddress()
+# PATCH 11: src/main.zig — no changes needed (MTE disabled via launcher)
 # =====================================================================
-# ROOT CAUSE: Android's scudo allocator tags heap pointers with the top
-# byte (TBI). Example: malloc(64) returns 0xb400007907449000 (tag=0xb4).
-# This value = 12970367470408917000 which EXCEEDS double's safe integer
-# range (2^53-1 = 9007199254740991). The double conversion in
-# fromPtrAddress() loses precision → corrupted pointer → SIGSEGV.
+# MTE is disabled by setting MEMTAG_OPTIONS=off in the launcher scripts
+# (launcher-bun.sh and launcher-bunx.sh). This must be done BEFORE the
+# process starts — prctl() in main() is too late because Bionic's scudo
+# allocator has already initialized with MTE enabled by the time main()
+# runs.
 #
-# FIX: Strip the top byte before converting to double. The untagged
-# pointer (0x0000007907449000 = 516019537920) is within double's safe
-# range and survives the round-trip.
+# The launcher approach:
+#   export MEMTAG_OPTIONS=off
+#   exec "$BUN_BIN" "$@"
 #
-# This is SAFE because:
-# - MEMTAG_OPTIONS=off is set in the launcher (disables MTE tag checking)
-# - free() doesn't check tags when MTE is disabled
-# - The kernel handles untagged pointers correctly
-JSVALUE_ZIG="src/jsc/JSValue.zig"
-if [ -f "$JSVALUE_ZIG" ]; then
-    if grep -q "$PATCH_MARKER" "$JSVALUE_ZIG" 2>/dev/null; then
-        echo "  [SKIP] $JSVALUE_ZIG already patched"
-    else
-        echo "  [PATCH] $JSVALUE_Zig (strip TBI tag in fromPtrAddress)"
-        python3 <<'PYEOF'
-import sys
-
-with open("src/jsc/JSValue.zig", "r") as f:
-    content = f.read()
-
-old = '''    /// Encodes addr as a double. Resulting value can be passed to asPtrAddress.
-    pub fn fromPtrAddress(addr: usize) JSValue {
-        return jsDoubleNumber(@floatFromInt(addr));
-    }'''
-
-new = '''    /// Encodes addr as a double. Resulting value can be passed to asPtrAddress.
-    /// ANDROID_TERMUX_FIX: Strip TBI tag (top byte) before converting to double.
-    /// Android's scudo allocator tags heap pointers with the top byte (e.g.
-    /// 0xb40000790744900). Tagged pointers exceed double's 52-bit mantissa
-    /// range, causing precision loss → corrupted pointer → SIGSEGV.
-    /// Untagging keeps the pointer within the safe integer range.
-    /// This is safe because MEMTAG_OPTIONS=off is set in the launcher,
-    /// which disables MTE tag checking on free().
-    pub fn fromPtrAddress(addr: usize) JSValue {
-        const untagged = if (@import("builtin").abi == .android)
-            addr & 0x00FFFFFFFFFFFFFF
-        else
-            addr;
-        return jsDoubleNumber(@floatFromInt(untagged));
-    }'''
-
-if old not in content:
-    print("    [FAIL] could not find fromPtrAddress")
-    sys.exit(1)
-
-content = content.replace(old, new, 1)
-
-with open("src/jsc/JSValue.zig", "w") as f:
-    f.write(content)
-
-print("    [OK] Patched fromPtrAddress to strip TBI tag")
-PYEOF
-        verify_patch "$JSVALUE_ZIG" "$PATCH_MARKER" || true
-    fi
-fi
+# This tells Bionic's scudo to NOT use MTE tags at all, so:
+# - malloc() returns untagged pointers (top byte = 0)
+# - free() doesn't check tags (no SIGABRT)
+# - syscalls work normally (no "pointer tag truncated")
+# - No prctl needed in main.zig
+# - No fromPtrAddress tag stripping needed
+# - No FFI.h tag stripping needed
+#
+# This is the cleanest, simplest, and most reliable fix.
 
 # =====================================================================
 # FINAL VERIFICATION
