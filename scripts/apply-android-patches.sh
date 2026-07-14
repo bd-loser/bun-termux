@@ -862,8 +862,16 @@ new_main = '''pub fn main() void {
     // M_HEAP_TAGGING_LEVEL_NONE = 0. This must run before any heap
     // allocation (including crash_handler.init()).
     if (Environment.isAndroid) {
+        // Debug: use raw syscall to write to stderr (can't use stdlib yet)
+        const msg = "[bun-mte] calling android_mallopt...\\n";
+        const wret = std.os.linux.write(2, msg.ptr, msg.len);
+        _ = wret;
         var level: c_int = 0;
-        _ = android_mallopt(-204, @ptrCast(&level), @sizeOf(c_int));
+        const ret = android_mallopt(-204, @ptrCast(&level), @sizeOf(c_int));
+        // Debug: print return value
+        var buf: [64]u8 = undefined;
+        const msg2 = std.fmt.bufPrint(&buf, "[bun-mte] android_mallopt returned: {d}\\n", .{ret}) catch "[bun-mte] fmt error\\n";
+        _ = std.os.linux.write(2, msg2.ptr, msg2.len);
     }
     _bun.crash_handler.init();'''
 
