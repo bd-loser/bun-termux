@@ -576,17 +576,17 @@ content = content.replace(old, new, 1)
 # Using OVERLAY (not .patch) because git apply --no-index fails on
 # tab characters in context lines. Overlay = copy entire file.
 old_patches = 'patches: ["patches/tinycc/tcc.h.patch"],'
-new_patches = 'patches: ["patches/tinycc/tcc.h.patch", "patches/tinycc/tccrun.c"],'
+new_patches = 'patches: ["patches/tinycc/tcc.h.patch", "patches/tinycc/tccrun.c", "patches/tinycc/arm64-link.c"],'
 if old_patches in content:
     content = content.replace(old_patches, new_patches, 1)
-    print("    [5a] Added CONFIG_SELINUX=1 + tccrun.c overlay to tinycc.ts")
+    print("    [5a] Added CONFIG_SELINUX=1 + tccrun.c + arm64-link.c overlays to tinycc.ts")
 else:
-    print("    [5a] Added CONFIG_SELINUX=1 (tccrun.c overlay already in patches array?)")
+    print("    [5a] Added CONFIG_SELINUX=1 (overlays already in patches array?)")
 
 with open("scripts/build/deps/tinycc.ts", "w") as f:
     f.write(content)
 PYEOF
-        # CRITICAL: Copy the tccrun.c overlay file into the bun source tree
+        # CRITICAL: Copy the overlay files into the bun source tree
         # Using OVERLAY (complete file copy) instead of .patch because
         # git apply --no-index fails on tab characters in context lines.
         # Bun's build system treats non-.patch files as overlays (copied as-is).
@@ -599,6 +599,13 @@ PYEOF
           echo "    [FAIL] tccrun.c.overlay not found at $REPO_DIR/patches/tinycc/"
           echo "    Searching for it..."
           find "$REPO_DIR" -name "tccrun.c*" 2>/dev/null | head -5
+          exit 1
+        fi
+        if [ -f "$REPO_DIR/patches/tinycc/arm64-link.c.overlay" ]; then
+          cp "$REPO_DIR/patches/tinycc/arm64-link.c.overlay" "$BUN_SRC/patches/tinycc/arm64-link.c"
+          echo "    [5c] Copied arm64-link.c overlay (veneer stubs for long calls) to bun source tree"
+        else
+          echo "    [FAIL] arm64-link.c.overlay not found at $REPO_DIR/patches/tinycc/"
           exit 1
         fi
         verify_patch "$TINYCC_TS" "$PATCH_MARKER" || true
