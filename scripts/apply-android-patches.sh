@@ -846,9 +846,10 @@ old_externs = 'pub extern "c" var environ: ?*anyopaque;'
 new_externs = '''pub extern "c" var environ: ?*anyopaque;
 
 // ANDROID_TERMUX_FIX_HEAP_TAGGING: Disable scudo heap tagging at startup.
-// Must be called before ANY heap allocation.
-extern fn android_mallopt(opcode: c_int, arg: *anyopaque, arg_size: usize) c_int;
-// Debug logging via raw write syscall (no stdlib dependency)
+// android_mallopt is a weak symbol in LIBC_P (API 28+).
+// Use dlsym to resolve it at runtime to avoid linker errors.
+extern fn dlopen(filename: ?[*:0]const u8, flag: c_int) ?*anyopaque;
+extern fn dlsym(handle: ?*anyopaque, symbol: [*:0]const u8) ?*anyopaque;
 extern fn write(fd: c_int, buf: [*]const u8, count: usize) isize;'''
 
 if old_externs not in content:
@@ -863,17 +864,29 @@ new_main = '''pub fn main() void {
     // anything else. M_BIONIC_SET_HEAP_TAGGING_LEVEL = -204,
     // M_HEAP_TAGGING_LEVEL_NONE = 0. This must run before any heap
     // allocation (including crash_handler.init()).
+    //
+    // android_mallopt is a weak symbol — use dlsym to resolve it at
+    // runtime to avoid linker errors (ld.lld: undefined symbol).
     if (Environment.isAndroid) {
-        const dbg_msg = "[bun-mte] calling android_mallopt\\n";
+        const dbg_msg = "[bun-mte] resolving android_mallopt via dlsym\\n";
         _ = write(2, dbg_msg.ptr, dbg_msg.len);
-        var level: c_int = 0;
-        const ret = android_mallopt(-204, @ptrCast(&level), @sizeOf(c_int));
-        if (ret == 0) {
-            const ok_msg = "[bun-mte] android_mallopt OK\\n";
-            _ = write(2, ok_msg.ptr, ok_msg.len);
+
+        // RTLD_DEFAULT = (void*)0 — search all loaded libraries
+        const android_mallopt_ptr = dlsym(@ptrFromInt(0), "android_mallopt");
+        if (android_mallopt_ptr) |fn_ptr| {
+            const android_mallopt_fn = @as(*const fn (opcode: c_int, arg: *anyopaque, arg_size: usize) callconv(.c) bool, @ptrCast(@alignCast(fn_ptr)));
+            var level: c_int = 0;
+            const ok = android_mallopt_fn(-204, @ptrCast(&level), @sizeOf(c_int));
+            if (ok) {
+                const ok_msg = "[bun-mte] android_mallopt OK - heap tagging disabled\\n";
+                _ = write(2, ok_msg.ptr, ok_msg.len);
+            } else {
+                const fail_msg = "[bun-mte] android_mallopt returned false\\n";
+                _ = write(2, fail_msg.ptr, fail_msg.len);
+            }
         } else {
-            const fail_msg = "[bun-mte] android_mallopt FAILED\\n";
-            _ = write(2, fail_msg.ptr, fail_msg.len);
+            const not_found_msg = "[bun-mte] android_mallopt NOT FOUND in libc\\n";
+            _ = write(2, not_found_msg.ptr, not_found_msg.len);
         }
     }
     _bun.crash_handler.init();'''
@@ -893,152 +906,6 @@ PYEOF
 fi
 
 # =====================================================================
-# PATCH 12: src/runtime/ffi/FFI.h — DEBUG: log JSVALUE_TO_PTR input/output
-# =====================================================================
-# This patch adds debug logging to JSVALUE_TO_PTR to trace exactly what
-# pointer values are being passed through the FFI trampoline.
-#
-# When BUN_FFI_DEBUG_PTR is set, every JSVALUE_TO_PTR call logs:
-#   - The raw EncodedJSValue (asInt64)
-#   - Which path was taken (null/typed_array/int32/double)
-#   - The resulting pointer value
-#
-# This will reveal WHERE the corruption from 0xb400007df4a26800 to
-# 0x100000001 happens.
-#
-# This is a DEBUG-ONLY patch. Remove once the root cause is found.
-FFI_H="src/runtime/ffi/FFI.h"
-if [ -f "$FFI_H" ]; then
-    if grep -q "BUN_FFI_DEBUG_PTR_LOG" "$FFI_H" 2>/dev/null; then
-        echo "  [SKIP] $FFI_H already has debug logging"
-    else
-        echo "  [PATCH] $FFI_H (add JSVALUE_TO_PTR debug logging)"
-        python3 <<'PYEOF'
-import sys
-
-with open("src/runtime/ffi/FFI.h", "r") as f:
-    content = f.read()
-
-# Add debug logging function after the includes
-anchor = '#define MAX_INT32 2147483648'
-if anchor not in content:
-    print("    [FAIL] could not find MAX_INT32 anchor")
-    sys.exit(1)
-
-debug_code = '''// ANDROID_TERMUX_FIX: Debug logging for JSVALUE_TO_PTR
-// Set BUN_FFI_DEBUG_PTR=1 to enable
-// NOTE: No #include — TinyCC can't find system headers. Use extern.
-extern int write(int, const void*, unsigned long);
-extern char* getenv(const char*);
-extern int snprintf(char*, unsigned long, const char*, ...);
-
-static int ffi_debug_ptr_enabled = -1;
-static void ffi_debug_ptr_log(const char* path, int64_t input, uint64_t output) {
-    if (ffi_debug_ptr_enabled == -1) {
-        const char* env = getenv("BUN_FFI_DEBUG_PTR");
-        ffi_debug_ptr_enabled = (env && *env) ? 1 : 0;
-    }
-    if (!ffi_debug_ptr_enabled) return;
-    char buf[128];
-    int n = snprintf(buf, sizeof(buf),
-        "[ffi-ptr] %s: input=0x%016llx output=0x%016llx\\n",
-        path, (unsigned long long)input, (unsigned long long)output);
-    write(2, buf, n);
-}
-
-#define MAX_INT32 2147483648'''
-
-content = content.replace(anchor, debug_code, 1)
-
-# Now patch JSVALUE_TO_PTR to add logging
-old_func = '''static void* JSVALUE_TO_PTR(EncodedJSValue val) {
-  if (val.asInt64 == TagValueNull)
-    return 0;
-
-  if (JSCELL_IS_TYPED_ARRAY(val)) {
-    return JSVALUE_TO_TYPED_ARRAY_VECTOR(val);
-  }
-
-  if (JSVALUE_IS_INT32(val)) {
-    return (void*)(uintptr_t)JSVALUE_TO_INT32(val);
-  }
-
-  // Assume the JSValue is a double
-  val.asInt64 -= DoubleEncodeOffset;
-  return (void*)(uintptr_t)val.asDouble;
-}'''
-
-new_func = '''static void* JSVALUE_TO_PTR(EncodedJSValue val) {
-  if (val.asInt64 == TagValueNull) {
-    ffi_debug_ptr_log("null", val.asInt64, 0);
-    return 0;
-  }
-
-  if (JSCELL_IS_TYPED_ARRAY(val)) {
-    void* result = JSVALUE_TO_TYPED_ARRAY_VECTOR(val);
-    ffi_debug_ptr_log("typed_array", val.asInt64, (uint64_t)(uintptr_t)result);
-    return result;
-  }
-
-  if (JSVALUE_IS_INT32(val)) {
-    void* result = (void*)(uintptr_t)JSVALUE_TO_INT32(val);
-    ffi_debug_ptr_log("int32", val.asInt64, (uint64_t)(uintptr_t)result);
-    return result;
-  }
-
-  // Assume the JSValue is a double
-  val.asInt64 -= DoubleEncodeOffset;
-  void* result = (void*)(uintptr_t)val.asDouble;
-  ffi_debug_ptr_log("double", val.asInt64 + DoubleEncodeOffset, (uint64_t)(uintptr_t)result);
-  return result;
-}'''
-
-if old_func not in content:
-    print("    [FAIL] could not find JSVALUE_TO_PTR")
-    sys.exit(1)
-
-content = content.replace(old_func, new_func, 1)
-
-# Also patch PTR_TO_JSVALUE to log the return path
-old_ptr = '''static EncodedJSValue PTR_TO_JSVALUE(void* ptr) {
-  EncodedJSValue val;
-  if (ptr == 0) {
-    val.asInt64 = TagValueNull;
-    return val;
-  }
-
-  val.asDouble = (double)(uintptr_t)ptr;
-  val.asInt64 += DoubleEncodeOffset;
-  return val;
-}'''
-
-new_ptr = '''static EncodedJSValue PTR_TO_JSVALUE(void* ptr) {
-  EncodedJSValue val;
-  ffi_debug_ptr_log("PTR_TO_JSVALUE", (int64_t)(uintptr_t)ptr, (uint64_t)(uintptr_t)ptr);
-  if (ptr == 0) {
-    val.asInt64 = TagValueNull;
-    return val;
-  }
-
-  val.asDouble = (double)(uintptr_t)ptr;
-  val.asInt64 += DoubleEncodeOffset;
-  return val;
-}'''
-
-if old_ptr in content:
-    content = content.replace(old_ptr, new_ptr, 1)
-    print("    [OK] Added debug logging to PTR_TO_JSVALUE")
-
-with open("src/runtime/ffi/FFI.h", "w") as f:
-    f.write(content)
-
-print("    [OK] Added debug logging to JSVALUE_TO_PTR")
-PYEOF
-        verify_patch "$FFI_H" "BUN_FFI_DEBUG_PTR_LOG" || true
-    fi
-fi
-
-# =====================================================================
 # FINAL VERIFICATION
 # =====================================================================
 echo ""
@@ -1047,7 +914,7 @@ echo "PATCH VERIFICATION SUMMARY"
 echo "=========================================="
 
 TOTAL_FAIL=0
-for f in src/resolver/resolver.zig src/cli/run_command.zig src/exe_format/elf.zig src/standalone_graph/StandaloneModuleGraph.zig scripts/build/config.ts scripts/build/deps/tinycc.ts scripts/build/flags.ts scripts/build/tools.ts src/runtime/ffi/ffi.zig src/runtime/ffi/FFI.h src/main.zig; do
+for f in src/resolver/resolver.zig src/cli/run_command.zig src/exe_format/elf.zig src/standalone_graph/StandaloneModuleGraph.zig scripts/build/config.ts scripts/build/deps/tinycc.ts scripts/build/flags.ts scripts/build/tools.ts src/runtime/ffi/ffi.zig src/main.zig; do
     if [ -f "$f" ]; then
         if grep -q "$PATCH_MARKER" "$f" 2>/dev/null; then
             COUNT=$(grep -c "$PATCH_MARKER" "$f")
