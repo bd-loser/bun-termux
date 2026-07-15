@@ -846,10 +846,10 @@ old_externs = 'pub extern "c" var environ: ?*anyopaque;'
 new_externs = '''pub extern "c" var environ: ?*anyopaque;
 
 // ANDROID_TERMUX_FIX_HEAP_TAGGING: Disable scudo heap tagging at startup.
-// android_mallopt is a weak symbol in LIBC_P (API 28+).
-// Use dlsym to resolve it at runtime to avoid linker errors.
-extern fn dlopen(filename: ?[*:0]const u8, flag: c_int) ?*anyopaque;
-extern fn dlsym(handle: ?*anyopaque, symbol: [*:0]const u8) ?*anyopaque;
+// mallopt() is the standard C function (not android_mallopt).
+// M_BIONIC_SET_HEAP_TAGGING_LEVEL = -204 is handled by mallopt() in
+// libc/bionic/malloc_common.cpp, NOT by android_mallopt().
+extern fn mallopt(param: c_int, value: c_int) c_int;
 extern fn write(fd: c_int, buf: [*]const u8, count: usize) isize;'''
 
 if old_externs not in content:
@@ -857,7 +857,7 @@ if old_externs not in content:
     sys.exit(1)
 content = content.replace(old_externs, new_externs, 1)
 
-# 2. Insert android_mallopt call at the very first line of main()
+# 2. Insert mallopt call at the very first line of main()
 old_main = 'pub fn main() void {\n    _bun.crash_handler.init();'
 new_main = '''pub fn main() void {
     // ANDROID_TERMUX_FIX_HEAP_TAGGING: Disable scudo heap tagging BEFORE
@@ -865,28 +865,21 @@ new_main = '''pub fn main() void {
     // M_HEAP_TAGGING_LEVEL_NONE = 0. This must run before any heap
     // allocation (including crash_handler.init()).
     //
-    // android_mallopt is a weak symbol — use dlsym to resolve it at
-    // runtime to avoid linker errors (ld.lld: undefined symbol).
+    // NOTE: M_BIONIC_SET_HEAP_TAGGING_LEVEL is handled by mallopt()
+    // (in libc/bionic/malloc_common.cpp), NOT by android_mallopt().
+    // android_mallopt() does NOT handle this opcode — it returns false.
     if (Environment.isAndroid) {
-        const dbg_msg = "[bun-mte] resolving android_mallopt via dlsym\\n";
+        const dbg_msg = "[bun-mte] calling mallopt(M_BIONIC_SET_HEAP_TAGGING_LEVEL, NONE)\\n";
         _ = write(2, dbg_msg.ptr, dbg_msg.len);
 
-        // RTLD_DEFAULT = (void*)0 — search all loaded libraries
-        const android_mallopt_ptr = dlsym(@ptrFromInt(0), "android_mallopt");
-        if (android_mallopt_ptr) |fn_ptr| {
-            const android_mallopt_fn = @as(*const fn (opcode: c_int, arg: *anyopaque, arg_size: usize) callconv(.c) bool, @ptrCast(@alignCast(fn_ptr)));
-            var level: c_int = 0;
-            const ok = android_mallopt_fn(-204, @ptrCast(&level), @sizeOf(c_int));
-            if (ok) {
-                const ok_msg = "[bun-mte] android_mallopt OK - heap tagging disabled\\n";
-                _ = write(2, ok_msg.ptr, ok_msg.len);
-            } else {
-                const fail_msg = "[bun-mte] android_mallopt returned false\\n";
-                _ = write(2, fail_msg.ptr, fail_msg.len);
-            }
+        // M_BIONIC_SET_HEAP_TAGGING_LEVEL = -204, M_HEAP_TAGGING_LEVEL_NONE = 0
+        const ret = mallopt(-204, 0);
+        if (ret == 1) {
+            const ok_msg = "[bun-mte] mallopt OK - heap tagging disabled\\n";
+            _ = write(2, ok_msg.ptr, ok_msg.len);
         } else {
-            const not_found_msg = "[bun-mte] android_mallopt NOT FOUND in libc\\n";
-            _ = write(2, not_found_msg.ptr, not_found_msg.len);
+            const fail_msg = "[bun-mte] mallopt returned 0 (failed)\\n";
+            _ = write(2, fail_msg.ptr, fail_msg.len);
         }
     }
     _bun.crash_handler.init();'''
