@@ -19,11 +19,7 @@
 ## Quick Install
 
 ```bash
-# Download the latest .deb from GitHub Releases
-# https://github.com/bd-loser/bun-termux/releases
-
-dpkg -i bun_1.3.14_aarch64.deb
-bun --version
+curl -fsSL https://raw.githubusercontent.com/bd-loser/bun-termux/main/scripts/install.sh | bash
 ```
 
 ## What's Patched
