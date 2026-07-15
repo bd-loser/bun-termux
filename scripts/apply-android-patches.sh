@@ -841,13 +841,15 @@ import sys
 with open("src/main.zig", "r") as f:
     content = f.read()
 
-# 1. Add extern fn declaration after the existing extern declarations
+# 1. Add extern fn declarations after the existing extern declarations
 old_externs = 'pub extern "c" var environ: ?*anyopaque;'
 new_externs = '''pub extern "c" var environ: ?*anyopaque;
 
 // ANDROID_TERMUX_FIX_HEAP_TAGGING: Disable scudo heap tagging at startup.
 // Must be called before ANY heap allocation.
-extern fn android_mallopt(opcode: c_int, arg: *anyopaque, arg_size: usize) c_int;'''
+extern fn android_mallopt(opcode: c_int, arg: *anyopaque, arg_size: usize) c_int;
+// Debug logging via raw write syscall (no stdlib dependency)
+extern fn write(fd: c_int, buf: [*]const u8, count: usize) isize;'''
 
 if old_externs not in content:
     print("    [FAIL] could not find extern environ declaration")
@@ -862,16 +864,17 @@ new_main = '''pub fn main() void {
     // M_HEAP_TAGGING_LEVEL_NONE = 0. This must run before any heap
     // allocation (including crash_handler.init()).
     if (Environment.isAndroid) {
-        // Debug: use raw syscall to write to stderr (can't use stdlib yet)
-        const msg = "[bun-mte] calling android_mallopt...\\n";
-        const wret = std.os.linux.write(2, msg.ptr, msg.len);
-        _ = wret;
+        const dbg_msg = "[bun-mte] calling android_mallopt\\n";
+        _ = write(2, dbg_msg.ptr, dbg_msg.len);
         var level: c_int = 0;
         const ret = android_mallopt(-204, @ptrCast(&level), @sizeOf(c_int));
-        // Debug: print return value
-        var buf: [64]u8 = undefined;
-        const msg2 = std.fmt.bufPrint(&buf, "[bun-mte] android_mallopt returned: {d}\\n", .{ret}) catch "[bun-mte] fmt error\\n";
-        _ = std.os.linux.write(2, msg2.ptr, msg2.len);
+        if (ret == 0) {
+            const ok_msg = "[bun-mte] android_mallopt OK\\n";
+            _ = write(2, ok_msg.ptr, ok_msg.len);
+        } else {
+            const fail_msg = "[bun-mte] android_mallopt FAILED\\n";
+            _ = write(2, fail_msg.ptr, fail_msg.len);
+        }
     }
     _bun.crash_handler.init();'''
 
