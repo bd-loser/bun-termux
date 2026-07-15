@@ -849,8 +849,7 @@ new_externs = '''pub extern "c" var environ: ?*anyopaque;
 // mallopt() is the standard C function (not android_mallopt).
 // M_BIONIC_SET_HEAP_TAGGING_LEVEL = -204 is handled by mallopt() in
 // libc/bionic/malloc_common.cpp, NOT by android_mallopt().
-extern fn mallopt(param: c_int, value: c_int) c_int;
-extern fn write(fd: c_int, buf: [*]const u8, count: usize) isize;'''
+extern fn mallopt(param: c_int, value: c_int) c_int;'''
 
 if old_externs not in content:
     print("    [FAIL] could not find extern environ declaration")
@@ -869,18 +868,8 @@ new_main = '''pub fn main() void {
     // (in libc/bionic/malloc_common.cpp), NOT by android_mallopt().
     // android_mallopt() does NOT handle this opcode — it returns false.
     if (Environment.isAndroid) {
-        const dbg_msg = "[bun-mte] calling mallopt(M_BIONIC_SET_HEAP_TAGGING_LEVEL, NONE)\\n";
-        _ = write(2, dbg_msg.ptr, dbg_msg.len);
-
         // M_BIONIC_SET_HEAP_TAGGING_LEVEL = -204, M_HEAP_TAGGING_LEVEL_NONE = 0
-        const ret = mallopt(-204, 0);
-        if (ret == 1) {
-            const ok_msg = "[bun-mte] mallopt OK - heap tagging disabled\\n";
-            _ = write(2, ok_msg.ptr, ok_msg.len);
-        } else {
-            const fail_msg = "[bun-mte] mallopt returned 0 (failed)\\n";
-            _ = write(2, fail_msg.ptr, fail_msg.len);
-        }
+        _ = mallopt(-204, 0);
     }
     _bun.crash_handler.init();'''
 
@@ -892,7 +881,7 @@ content = content.replace(old_main, new_main, 1)
 with open("src/main.zig", "w") as f:
     f.write(content)
 
-print("    [OK] Added android_mallopt(SET_HEAP_TAGGING_LEVEL, NONE) to main()")
+print("    [OK] Added mallopt(SET_HEAP_TAGGING_LEVEL, NONE) to main()")
 PYEOF
         verify_patch "$MAIN_ZIG" "ANDROID_TERMUX_FIX_HEAP_TAGGING" || true
     fi
