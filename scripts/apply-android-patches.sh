@@ -888,6 +888,121 @@ PYEOF
 fi
 
 # =====================================================================
+# PATCH 12: src/jsc/bindings/c-bindings.cpp — replace close_range syscall
+# =====================================================================
+# ROOT CAUSE:
+#   Android 12 (and some Android 13 devices) run third-party apps under
+#   a zygote seccomp filter that does NOT include close_range (syscall
+#   436, added in Linux 5.9). The filter uses SECCOMP_RET_TRAP, so
+#   invoking the syscall raises SIGSYS BEFORE it can return -ENOSYS.
+#   Every "if (bun_close_range(...) != 0) fallback" check is useless
+#   because the process is already dead.
+#
+#   bun_initialize_process() calls bun_close_range(4, ~0U, CLOEXEC) at
+#   startup, so bun dies with "Bad system call" before main() runs on
+#   affected devices. Strace evidence:
+#     close_range(4, 4294967295, CLOSE_RANGE_CLOEXEC) = 4
+#     --- SIGSYS {si_code=SYS_SECCOMP, si_syscall=__NR_close_range} ---
+#     +++ killed by SIGSYS (core dumped) +++
+#
+# FIX: On Android, don't call the syscall at all. Iterate /proc/self/fd
+#   and set FD_CLOEXEC on each fd in [start, end]. This is the same
+#   thing close_range(CLOSE_RANGE_CLOEXEC) does, minus the seccomp trap.
+#   For non-CLOEXEC flags we close() the fds instead.
+#
+#   We interpose bun_close_range itself (not the syscall), so ALL three
+#   call sites benefit: bun_initialize_process, on_before_reload_process
+#   (--watch), and process.execve fallback.
+#
+CBINDINGS_CPP="src/jsc/bindings/c-bindings.cpp"
+if [ -f "$CBINDINGS_CPP" ]; then
+    if grep -q "ANDROID_TERMUX_FIX_CLOSE_RANGE" "$CBINDINGS_CPP" 2>/dev/null; then
+        echo "  [SKIP] $CBINDINGS_CPP already patched for close_range seccomp"
+    else
+        echo "  [PATCH] $CBINDINGS_CPP (avoid close_range syscall on Android)"
+        python3 <<'PYEOF'
+import sys
+
+path = "src/jsc/bindings/c-bindings.cpp"
+with open(path, "r") as f:
+    content = f.read()
+
+old = (
+    '// close_range is glibc > 2.33, which is very new\n'
+    'extern "C" ssize_t bun_close_range(unsigned int start, unsigned int end, unsigned int flags)\n'
+    '{\n'
+    '    return syscall(__NR_close_range, start, end, flags);\n'
+    '}\n'
+)
+
+new = (
+    '// close_range is glibc > 2.33, which is very new\n'
+    '#if defined(__ANDROID__)\n'
+    '// ANDROID_TERMUX_FIX_CLOSE_RANGE: On Android, the zygote seccomp filter\n'
+    '// used for third-party apps does NOT allow close_range (syscall 436).\n'
+    '// The filter uses SECCOMP_RET_TRAP, so calling the syscall raises SIGSYS\n'
+    '// BEFORE it can return -ENOSYS — the "if fails, fallback" checks at every\n'
+    '// call site are useless because the process is already dead ("Bad system\n'
+    '// call"). Reproduce with a fallback that walks /proc/self/fd. This is\n'
+    '// what close_range(CLOSE_RANGE_CLOEXEC) does, minus the trap. Return 0\n'
+    '// on success so the callers do NOT run their loop-based fallback again.\n'
+    '#include <dirent.h>\n'
+    '#include <cerrno>\n'
+    'extern "C" ssize_t bun_close_range(unsigned int start, unsigned int end, unsigned int flags)\n'
+    '{\n'
+    '    DIR* d = opendir("/proc/self/fd");\n'
+    '    if (!d) {\n'
+    '        // /proc unavailable — mimic ENOSYS so the caller\'s fallback\n'
+    '        // loop can run. Not fatal.\n'
+    '        errno = ENOSYS;\n'
+    '        return -1;\n'
+    '    }\n'
+    '    int dfd = dirfd(d);\n'
+    '    struct dirent* e;\n'
+    '    const bool cloexec_only = (flags & CLOSE_RANGE_CLOEXEC) != 0;\n'
+    '    while ((e = readdir(d)) != nullptr) {\n'
+    '        if (e->d_name[0] < \'0\' || e->d_name[0] > \'9\') continue;\n'
+    '        char* endp = nullptr;\n'
+    '        unsigned long v = strtoul(e->d_name, &endp, 10);\n'
+    '        if (endp == e->d_name || *endp != \'\\0\') continue;\n'
+    '        if (v > 0x7fffffffUL) continue;\n'
+    '        unsigned int fd = (unsigned int)v;\n'
+    '        if (fd < start || fd > end) continue;\n'
+    '        if ((int)fd == dfd) continue; // don\'t touch the iteration fd\n'
+    '        if (cloexec_only) {\n'
+    '            int fl = fcntl((int)fd, F_GETFD);\n'
+    '            if (fl != -1) fcntl((int)fd, F_SETFD, fl | FD_CLOEXEC);\n'
+    '        } else {\n'
+    '            close((int)fd);\n'
+    '        }\n'
+    '    }\n'
+    '    closedir(d);\n'
+    '    return 0;\n'
+    '}\n'
+    '#else\n'
+    'extern "C" ssize_t bun_close_range(unsigned int start, unsigned int end, unsigned int flags)\n'
+    '{\n'
+    '    return syscall(__NR_close_range, start, end, flags);\n'
+    '}\n'
+    '#endif\n'
+)
+
+if old not in content:
+    print("    [FAIL] could not find bun_close_range Linux definition")
+    sys.exit(1)
+
+content = content.replace(old, new, 1)
+
+with open(path, "w") as f:
+    f.write(content)
+
+print("    [OK] Replaced bun_close_range with /proc/self/fd walk on Android")
+PYEOF
+        verify_patch "$CBINDINGS_CPP" "ANDROID_TERMUX_FIX_CLOSE_RANGE" || true
+    fi
+fi
+
+# =====================================================================
 # FINAL VERIFICATION
 # =====================================================================
 echo ""
@@ -896,7 +1011,7 @@ echo "PATCH VERIFICATION SUMMARY"
 echo "=========================================="
 
 TOTAL_FAIL=0
-for f in src/resolver/resolver.zig src/cli/run_command.zig src/exe_format/elf.zig src/standalone_graph/StandaloneModuleGraph.zig scripts/build/config.ts scripts/build/deps/tinycc.ts scripts/build/flags.ts scripts/build/tools.ts src/runtime/ffi/ffi.zig src/main.zig; do
+for f in src/resolver/resolver.zig src/cli/run_command.zig src/exe_format/elf.zig src/standalone_graph/StandaloneModuleGraph.zig scripts/build/config.ts scripts/build/deps/tinycc.ts scripts/build/flags.ts scripts/build/tools.ts src/runtime/ffi/ffi.zig src/main.zig src/jsc/bindings/c-bindings.cpp; do
     if [ -f "$f" ]; then
         if grep -q "$PATCH_MARKER" "$f" 2>/dev/null; then
             COUNT=$(grep -c "$PATCH_MARKER" "$f")
