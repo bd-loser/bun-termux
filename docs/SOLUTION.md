@@ -59,9 +59,10 @@ The BL is repatched to jump to the veneer (within range), and the veneer jumps t
 **Root Cause:** Android's scudo allocator tags heap pointers with a non-zero top byte (e.g., `0xb4`). When `free()` receives a tagged pointer, it checks the tag and aborts if it doesn't match.
 
 Previous attempts failed:
-- `MEMTAG_OPTIONS=off` in launcher — doesn't work on all devices
-- `android_mallopt()` in LD_PRELOAD — wrong function (doesn't handle this opcode)
+- `MEMTAG_OPTIONS=off` in launcher — doesn't work on all devices (kernel/ELF notes force MTE on regardless)
+- `android_mallopt()` — wrong function (doesn't handle this opcode)
 - `prctl(PR_SET_TAGGED_ADDR_CTRL)` — doesn't disable scudo's tag generation
+- LD_PRELOAD `libbun-mte-fix.so` malloc/free wrapper — runs too late; scudo is already initialized by the time constructors fire
 
 **The correct function:** `mallopt()` (the standard C function), NOT `android_mallopt()`.
 

@@ -39,31 +39,12 @@ add_preload() {
   fi
 }
 
-# Load the MTE fix shim FIRST (before the android-fix shim) so that
-# malloc/free interception happens before any other LD_PRELOAD library
-# touches the heap. The MTE fix strips tags from malloc's return values
-# and re-applies them in free(), so Bun's FFI never sees tagged pointers.
-#
-# Build it with: bash src/mte-fix/build-mte-fix.sh full
-MTE_FIX="/data/data/com.termux/files/usr/lib/bun-termux/libbun-mte-fix.so"
-add_preload "$MTE_FIX"
-
-# Load the android-fix shim (SELinux syscall interception, path translation)
+# Load the android-fix shim (SELinux syscall interception, path translation).
+# Scudo heap tagging is disabled inside the patched binary itself via
+# mallopt(M_BIONIC_SET_HEAP_TAGGING_LEVEL, NONE) at the top of main() —
+# see PATCH 11 in scripts/apply-android-patches.sh. No LD_PRELOAD MTE
+# shim or MEMTAG_OPTIONS env var is required.
 add_preload "$SHIM"
-
-# Disable Android's MTE (Memory Tagging Extension) for the Bun process.
-# Android 11+ scudo allocator tags heap pointers with the top byte (TBI).
-# When Bun's FFI passes these tagged pointers to free(), scudo's MTE
-# tag check aborts with SIGABRT. Setting MEMTAG_OPTIONS=off before exec
-# tells Bionic's scudo to NOT use MTE tags at all — before the process
-# even starts.
-#
-# NOTE: On some Android versions / devices, MEMTAG_OPTIONS=off does NOT
-# actually disable MTE (the kernel or ELF notes force it on). In that
-# case, the libbun-mte-fix.so shim above handles the tag stripping /
-# re-application at the malloc/free boundary, which works regardless
-# of whether MEMTAG_OPTIONS is respected.
-export MEMTAG_OPTIONS=off
 
 # Exec the patched Bun binary. argv[0] is the binary path (ending in
 # "bun"), so Bun runs in normal mode — NOT bunx mode. For bunx mode,

@@ -55,16 +55,11 @@ add_preload() {
   fi
 }
 
-# Load the MTE fix shim FIRST (see launcher-bun.sh for details).
-MTE_FIX="/data/data/com.termux/files/usr/lib/bun-termux/libbun-mte-fix.so"
-add_preload "$MTE_FIX"
-
-# Load the android-fix shim
+# Load the android-fix shim. Scudo heap tagging is disabled inside the
+# patched binary itself via mallopt(M_BIONIC_SET_HEAP_TAGGING_LEVEL, NONE)
+# at the top of main() — see PATCH 11 in scripts/apply-android-patches.sh.
+# No LD_PRELOAD MTE shim or MEMTAG_OPTIONS env var is required.
 add_preload "$SHIM"
-
-# Disable Android's MTE (Memory Tagging Extension) for the Bun process.
-# See launcher-bun.sh for details. Must be set before exec.
-export MEMTAG_OPTIONS=off
 
 # CRITICAL: `exec -a "bunx"` sets argv[0] to "bunx" so Bun's isBunX()
 # detection (endsWithComptime(argv0, "bunx")) returns true. Without
