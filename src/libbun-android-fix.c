@@ -42,11 +42,13 @@
  *   targeting aarch64 Bionic.
  *
  * CREDITS:
- *   Several patterns (safe_dir_fd duplicate, /proc/stat faking, shebang
- *   translation, __OPEN_NEEDS_MODE) are adapted from Happ1ness-dev/bun-termux
- *   (MIT, by @Happ1ness-dev), which itself builds on kaan-escober/
- *   bun-termux-loader. Our shim is Bionic-native (no glibc-runner, no
- *   userland exec); Happ1ness's shim runs under glibc via userland exec.
+ *   Several patterns (safe_dir_fd EACCES-dup, /proc/stat memfd synthesis,
+ *   fopen /etc redirect, execve shebang translation, /tmp -> TMPDIR
+ *   mkdir/symlink translation, linkat EXDEV copyfile fallback,
+ *   __OPEN_NEEDS_MODE Bionic-clang workaround) are adapted from
+ *   Happ1ness-dev/bun-termux shim.c (MIT). Their upstream loads the shim
+ *   under glibc via userland-exec; this shim is Bionic-native (no
+ *   userland-exec, no glibc runner).
  *
  * License: MIT
  */
