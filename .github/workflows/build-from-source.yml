@@ -1,14 +1,6 @@
 name: Build Bun from Source (Patched for Android)
 
 on:
-  push:
-    branches: [main, master]
-    paths:
-      - 'scripts/**'
-      - 'src/**'
-      - 'packaging/**'
-      - 'Makefile'
-      - '.github/workflows/build-from-source.yml'
   workflow_dispatch:
     inputs:
       version:

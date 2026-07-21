@@ -11,12 +11,6 @@ on:
         description: Run native armv7 fallback job (requires self-hosted armv7 runner)
         required: false
         default: "false"
-  push:
-    branches: [main, master]
-    paths:
-      - '.github/workflows/armv7.yml'
-      - 'scripts/ci/**'
-      - 'docs/armv7-**'
 
 jobs:
   detect-native-runner:
