@@ -3,7 +3,7 @@
 > Run [Bun](https://bun.sh) natively on Android/Termux with full FFI, runtime C compilation via TinyCC, `dlopen` for native libraries, and working [opentui](https://github.com/anomalyco/opentui) TUI rendering. Bionic-native. No proot. No glibc-runner. No userland-exec.
 
 [![Build](https://github.com/bd-loser/bun-termux/actions/workflows/build-from-source.yml/badge.svg)](https://github.com/bd-loser/bun-termux/actions)
-[![Bun Version](https://img.shields.io/badge/Bun-1.3.14-blue.svg)](https://github.com/oven-sh/bun/releases/tag/bun-v1.3.14)
+[![Bun Version](https://img.shields.io/badge/Bun-1.4.0-blue.svg)](https://github.com/oven-sh/bun/releases/tag/bun-v1.4.0)
 [![Platform](https://img.shields.io/badge/Platform-Android%20aarch64-green.svg)](https://termux.dev)
 [![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Termux](https://img.shields.io/badge/Termux-Bionic--native-brightgreen.svg)](https://termux.dev)
@@ -14,21 +14,22 @@
 
 ## Why this fork
 
-Bun 1.3.14 is the first official Android (Bionic-linked PIE) build, but several Android/SELinux/Bionic quirks break real-world usage on Termux: the directory resolver hits `EACCES` on `openat(O_DIRECTORY)`, `bun install` fails on `linkat`/`symlinkat`, `os.cpus()` returns `[]` because `/proc/stat` is restricted, DNS breaks without `/etc/resolv.conf`, `bun --bun` fails writing to `/tmp`, `bun build --compile` outputs broken PIE binaries, TinyCC is disabled, and Scudo's heap pointer tagging crashes `free()` on FFI pointers from libraries like opentui.
+Bun 1.4 ships an official Android (Bionic-linked) build and fixed most of the 1.3-era pain itself — the resolver walk, `bun build --compile` PIE handling, DNS, `os.cpus()`, and `/tmp` all work out of the box. What still breaks on Termux (verified against stock 1.4.0 on-device):
 
-This fork fixes every one of those.
+- **`bun install` dies with SIGSYS** — Android's zygote seccomp profile *traps* `fchmodat2(452)` and `openat2(437)` instead of returning `ENOSYS`, so upstream's runtime fallbacks never run.
+- **`bunx <pkg>` fails with ENOENT** — npm shims carry `#!/usr/bin/env node` shebangs and Android has no `/usr/bin`.
+- **`bun:ffi cc()` reports "TinyCC is disabled"** — upstream gates TinyCC off on Android.
+
+This fork fixes exactly those, at source level.
 
 ## Features
 
+- **Source-level only** — every fix compiled into the binary via `#[cfg(target_os = "android")]`; no LD_PRELOAD, no termux-exec
 - **Full FFI support** — `dlopen`, `cc()`, `JSCallback` all work
-- **TinyCC enabled on Android** — compile C code at runtime
-- **opentui compatible** — render TUI apps with yoga layout
-- **Heap tagging fix** — no more `free(tagged_ptr) SIGABRT` crashes on FFI
-- **ARM64 long-call veneers** — TinyCC generates proper stubs for out-of-range BL
-- **SELinux-safe LD_PRELOAD shim** — Bionic-native, zero glibc/proot overhead
-- **`bun build --compile` fix** — correct PIE offsets for Bionic's linker64
-- **`bunx` fix** — resolver tolerates SELinux `EACCES` on ancestor walk
-- **DNS / os.cpus() / shebang / /tmp** — all working via targeted intercepts
+- **TinyCC enabled on Android** — SELinux-safe JIT memory (`memfd_create`) + ARM64 long-call veneers
+- **Seccomp-trap bypass** — `lchmod` and resolver walks avoid `fchmodat2`/`openat2`
+- **Shebang remap** — missing-interpreter scripts exec from `$PREFIX/bin`
+- **`bunx` fix** — launcher sets `argv[0]` correctly; scripts spawn cleanly
 
 ## Quick Install
 
@@ -41,41 +42,31 @@ That's it. Installs `bun` and `bunx` into `$PREFIX/bin` on Termux (aarch64).
 ## Verify
 
 ```bash
-bun --version              # 1.3.14
-bun -e "console.log(require('os').cpus().length)"  # real CPU count, not 0
-bunx cowsay hello          # resolver walk works on Android SELinux
+bun --version              # 1.4.0
+bun -e "console.log(require('os').cpus().length)"  # real CPU count
+bunx cowsay hello          # shebang remap + spawn work on Android
+bun install                # no fchmodat2/openat2 SIGSYS
+bun -e "const {cc}=require('bun:ffi');console.log(typeof cc)"  # function
 ```
 
 ## What's Patched
 
-Every fix here targets a concrete failure mode of stock Bun 1.3.14 on Android/Termux.
+Seven patches, applied by [`scripts/apply-android-patches.sh`](scripts/apply-android-patches.sh). Every Rust fix is a compile-time `#[cfg(target_os = "android")]` branch — Android's seccomp returns `SECCOMP_RET_TRAP` (SIGSYS) for blocked syscalls, not `ENOSYS`, so runtime fallbacks can never fire.
 
-### 1. Resolver — directory walking (`bunx` fix)
-Bun's directory resolver uses raw syscalls that fail with `EACCES` on Android SELinux (untrusted_app_27+ blocks `openat(O_DIRECTORY)` on `/` and `/data`). Patched to continue walking on `AccessDenied`.
+### Build system
+1. **`config.ts`** — enable TinyCC on Android (upstream disables it)
+2. **`deps/tinycc.ts`** — wire in our TinyCC source patches + `CONFIG_SELINUX=1`
+3. **`tools.ts`** — accept LLVM/clang 18 (NDK r27c / Ubuntu)
 
-### 2. ELF binary format — `bun build --compile`
-Fixes PIE/ASLR issues with Bionic's linker64. Uses the last writable `PT_LOAD` segment and writes offset (not vaddr) to `BUN_COMPILED`.
+### Syscall fixes
+4. **`src/sys/lib.rs`** — `lchmod` uses `fchmodat(AT_SYMLINK_NOFOLLOW)` instead of the seccomp-trapped `fchmodat2(452)`
+5. **`src/sys/linux_syscall.rs`** — resolver walks use plain `openat` instead of the trapped `openat2(437)`
 
-### 3. TinyCC — runtime C compilation on Android
-- **Enable TinyCC for Android** (disabled upstream)
-- **`CONFIG_SELINUX=1`** — use `mmap(PROT_EXEC)` via memfd instead of mprotect
-- **`tccrun.c` overlay** — `memfd_create` instead of `/tmp` (Android has no `/tmp`)
-- **`arm64-link.c` overlay** — generate veneer stubs for out-of-range BL calls
+### Spawn & FFI
+6. **`src/spawn_sys/posix_spawn.rs`** — when the exec target is a script whose shebang names a *missing* interpreter, remap `/usr/bin|/bin|…` to `$PREFIX/bin` and rebuild argv `[interp, script, …]` (replaces termux-exec)
+7. **`src/runtime/ffi/ffi_body.rs`** — TinyCC finds Bionic libc (`/system/lib64`) and Termux headers/libs (`$PREFIX/include`, `$PREFIX/lib`)
 
-### 4. FFI library paths
-Adds Android system library and include paths (`/system/lib64`, `$PREFIX/include`, NDK sysroot) to TinyCC so `cc()` can find `libc.so`.
-
-### 5. Heap tagging disable (opentui / FFI fix)
-Calls `mallopt(M_BIONIC_SET_HEAP_TAGGING_LEVEL, M_HEAP_TAGGING_LEVEL_NONE)` at the start of `main()` to disable Scudo's heap pointer tagging. Without this, `free(tagged_ptr)` from an FFI-allocated pointer crashes with `SIGABRT`.
-
-### 6. LD_PRELOAD shim (`libbun-android-fix.so`)
-Bionic-native (no glibc, no userland-exec). Intercepts SELinux-restricted syscalls:
-- `openat` with `O_DIRECTORY` on `/` and `/data` → dup a safe fd
-- `linkat`/`symlinkat`/`renameat` → fall back to `copy` on `EACCES`/`EXDEV`
-- `fopen` for `/etc/resolv.conf`/`nsswitch.conf`/`hosts` → `$PREFIX/etc/`
-- `mkdir`/`symlink` for `/tmp` → `$TMPDIR`
-- `execve` shebang translation (`/usr/bin/env node` → `$PREFIX/bin/env`)
-- `/proc/stat` synthesis for `os.cpus()`
+Plus two TinyCC source patches (against Bun's pinned commit): `tccrun.c` maps executable memory via `memfd_create` (SELinux blocks `mprotect(PROT_EXEC)` on heap), and `arm64-link.c` emits veneer stubs for out-of-range BL calls.
 
 ## Compatibility
 
@@ -84,12 +75,12 @@ Bionic-native (no glibc, no userland-exec). Intercepts SELinux-restricted syscal
 | Architecture | `aarch64` (arm64) |
 | Android | 10+ (API 29+, SELinux untrusted_app_27+) |
 | Termux | Termux app + Termux:API optional |
-| Bun version | 1.3.14 |
-| Node built-ins | `os`, `fs`, `net`, `dns`, `child_process` — verified working |
-| `bun install` | Works (linkat fallback) |
+| Bun version | 1.4.0 |
+| Node built-ins | `os`, `fs`, `net`, `dns`, `child_process` — work unpatched in 1.4 |
+| `bun install` | Works (fchmodat2/openat2 bypass) |
 | `bun run` | Works |
-| `bun build --compile` | Works (PIE fix) |
-| `bunx <pkg>` | Works (resolver fix) |
+| `bun build --compile` | Works (fixed upstream in 1.4) |
+| `bunx <pkg>` | Works (shebang remap) |
 | `bun:ffi` `dlopen` | Works |
 | `bun:ffi` `cc()` (TinyCC) | Works |
 | `bun:ffi` `JSCallback` | Works |
@@ -118,15 +109,18 @@ bun run app.jsx
 
 ## Build from Source
 
-Requires NDK r27c, Zig, Rust, CMake.
+Requires Rust (pinned via `rust-toolchain.toml`), NDK r27c, clang 18, CMake, Ninja, and Bun for bootstrapping.
 
 ```bash
+git clone https://github.com/oven-sh/bun.git /tmp/bun-src   # bun-v1.4.0
 git clone https://github.com/bd-loser/bun-termux.git
 cd bun-termux
-make build
+BUN_SRC=/tmp/bun-src bash scripts/apply-android-patches.sh
+cd /tmp/bun-src
+ANDROID_NDK_ROOT=/path/to/ndk bun scripts/build.ts --profile=android-release
 ```
 
-CI builds automatically on push to `main` (see `.github/workflows/`).
+CI builds on manual dispatch and a weekly cron (see `.github/workflows/build-from-source.yml`).
 
 See [docs/BUILD.md](docs/BUILD.md) for detailed build instructions.
 
@@ -138,8 +132,8 @@ See [docs/BUILD.md](docs/BUILD.md) for detailed build instructions.
 
 ## Credits
 
-- **Upstream fork ancestry:** [Hope2333/bun-termux](https://github.com/Hope2333/bun-termux) (MIT) — original pure-android packaging scaffolding (Makefile, deb/pacman targets, docs skeleton). This fork extends it with source-level patches, LD_PRELOAD shim, TinyCC overlays, launcher scripts, and full-FFI support.
-- **Shim patterns:** [Happ1ness-dev/bun-termux](https://github.com/Happ1ness-dev/bun-termux) (MIT) — `src/libbun-android-fix.c` adapts patterns from their `shim.c`: `safe_dir_fd` EACCES-dup, `/proc/stat` memfd synthesis, `fopen` `/etc` redirect, execve shebang translation, `/tmp` → `$TMPDIR`, `linkat` EXDEV fallback, `__OPEN_NEEDS_MODE`. Their fork uses userland-exec + glibc; this fork ports the patterns to Bionic-native.
+- **Upstream fork ancestry:** [Hope2333/bun-termux](https://github.com/Hope2333/bun-termux) (MIT) — original pure-android packaging scaffolding (Makefile, deb/pacman targets, docs skeleton). This fork extends it with source-level patches, launcher scripts, and full-FFI support.
+- **Historical shim:** the 1.3.x releases used an LD_PRELOAD shim (`libbun-android-fix.c`) adapting patterns from [Happ1ness-dev/bun-termux](https://github.com/Happ1ness-dev/bun-termux) (MIT). The shim was removed in the 1.4 port — all fixes are in-source now.
 - **TinyCC** — LGPL-2.1 upstream ([tinycc](https://repo.or.cz/tinycc.git)); overlay modifications for Android SELinux + ARM64 veneers are contributed under LGPL.
 - **Bun** — MIT © Oven, Inc. ([oven-sh/bun](https://github.com/oven-sh/bun))
 

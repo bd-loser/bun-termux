@@ -1,0 +1,61 @@
+diff --git a/arm64-link.c b/arm64-link.c
+index 39777de..6b80a9c 100644
+--- a/arm64-link.c
++++ b/arm64-link.c
+@@ -330,11 +330,51 @@ ST_FUNC void relocate(TCCState *s1, ElfW_Rel *rel, int type, unsigned char *ptr,
+                     return;
+                 }
+ #endif
+-                name = (char *)symtab_section->link->data +
+-                    ((ElfW(Sym) *)symtab_section->data)[sym_index].st_name;
+-                tcc_error_noabort("R_AARCH64_(JUMP|CALL)26 relocation failed"
+-                          " for '%s' (val=%lx, addr=%lx)",
+-                          name, (long)val, (long)addr);
++                /* ANDROID_TERMUX_FIX: out-of-range BL/B (+/-128MB).
++                 *
++                 * Hit whenever bun:ffi cc() calls a tcc_add_symbol'd
++                 * libc function (free, memcpy, ...) that Bionic's loader
++                 * placed further than 128MB from the JIT region. Upstream
++                 * reports via tcc_error_noabort — which does NOT abort —
++                 * then falls through and writes a TRUNCATED offset, so the
++                 * BL lands on unrelated code and corrupts state.
++                 *
++                 * Emit a veneer instead: a 12-byte stub in our own
++                 * section, therefore always in branch range, that does
++                 *   LDR x16, [pc, #8]     ; load the 64-bit literal
++                 *   BR  x16               ; indirect jump, unlimited range
++                 *   .quad target
++                 * and retarget the original BL/B at the stub. This is the
++                 * standard AArch64 long-branch veneer that ld/lld emit.
++                 */
++                Section *veneer_sec;
++                uint8_t *vp;
++                int is_call = (type == R_AARCH64_CALL26);
++                uint64_t veneer_addr;
++
++                veneer_sec = find_section(s1, ".android_veneer");
++                if (!veneer_sec->data)
++                    veneer_sec->sh_flags = SHF_ALLOC | SHF_EXECINSTR;
++
++                vp = section_ptr_add(veneer_sec, 12);
++                veneer_addr = veneer_sec->sh_addr + (vp - veneer_sec->data);
++                write32le(vp, 0x58000050);      /* LDR x16, [pc, #8] */
++                write32le(vp + 4, 0xd61f0200);  /* BR  x16 */
++                write64le(vp + 8, val);         /* .quad target */
++
++                if (((veneer_addr - addr) + ((uint64_t)1 << 27))
++                    & ~(uint64_t)0xffffffc) {
++                    name = (char *)symtab_section->link->data +
++                        ((ElfW(Sym) *)symtab_section->data)[sym_index].st_name;
++                    tcc_error_noabort("veneer for '%s' out of range"
++                              " (veneer=%lx, addr=%lx)",
++                              name, (long)veneer_addr, (long)addr);
++                } else {
++                    write32le(ptr, (0x14000000 |
++                                    (uint32_t)is_call << 31 |
++                                    ((veneer_addr - addr) >> 2 & 0x3ffffff)));
++                }
++                return;
+             }
+             write32le(ptr, (0x14000000 |
+                             (uint32_t)(type == R_AARCH64_CALL26) << 31 |

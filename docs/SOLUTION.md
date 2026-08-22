@@ -1,5 +1,12 @@
 # FFI Fix Solution — Root Cause Analysis
 
+> **Historical (Bun 1.3.x).** This analysis applies to the Zig-era 1.3.14
+> builds, where the heap-tagging `mallopt()` patch and LD_PRELOAD shim were
+> needed. Stock Bun 1.4 does not exhibit this crash on Termux, and the 1.4
+> port ships source-level patches only — see
+> [`scripts/apply-android-patches.sh`](../scripts/apply-android-patches.sh)
+> for the current patch set.
+
 ## Problem
 
 Bun's FFI crashed with `SIGABRT` when calling native functions that take pointer arguments (like `free()`, `yogaNodeFree()`, `yogaNodeCalculateLayout()`) on Android aarch64/Termux.

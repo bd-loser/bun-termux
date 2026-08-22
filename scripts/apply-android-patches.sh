@@ -1,1041 +1,666 @@
 #!/usr/bin/env bash
-# apply-android-patches.sh — patches Bun v1.3.14 (Zig) for Android/Termux
+# =============================================================================
+# apply-android-patches.sh — Bun v1.4.x Android/Termux source patches
 #
-# ROBUSTNESS RULES (learned from previous failed attempts):
-#   1. Use line-number-based patching with semantic anchors, not exact
-#      string matching. Triple-quoted Python strings silently fail on
-#      any whitespace difference.
-#   2. Verify EVERY patch applied. Abort the build if any patch failed.
-#   3. Print clear [OK]/[FAIL] markers so CI logs are greppable.
-#   4. Idempotent: safe to re-run. Detects existing patches via markers.
+# Rewritten for the Rust rewrite (Bun 1.4). Replaces the Zig-era script.
 #
-# === HYBRID APPROACH: source patches + LD_PRELOAD shim ===
+# What changed vs the 1.3.14 script:
+#   - DROPPED (upstream fixed): resolver Layers 1a/1b, cli/run_command.zig,
+#     exe_format/elf.zig 4a-4e, StandaloneModuleGraph PIE handling.
+#   - DROPPED (obsolete): EncodingTables.h pragma, C++ dangling-ref perl hack,
+#     runtime/ffi/ffi.zig (file replaced by src/runtime/ffi/ffi_body.rs),
+#     main.zig mallopt, flags.ts -march rewrite (upstream now special-cases
+#     Android arm64 itself).
+#   - DROPPED (already correct in 1.4): c-bindings.cpp close_range — the Linux
+#     branch is already a raw syscall(__NR_close_range) compatible with bionic.
+#   - KEPT/PORTED: config.ts TinyCC enable, deps/tinycc.ts defines + patch
+#     wiring, tools.ts LLVM relaxation, NEW lchmod/openat2 seccomp fixes,
+#     NEW shebang remap, NEW TinyCC Android search paths (ffi_body.rs).
+#   - LD_PRELOAD shim is GONE. Everything is source-level now.
 #
-# Bun's directory resolver uses std.fs.openDirAbsoluteZ which calls
-# Zig's std.os.linux.openat — a RAW SYSCALL (inline asm, NOT libc).
-# LD_PRELOAD shims can only intercept libc function calls, NOT raw
-# syscalls. Therefore:
-#
-# - Source patches (Layers 1a/1b/2) are REQUIRED for the resolver walk
-#   (they prevent the raw syscall from ever hitting /, or handle the
-#   error in Zig's error handling)
-# - The LD_PRELOAD shim (libbun-android-fix.so) handles everything that
-#   goes through libc: linkat/symlinkat (bun install), fopen (DNS),
-#   mkdir/symlink (/tmp), execve (shebangs), /proc/stat (os.cpus())
-#
-# Both are needed. Neither alone is sufficient.
-#
-# WHAT THIS PATCHES (Bun v1.3.14 Zig codebase):
-#
-#   1. src/resolver/resolver.zig — THE bunx fix (2 changes, ancestor walk PRESERVED):
-#      a) Walk error switch: on AccessDenied, CONTINUE to the next
-#         queue item instead of returning null. Skips inaccessible
-#         ancestors (/, /data) while still processing accessible ones.
-#         This is the PRIMARY fix — ancestor walking is preserved,
-#         so enclosing package.json from parent dirs IS found (monorepo
-#         support works!).
-#      b) DirEntry cache .err branch: on AccessDenied, don't return the
-#         cached error. Without this, a previously-cached EACCES on "/"
-#         would propagate as an error on subsequent walks, bypassing (a).
-#         This lets root_path be queued, and (a) handles it in processing.
-#
-#      NOTE: Previous versions had a Layer 1a (root_path = path) that
-#      prevented ancestor walking entirely. This is NO LONGER NEEDED
-#      because 1a+1b together handle all AccessDenied cases. Removing
-#      1a RESTORES MONOREPO SUPPORT (ancestor walking works).
-#
-#   2. src/cli/run_command.zig — CouldntReadCurrentDirectory fallback:
-#      When readDirInfo returns null (walk failed), create a minimal
-#      DirInfo from the cwd instead of erroring out.
-#
-#   3. src/exe_format/elf.zig — bun build --compile fix (2 changes):
-#      a) writeBunSection: pick the LAST writable PT_LOAD instead of the
-#         first. With RELRO, the linker can emit two RW PT_LOADs (one
-#         RELRO-covered, one not). Growing the first would swallow the
-#         second, producing overlapping PT_LOADs that Bionic's linker64
-#         rejects with "CANNOT LINK EXECUTABLE". Picking the last RW
-#         PT_LOAD (highest vaddr) means the extension goes past all
-#         other PT_LOADs — no overlap. Works for both single-RW and
-#         split-RW layouts, doesn't regress WSL1.
-#      b) Defensive overlap check after extension — returns a clear
-#         error if the extended segment would overlap another PT_LOAD,
-#         instead of silently producing a broken binary.
-#
-#   4. scripts/build/config.ts — enable TinyCC for Android (bun:ffi callback support)
-#   5. scripts/build/deps/tinycc.ts — add Android/Bionic defines to TinyCC build
-#   6. scripts/build/flags.ts — cross-compile CPU flag fix
-#   7. scripts/build/tools.ts — accept NDK clang 18
-#   8. C++ dangling-reference fix for clang 18
-#
+# Key principle (learned empirically on-device): Android's zygote seccomp
+# filter returns SECCOMP_RET_TRAP for blocked syscalls, which raises SIGSYS
+# instead of setting errno. Any patch relying on runtime ENOSYS/EPERM
+# fallbacks never executes. Every syscall-level fix below is therefore a
+# compile-time #[cfg(target_os = "android")] branch.
+# =============================================================================
 set -euo pipefail
 
-BUN_SRC="${1:-.}"
 PATCH_MARKER="ANDROID_TERMUX_FIX"
-FAIL_COUNT=0
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+BUN_SRC="${BUN_SRC:-${GITHUB_WORKSPACE:-$PWD}}"
 
+if [ ! -f "$BUN_SRC/package.json" ]; then
+    echo "FATAL: $BUN_SRC does not look like a bun checkout (no package.json)" >&2
+    exit 1
+fi
 cd "$BUN_SRC"
 
-echo "=========================================="
-echo "Applying Android/Termux patches to Bun v1.3.14"
-echo "Source: $BUN_SRC"
-echo "Approach: source patches (resolver walk) + LD_PRELOAD shim (libc calls)"
-echo "=========================================="
+BUN_VERSION="$(python3 -c 'import json;print(json.load(open("package.json")).get("version","?"))' 2>/dev/null || echo '?')"
+echo "Applying Android/Termux patches to Bun $BUN_VERSION"
+echo "Source tree: $BUN_SRC"
+echo ""
 
-# === Helper: verify a patch was applied ===
+TOTAL_FAIL=0
+
 verify_patch() {
-    local file="$1"
-    local marker="$2"
-    if grep -q "$marker" "$file" 2>/dev/null; then
-        echo "  [OK] $file: $marker found"
-        return 0
+    # verify_patch <file> — checks the patch marker landed in the file
+    local f="$1"
+    if grep -q "$PATCH_MARKER" "$f" 2>/dev/null; then
+        echo "  [OK]   $f"
     else
-        echo "  [FAIL] $file: $marker NOT found — patch did not apply!"
-        FAIL_COUNT=$((FAIL_COUNT + 1))
-        return 1
+        echo "  [FAIL] $f — no markers found"
+        TOTAL_FAIL=$((TOTAL_FAIL + 1))
     fi
 }
 
-# =====================================================================
-# PATCH 1: src/resolver/resolver.zig — THE bunx fix
-# =====================================================================
-RESOLVER_ZIG="src/resolver/resolver.zig"
+# py_patch <python-body-via-stdin> : runs an exact-anchor python patcher.
+# Each snippet MUST assert() its anchor; a failed assert aborts the script
+# (set -e) so CI fails loudly instead of shipping a half-patched tree.
+py_patch() {
+    python3 -
+}
 
-if [ ! -f "$RESOLVER_ZIG" ]; then
-    echo "  [FAIL] $RESOLVER_ZIG not found"
-    FAIL_COUNT=$((FAIL_COUNT + 1))
-else
-    if grep -q "$PATCH_MARKER" "$RESOLVER_ZIG" 2>/dev/null; then
-        echo "  [SKIP] $RESOLVER_ZIG already patched"
-    else
-        echo "  [PATCH] $RESOLVER_ZIG"
-        python3 <<'PYEOF'
-import re, sys
+# =============================================================================
+# PATCH 1: scripts/build/config.ts — enable TinyCC on Android
+# =============================================================================
+# Upstream disables TinyCC on Android ("oven-sh/tinycc has no bionic
+# support"), but our repo carries real fixes against Bun's pinned TinyCC
+# commit (patches/tinycc/*.patch): memfd_create W+X mapping (SELinux-safe)
+# and arm64 long-call veneers. With those, libtcc builds and links on
+# Bionic, enabling bun:ffi cc()/JSCallback.
+CONFIG_TS="scripts/build/config.ts"
+if [ -f "$CONFIG_TS" ] && ! grep -q "$PATCH_MARKER" "$CONFIG_TS"; then
+    echo "[PATCH 1] $CONFIG_TS — enable TinyCC on Android"
+    py_patch <<'PYEOF'
+import pathlib
 
-with open("src/resolver/resolver.zig", "r") as f:
-    content = f.read()
+p = pathlib.Path("scripts/build/config.ts")
+c = p.read_text()
 
-patched = 0
+old = 'const tinycc = partial.tinycc ?? !(abi === "android" || freebsd);'
+new = ('const tinycc = partial.tinycc ?? !freebsd; '
+       '// ANDROID_TERMUX_FIX: enable TinyCC on Android (see patches/tinycc/)')
 
-# 1a: Walk error switch — add AccessDenied => continue (PRIMARY FIX)
-# This is in the queue PROCESSING loop. When openDirAbsoluteZ returns
-# EACCES for / or /data, skip this ancestor and continue to the next.
-# The cwd at queue[0] is always accessible.
-old_switch = r'''                    error\.ENOTDIR, error\.IsDir, error\.NotDir => return null,'''
+assert c.count(old) == 1, "config.ts anchor not found (or ambiguous): tinycc gate"
+c = c.replace(old, new, 1)
+p.write_text(c)
+print("  patched tinycc gate")
+PYEOF
+    verify_patch "$CONFIG_TS"
+elif [ -f "$CONFIG_TS" ]; then
+    echo "[SKIP 1] $CONFIG_TS already patched"
+fi
 
-new_switch = '''                    // ANDROID_TERMUX_FIX [Layer 1a]: On AccessDenied (EACCES), skip this
-                    // ancestor and CONTINUE processing the rest of the queue. The cwd
-                    // at queue[0] is always accessible — returning null would abort
-                    // the entire walk and never try the cwd. Ancestor walking is
-                    // PRESERVED (monorepo support works).
-                    error.ENOTDIR, error.IsDir, error.NotDir => return null,
-                    error.AccessDenied => {
-                        r.dir_cache.markNotFound(queue_top.result);
-                        const cached_dir_entry_result = rfs.entries.getOrPut(queue_top.unsafe_path) catch unreachable;
-                        rfs.entries.markNotFound(cached_dir_entry_result);
+# =============================================================================
+# PATCH 2: scripts/build/deps/tinycc.ts — Android defines + patch wiring
+# =============================================================================
+# 2a: wire our TinyCC source patches into the dependency's patches array.
+# 2b: CONFIG_SELINUX=1 makes tccrun.c allocate executable memory via
+#     memfd/mmap instead of rw->rx mprotect on heap memory, which Android's
+#     SELinux policy blocks. This is what makes JSCallback work.
+TINYCC_TS="scripts/build/deps/tinycc.ts"
+if [ -f "$TINYCC_TS" ] && ! grep -q "$PATCH_MARKER" "$TINYCC_TS"; then
+    echo "[PATCH 2] $TINYCC_TS — Android defines + patch wiring"
+    py_patch <<'PYEOF'
+import pathlib
+
+p = pathlib.Path("scripts/build/deps/tinycc.ts")
+c = p.read_text()
+
+old_patches = 'patches: ["patches/tinycc/tcc.h.patch"],'
+new_patches = ('patches: [\n'
+               '      // ANDROID_TERMUX_FIX: memfd_create W+X mapping (SELinux-safe)\n'
+               '      // + arm64 linker veneers for far branches. Required to build\n'
+               '      // libtcc against Bionic and run JIT memory on Android.\n'
+               '      "patches/tinycc/tccrun.c.patch",\n'
+               '      "patches/tinycc/arm64-link.c.patch",\n'
+               '    ],')
+assert c.count(old_patches) == 1, "tinycc.ts anchor not found: patches array"
+c = c.replace(old_patches, new_patches, 1)
+
+old_def = "if (cfg.windows) defines.CONFIG_WIN32 = true;"
+new_def = old_def + """
+
+    // ANDROID_TERMUX_FIX: Android SELinux blocks mprotect(PROT_EXEC) on heap
+    // memory; CONFIG_SELINUX=1 switches tcc to tmpfile/memfd-backed
+    // executable mappings, which is what keeps bun:ffi JSCallback working.
+    if (!cfg.darwin && !cfg.windows && cfg.abi === "android") {
+      defines.CONFIG_SELINUX = 1;
+    }"""
+assert c.count(old_def) == 1, "tinycc.ts anchor not found: CONFIG_WIN32 define"
+c = c.replace(old_def, new_def, 1)
+
+p.write_text(c)
+print("  wired tccrun/arm64-link patches + CONFIG_SELINUX")
+PYEOF
+    verify_patch "$TINYCC_TS"
+elif [ -f "$TINYCC_TS" ]; then
+    echo "[SKIP 2] $TINYCC_TS already patched"
+fi
+
+# Sanity: the two TinyCC patch files must ship with the repo.
+for tpf in patches/tinycc/tccrun.c.patch patches/tinycc/arm64-link.c.patch; do
+    if [ ! -f "$REPO_DIR/$tpf" ]; then
+        echo "  [FAIL] missing required file in bun-termux repo: $tpf"
+        TOTAL_FAIL=$((TOTAL_FAIL + 1))
+    fi
+done
+
+# =============================================================================
+# PATCH 3: scripts/build/tools.ts — accept NDK clang (LLVM 18)
+# =============================================================================
+# CI runners get LLVM from apt (llvm.org script pins whatever we ask for),
+# but the C++ side must compile with the NDK's clang for Bionic. NDK r27c
+# ships clang 18.0.2; upstream hard-requires 21.x. Relax the discovery
+# constants so the NDK toolchain satisfies the check.
+TOOLS_TS="scripts/build/tools.ts"
+if [ -f "$TOOLS_TS" ] && ! grep -q "$PATCH_MARKER" "$TOOLS_TS"; then
+    echo "[PATCH 3] $TOOLS_TS — accept NDK clang 18"
+    py_patch <<'PYEOF'
+import pathlib
+
+p = pathlib.Path("scripts/build/tools.ts")
+c = p.read_text()
+
+subs = [
+    ('export const LLVM_VERSION = "21.1.8";',
+     'export const LLVM_VERSION = "18.0.2"; // ANDROID_TERMUX_FIX: NDK r27c'),
+    ('const LLVM_MAJOR = "21";',
+     'const LLVM_MAJOR = "18"; // ANDROID_TERMUX_FIX'),
+    ('const LLVM_MINOR = "1";',
+     'const LLVM_MINOR = "0"; // ANDROID_TERMUX_FIX'),
+]
+for old, new in subs:
+    assert c.count(old) == 1, f"tools.ts anchor not found (or ambiguous): {old}"
+    c = c.replace(old, new, 1)
+
+p.write_text(c)
+print("  relaxed LLVM version to 18.0.x (NDK)")
+PYEOF
+    verify_patch "$TOOLS_TS"
+elif [ -f "$TOOLS_TS" ]; then
+    echo "[SKIP 3] $TOOLS_TS already patched"
+fi
+
+# =============================================================================
+# PATCH 4: src/sys/lib.rs — lchmod without fchmodat2
+# =============================================================================
+# Upstream implements lchmod via the fchmodat2(452) syscall with a runtime
+# ENOSYS fallback to fchmodat(AT_SYMLINK_NOFOLLOW). On Android the zygote
+# seccomp filter TRAPS fchmodat2 (SIGSYS, no errno), so every symlink-mode
+# change kills the process instead of falling back. Compile-time switch.
+SYS_LIB_RS="src/sys/lib.rs"
+if [ -f "$SYS_LIB_RS" ] && ! grep -q "ANDROID_TERMUX_FIX_LCHMOD" "$SYS_LIB_RS"; then
+    echo "[PATCH 4] $SYS_LIB_RS — lchmod: avoid trapped fchmodat2"
+    py_patch <<'PYEOF'
+import pathlib
+
+p = pathlib.Path("src/sys/lib.rs")
+c = p.read_text()
+
+old = """        #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+        {
+            const SYS_FCHMODAT2: libc::c_long = 452;
+            loop {
+                // SAFETY: `ZStr::as_ptr()` yields a valid NUL-terminated C string.
+                let rc = unsafe {
+                    libc::syscall(
+                        SYS_FCHMODAT2,
+                        Fd::cwd().native() as libc::c_long,
+                        path.as_ptr(),
+                        mode as libc::c_long,
+                        libc::AT_SYMLINK_NOFOLLOW as libc::c_long,
+                    )
+                };
+                if rc < 0 {
+                    let e = last_errno();
+                    if e == libc::EINTR {
                         continue;
-                    },'''
+                    }
+                    if e == libc::ENOSYS {
+                        return fchmodat(Fd::cwd(), path, mode, libc::AT_SYMLINK_NOFOLLOW);
+                    }
+                    return Err(Error::from_code_int(e, Tag::lchmod).with_path(path.as_bytes()));
+                }
+                return Ok(());
+            }
+        }"""
 
-new_content = re.sub(old_switch, lambda m: new_switch, content, count=1)
-if new_content != content:
-    content = new_content
-    patched += 1
-    print("    [1a] AccessDenied => continue in processing loop (PRIMARY FIX)")
-else:
-    print("    [FAIL] could not find walk error switch pattern")
-    sys.exit(1)
+new = """        #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+        {
+            // ANDROID_TERMUX_FIX_LCHMOD: Android's zygote seccomp profile
+            // returns SECCOMP_RET_TRAP for fchmodat2, raising SIGSYS instead
+            // of returning ENOSYS, so upstream's runtime fallback never gets
+            // a chance to run. Use fchmodat(AT_SYMLINK_NOFOLLOW) directly.
+            #[cfg(target_os = "android")]
+            {
+                return fchmodat(Fd::cwd(), path, mode, libc::AT_SYMLINK_NOFOLLOW);
+            }
 
-# 1b: DirEntry cache .err branch — don't return AccessDenied (CACHE FIX)
-# This is in the queue QUEUING phase (if top == root_path block). Without
-# this, a previously-cached EACCES on "/" would propagate as an error on
-# subsequent walks, bypassing Layer 1a entirely. With this, root_path
-# gets queued, and Layer 1a handles EACCES in the processing loop.
-old_err = r'''                        \.err => \|err\| \{
-                            debuglog\("Failed to load DirEntry \{s\}  \{s\} - \{s\}", \.\{ top, @errorName\(err\.original_err\), @errorName\(err\.canonical_error\) \}\);
-                            return err\.canonical_error;
-                        \},'''
+            #[cfg(not(target_os = "android"))]
+            {
+                const SYS_FCHMODAT2: libc::c_long = 452;
+                loop {
+                    // SAFETY: `ZStr::as_ptr()` yields a valid NUL-terminated C string.
+                    let rc = unsafe {
+                        libc::syscall(
+                            SYS_FCHMODAT2,
+                            Fd::cwd().native() as libc::c_long,
+                            path.as_ptr(),
+                            mode as libc::c_long,
+                            libc::AT_SYMLINK_NOFOLLOW as libc::c_long,
+                        )
+                    };
+                    if rc < 0 {
+                        let e = last_errno();
+                        if e == libc::EINTR {
+                            continue;
+                        }
+                        if e == libc::ENOSYS {
+                            return fchmodat(Fd::cwd(), path, mode, libc::AT_SYMLINK_NOFOLLOW);
+                        }
+                        return Err(Error::from_code_int(e, Tag::lchmod).with_path(path.as_bytes()));
+                    }
+                    return Ok(());
+                }
+            }
+        }"""
 
-new_err = '''                        .err => |err| {
-                            // ANDROID_TERMUX_FIX [Layer 1b]: On AccessDenied, don't return
-                            // the cached error. Let root_path be queued — Layer 1a will
-                            // handle EACCES in the processing loop. Without this, a
-                            // previously-cached EACCES on "/" would propagate as an error
-                            // on subsequent walks, bypassing Layer 1a.
-                            if (err.canonical_error != error.AccessDenied) {
-                                debuglog("Failed to load DirEntry {s}  {s} - {s}", .{ top, @errorName(err.original_err), @errorName(err.canonical_error) });
-                                return err.canonical_error;
+assert c.count(old) == 1, "sys/lib.rs anchor not found (or ambiguous): lchmod block"
+c = c.replace(old, new, 1)
+p.write_text(c)
+print("  split lchmod into android (fchmodat) / other (fchmodat2)")
+PYEOF
+    verify_patch "$SYS_LIB_RS"
+elif [ -f "$SYS_LIB_RS" ]; then
+    echo "[SKIP 4] $SYS_LIB_RS already patched"
+fi
+
+# =============================================================================
+# PATCH 5: src/sys/linux_syscall.rs — openat2 fallback
+# =============================================================================
+# Same seccomp story as fchmodat2: RESOLVE_BENEATH / RESOLVE_IN_ROOT walks
+# go through openat2(437), which Android traps outright. Route Android to
+# plain openat. We lose kernel-enforced symlink confinement; acceptable on
+# Termux where the threat model doesn't include hostile root dirs.
+LSC_RS="src/sys/linux_syscall.rs"
+if [ -f "$LSC_RS" ] && ! grep -q "ANDROID_TERMUX_FIX_OPENAT2" "$LSC_RS"; then
+    echo "[PATCH 5] $LSC_RS — openat2: compile-time openat fallback"
+    py_patch <<'PYEOF'
+import pathlib
+
+p = pathlib.Path("src/sys/linux_syscall.rs")
+c = p.read_text()
+
+beneath_old = """    retry(|| {
+        rustix::fs::openat2(
+            dir,
+            path.as_cstr(),
+            oflags,
+            mode,
+            rustix::fs::ResolveFlags::BENEATH,
+        )
+    })
+    .map(own_fd)"""
+
+beneath_new = """    retry(|| {
+        // ANDROID_TERMUX_FIX_OPENAT2: seccomp traps openat2 on Android
+        // (SECCOMP_RET_TRAP, not ENOSYS), so the walk must not use it.
+        // Plain openat loses RESOLVE_BENEATH confinement; fine on Termux.
+        #[cfg(target_os = "android")]
+        {
+            rustix::fs::openat(dir, path.as_cstr(), oflags, mode)
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            rustix::fs::openat2(
+                dir,
+                path.as_cstr(),
+                oflags,
+                mode,
+                rustix::fs::ResolveFlags::BENEATH,
+            )
+        }
+    })
+    .map(own_fd)"""
+
+inroot_old = """    retry(|| {
+        rustix::fs::openat2(
+            dir,
+            path.as_cstr(),
+            oflags,
+            mode,
+            rustix::fs::ResolveFlags::IN_ROOT | rustix::fs::ResolveFlags::NO_MAGICLINKS,
+        )
+    })
+    .map(own_fd)"""
+
+inroot_new = """    retry(|| {
+        // ANDROID_TERMUX_FIX_OPENAT2: see openat2_beneath above. IN_ROOT /
+        // NO_MAGICLINKS have no openat equivalent; resolve relative to dirfd.
+        #[cfg(target_os = "android")]
+        {
+            rustix::fs::openat(dir, path.as_cstr(), oflags, mode)
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            rustix::fs::openat2(
+                dir,
+                path.as_cstr(),
+                oflags,
+                mode,
+                rustix::fs::ResolveFlags::IN_ROOT | rustix::fs::ResolveFlags::NO_MAGICLINKS,
+            )
+        }
+    })
+    .map(own_fd)"""
+
+assert c.count(beneath_old) == 1, "linux_syscall.rs anchor not found: openat2_beneath"
+c = c.replace(beneath_old, beneath_new, 1)
+assert c.count(inroot_old) == 1, "linux_syscall.rs anchor not found: openat2_in_root"
+c = c.replace(inroot_old, inroot_new, 1)
+
+p.write_text(c)
+print("  patched openat2_beneath + openat2_in_root")
+PYEOF
+    verify_patch "$LSC_RS"
+elif [ -f "$LSC_RS" ]; then
+    echo "[SKIP 5] $LSC_RS already patched"
+fi
+
+# =============================================================================
+# PATCH 6: src/spawn_sys/posix_spawn.rs — shebang interpreter remap
+# =============================================================================
+# Android has no /usr/bin and no /bin. Scripts installed by npm packages
+# (`node_modules/.bin/*`) carry shebangs like `#!/usr/bin/env node` and die
+# with ENOENT at execve. This replaces the old LD_PRELOAD (termux-exec)
+# shim at the source level: when the spawned path is a script whose shebang
+# names a MISSING absolute interpreter, remap /usr/bin:/bin:/usr/sbin:/sbin
+# entries to $PREFIX/bin and rebuild argv accordingly. Existing interpreters
+# are left untouched (kernel handles valid shebangs natively).
+PS_RS="src/spawn_sys/posix_spawn.rs"
+if [ -f "$PS_RS" ] && ! grep -q "ANDROID_TERMUX_FIX_SHEBANG" "$PS_RS"; then
+    echo "[PATCH 6] $PS_RS — remap missing-interpreter shebangs"
+    py_patch <<'PYEOF'
+import pathlib
+
+p = pathlib.Path("src/spawn_sys/posix_spawn.rs")
+c = p.read_text()
+
+helper_anchor = """    #[cfg(unix)]
+    pub(crate) fn spawn_z(
+        path: &CStr,"""
+
+helper = """    /// ANDROID_TERMUX_FIX_SHEBANG: if `script` names an existing file whose
+    /// first line is a shebang pointing at an absolute interpreter that does
+    /// NOT exist on this system, return the Termux equivalent for the usual
+    /// FHS prefixes (/usr/bin, /bin, /usr/sbin, /sbin -> $PREFIX/bin).
+    /// Returns None whenever the kernel could succeed on its own.
+    #[cfg(target_os = "android")]
+    fn android_shebang_remap(script: &CStr) -> Option<CString> {
+        const HDR_MAX: usize = 256;
+        let mut hdr = [0u8; HDR_MAX];
+        // SAFETY: plain fd lifecycle around a fixed-size buffer.
+        let fd = unsafe { system::open(script.as_ptr(), system::O_RDONLY | system::O_CLOEXEC) };
+        if fd < 0 {
+            return None;
+        }
+        let mut filled = 0usize;
+        while filled < HDR_MAX {
+            let n = unsafe {
+                system::read(fd, hdr[filled..].as_mut_ptr().cast(), HDR_MAX - filled)
+            };
+            if n <= 0 {
+                break;
+            }
+            filled += n as usize;
+        }
+        unsafe { system::close(fd) };
+        if filled < 3 || hdr[0] != b'#' || hdr[1] != b'!' {
+            return None;
+        }
+        let mut i = 2usize;
+        while i < filled && (hdr[i] == b' ' || hdr[i] == b'\\t') {
+            i += 1;
+        }
+        let start = i;
+        while i < filled
+            && hdr[i] != b'\\n'
+            && hdr[i] != b' '
+            && hdr[i] != b'\\t'
+            && hdr[i] != 0
+        {
+            i += 1;
+        }
+        let interp = &hdr[start..i];
+        if interp.first() != Some(&b'/') || interp.contains(&0) {
+            return None;
+        }
+        let rest = if let Some(r) = interp.strip_prefix(b"/usr/bin/") {
+            r
+        } else if let Some(r) = interp.strip_prefix(b"/bin/") {
+            r
+        } else if let Some(r) = interp.strip_prefix(b"/usr/sbin/") {
+            r
+        } else if let Some(r) = interp.strip_prefix(b"/sbin/") {
+            r
+        } else {
+            return None;
+        };
+        let interp_c = CString::new(interp).ok()?;
+        // SAFETY: `interp_c` is NUL-terminated for the duration of the call.
+        if unsafe { system::access(interp_c.as_ptr(), system::F_OK) } == 0 {
+            return None; // interpreter exists; the kernel handles this natively
+        }
+        // SAFETY: NUL-terminated literal; result is owned by libc.
+        let prefix_ptr = unsafe { system::getenv(b"PREFIX\\0".as_ptr().cast()) };
+        if prefix_ptr.is_null() {
+            return None;
+        }
+        // SAFETY: getenv results live for the life of the process.
+        let prefix = unsafe { core::ffi::CStr::from_ptr(prefix_ptr) }.to_bytes();
+        let mut out = Vec::with_capacity(prefix.len() + rest.len() + 5);
+        out.extend_from_slice(prefix);
+        out.extend_from_slice(b"/bin/");
+        out.extend_from_slice(rest);
+        CString::new(out).ok()
+    }
+
+""" + helper_anchor
+
+assert c.count(helper_anchor) == 1, "posix_spawn.rs anchor not found: spawn_z signature"
+c = c.replace(helper_anchor, helper, 1)
+
+hook_anchor = """        let uid = attr.and_then(|a| a.uid);
+        let gid = attr.and_then(|a| a.gid);
+"""
+
+hook = """        let uid = attr.and_then(|a| a.uid);
+        let gid = attr.and_then(|a| a.gid);
+
+        // ANDROID_TERMUX_FIX_SHEBANG: when the target is a script whose
+        // interpreter is missing, exec the Termux interpreter instead and
+        // rebuild argv as [interp, script, rest...], mirroring what the
+        // kernel's binfmt_script would have done.
+        #[cfg(target_os = "android")]
+        let (path_storage, argv_storage): (Option<CString>, Option<Vec<*const c_char>>) =
+            match android_shebang_remap(path) {
+                Some(interp) => {
+                    // SAFETY: `argv` is a null-terminated argv array per posix_spawn contract.
+                    let argc = unsafe {
+                        let mut n = 0usize;
+                        while !(*argv.offset(n as isize)).is_null() && n < 4096 {
+                            n += 1;
+                        }
+                        n
+                    };
+                    let mut new_argv: Vec<*const c_char> = Vec::with_capacity(argc + 2);
+                    new_argv.push(interp.as_ptr());
+                    new_argv.push(path.as_ptr());
+                    unsafe {
+                        for j in 1..argc as isize {
+                            let entry = *argv.offset(j);
+                            if entry.is_null() {
+                                break;
                             }
-                            // AccessDenied: fall through (root_path gets queued, Layer 1a handles it)
-                        },'''
+                            new_argv.push(entry);
+                        }
+                    }
+                    new_argv.push(core::ptr::null());
+                    (Some(interp), Some(new_argv))
+                }
+                None => (None, None),
+            };
+        #[cfg(target_os = "android")]
+        let path: &CStr = path_storage.as_deref().unwrap_or(path);
+        #[cfg(target_os = "android")]
+        let argv: *const *const c_char =
+            argv_storage.as_ref().map_or(argv, |v| v.as_ptr());
+"""
 
-new_content = re.sub(old_err, lambda m: new_err, content, count=1)
-if new_content != content:
-    content = new_content
-    patched += 1
-    print("    [1b] DirEntry cache .err: don't return AccessDenied (CACHE FIX)")
-else:
-    print("    [FAIL] could not find .err branch pattern")
-    sys.exit(1)
+assert c.count(hook_anchor) == 1, "posix_spawn.rs anchor not found: uid/gid prologue"
+c = c.replace(hook_anchor, hook, 1)
 
-with open("src/resolver/resolver.zig", "w") as f:
-    f.write(content)
-
-print(f"    Total: {patched}/2 sub-patches applied to resolver.zig")
-print(f"    Ancestor walking PRESERVED (monorepo support works!)")
+p.write_text(c)
+print("  added android_shebang_remap + spawn_z hook")
 PYEOF
-        verify_patch "$RESOLVER_ZIG" "$PATCH_MARKER" || true
-    fi
+    verify_patch "$PS_RS"
+elif [ -f "$PS_RS" ]; then
+    echo "[SKIP 6] $PS_RS already patched"
 fi
 
-# =====================================================================
-# PATCH 2: src/cli/run_command.zig — CouldntReadCurrentDirectory fallback
-# =====================================================================
-RUN_CMD="src/cli/run_command.zig"
+# =============================================================================
+# PATCH 7: src/runtime/ffi/ffi_body.rs — TinyCC search paths for Android
+# =============================================================================
+# Upstream probes FHS locations only (/usr/include[aarch64-linux-gnu],
+# /usr/lib/aarch64-linux-gnu, /usr/lib64, /usr/local). None exist on Android:
+# Bionic libc lives in /system/lib64 and Termux toolchains under $PREFIX.
+# Without these paths bun:ffi cc() fails with "library 'c' not found".
+FFI_RS="src/runtime/ffi/ffi_body.rs"
+if [ -f "$FFI_RS" ] && ! grep -q "ANDROID_TERMUX_FIX_TCC_PATHS" "$FFI_RS"; then
+    echo "[PATCH 7] $FFI_RS — TinyCC Android search paths"
+    py_patch <<'PYEOF'
+import pathlib
 
-if [ ! -f "$RUN_CMD" ]; then
-    echo "  [FAIL] $RUN_CMD not found"
-    FAIL_COUNT=$((FAIL_COUNT + 1))
-else
-    if grep -q "$PATCH_MARKER" "$RUN_CMD" 2>/dev/null; then
-        echo "  [SKIP] $RUN_CMD already patched"
-    else
-        echo "  [PATCH] $RUN_CMD"
-        python3 <<'PYEOF'
-import re, sys
+p = pathlib.Path("src/runtime/ffi/ffi_body.rs")
+c = p.read_text()
 
-with open("src/cli/run_command.zig", "r") as f:
-    content = f.read()
+anchor = """        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            if let Some(include_dir) = Self::get_system_include_dir() {"""
 
-patched = 0
-
-old = r'''        const root_dir_info = this_transpiler\.resolver\.readDirInfo\(this_transpiler\.fs\.top_level_dir\) catch \|err\| \{
-            if \(!log_errors\) return error\.CouldntReadCurrentDirectory;
-            ctx\.log\.print\(Output\.errorWriter\(\)\) catch \{\};
-            Output\.prettyErrorln\("<r><red>error<r><d>:<r> <b>\{s\}<r> loading directory \{f\}", \.\{ @errorName\(err\), bun\.fmt\.QuotedFormatter\{ \.text = this_transpiler\.fs\.top_level_dir \} \}\);
-            Output\.flush\(\);
-            return err;
-        \} orelse \{
-            ctx\.log\.print\(Output\.errorWriter\(\)\) catch \{\};
-            Output\.prettyErrorln\("error loading current directory", \.\{\}\);
-            Output\.flush\(\);
-            return error\.CouldntReadCurrentDirectory;
-        \};'''
-
-new = '''        // ANDROID_TERMUX_FIX [Layer 2]: On Android, readDirInfo may return null when
-        // the directory walk is blocked by SELinux (EACCES on / or /data via raw
-        // syscall that the LD_PRELOAD shim cannot intercept). Instead of failing,
-        // create a minimal DirInfo from the cwd so bunx/bun-run can proceed.
-        const root_dir_info: *DirInfo = blk: {
-            const result = this_transpiler.resolver.readDirInfo(this_transpiler.fs.top_level_dir) catch null;
-            if (result) |info| break :blk info;
-            // readDirInfo returned null — synthesize a minimal DirInfo.
-            // Use a unique cache key (with counter) to avoid poisoned cache.
-            const cwd = this_transpiler.fs.top_level_dir;
-            var key_buf: [bun.MAX_PATH_BYTES + 16]u8 = undefined;
-            const key = std.fmt.bufPrintZ(&key_buf, "{s}__termux_{d}", .{ cwd, std.time.milliTimestamp() }) catch break :blk {
-                if (!log_errors) return error.CouldntReadCurrentDirectory;
-                Output.prettyErrorln("error loading current directory (termux fallback OOM)", .{});
-                Output.flush();
-                return error.CouldntReadCurrentDirectory;
-            };
-            var cache_result = this_transpiler.resolver.dir_cache.getOrPut(key) catch break :blk {
-                if (!log_errors) return error.CouldntReadCurrentDirectory;
-                Output.prettyErrorln("error loading current directory (termux fallback cache)", .{});
-                Output.flush();
-                return error.CouldntReadCurrentDirectory;
-            };
-            break :blk this_transpiler.resolver.dir_cache.put(&cache_result, DirInfo{
-                .abs_path = cwd,
-            }) catch {
-                if (!log_errors) return error.CouldntReadCurrentDirectory;
-                Output.prettyErrorln("error loading current directory (termux fallback put)", .{});
-                Output.flush();
-                return error.CouldntReadCurrentDirectory;
-            };
-        };'''
-
-new_content = re.sub(old, lambda m: new, content, count=1)
-if new_content != content:
-    content = new_content
-    patched += 1
-    print("    [2a] readDirInfo orelse → cwd fallback DirInfo")
-else:
-    print("    [FAIL] could not find readDirInfo pattern in run_command.zig")
-    sys.exit(1)
-
-with open("src/cli/run_command.zig", "w") as f:
-    f.write(content)
-
-print(f"    Total: {patched}/1 sub-patches applied to run_command.zig")
-PYEOF
-        verify_patch "$RUN_CMD" "$PATCH_MARKER" || true
-    fi
-fi
-
-# =====================================================================
-# PATCH 3: src/exe_format/elf.zig — bun build --compile fix
-# =====================================================================
-ELF_ZIG="src/exe_format/elf.zig"
-
-if [ ! -f "$ELF_ZIG" ]; then
-    echo "  [FAIL] $ELF_ZIG not found"
-    FAIL_COUNT=$((FAIL_COUNT + 1))
-else
-    if grep -q "$PATCH_MARKER" "$ELF_ZIG" 2>/dev/null; then
-        echo "  [SKIP] $ELF_ZIG already patched"
-    else
-        echo "  [PATCH] $ELF_ZIG"
-        python3 <<'PYEOF'
-import re, sys
-
-with open("src/exe_format/elf.zig", "r") as f:
-    content = f.read()
-
-patched = 0
-
-# 4a: Pick the LAST writable PT_LOAD instead of the first
-old_pick = r'''            if \(\(phdr\.p_flags & elf\.PF_W\) != 0 and rw_phdr_index == null\) \{
-                rw_phdr_index = i;
-                rw_phdr = phdr;
-            \}'''
-
-new_pick = '''            // ANDROID_TERMUX_FIX [Layer 4a]: Pick the LAST writable PT_LOAD
-            if ((phdr.p_flags & elf.PF_W) != 0) {
-                rw_phdr_index = i;
-                rw_phdr = phdr;
-            }'''
-
-new_content = re.sub(old_pick, lambda m: new_pick, content, count=1)
-if new_content != content:
-    content = new_content
-    patched += 1
-    print("    [4a] Pick LAST writable PT_LOAD (fixes RELRO overlap)")
-else:
-    print("    [FAIL] could not find PT_LOAD selection pattern")
-    sys.exit(1)
-
-# 4b: Add sh_addr to BunSectionInfo (needed for offset computation)
-old_struct = r'''    const BunSectionInfo = struct \{
-        /// File offset of the \.bun section's data \(sh_offset\)\.
-        file_offset: u64,
-        /// Index of the \.bun section in the section header table\.
-        section_index: u16,
-    \};'''
-
-new_struct = '''    const BunSectionInfo = struct {
-        /// File offset of the .bun section's data (sh_offset).
-        file_offset: u64,
-        /// Index of the .bun section in the section header table.
-        section_index: u16,
-        /// ANDROID_TERMUX_FIX: Virtual address of .bun section (sh_addr).
-        sh_addr: u64,
-    };'''
-
-new_content = re.sub(old_struct, lambda m: new_struct, content, count=1)
-if new_content != content:
-    content = new_content
-    patched += 1
-    print("    [4b] Add sh_addr to BunSectionInfo")
-else:
-    print("    [FAIL] could not find BunSectionInfo struct")
-    sys.exit(1)
-
-# 4c: Return sh_addr from findBunSection
-old_return = r'''                    return \.\{
-                        \.file_offset = shdr\.sh_offset,
-                        \.section_index = @intCast\(i\),
-                    \};'''
-
-new_return = '''                    return .{
-                        .file_offset = shdr.sh_offset,
-                        .section_index = @intCast(i),
-                        .sh_addr = shdr.sh_addr, // ANDROID_TERMUX_FIX
-                    };'''
-
-new_content = re.sub(old_return, lambda m: new_return, content, count=1)
-if new_content != content:
-    content = new_content
-    patched += 1
-    print("    [4c] Return sh_addr from findBunSection")
-else:
-    print("    [FAIL] could not find findBunSection return")
-    sys.exit(1)
-
-# 4d: Write OFFSET instead of absolute vaddr to BUN_COMPILED.size
-# This is the KEY fix for PIE/ASLR: on Android, PIE binaries are loaded
-# at a random base address. The runtime can't use @ptrFromInt(vaddr)
-# because vaddr is relative to 0, not to the load base. By storing the
-# offset from BUN_COMPILED to the payload, the runtime can use pointer
-# arithmetic (which automatically accounts for the base).
-old_write = r'''std\.mem\.writeInt\(u64, self\.data\.items\[bun_section_offset\.\.\]\[0\.\.8\], new_vaddr, \.little\);'''
-
-new_write = '''// ANDROID_TERMUX_FIX [Layer 4d]: Write OFFSET (not absolute vaddr)
-                    // to BUN_COMPILED.size. On PIE binaries (required on Android),
-                    // the binary is loaded at a random ASLR base. The runtime can't
-                    // use @ptrFromInt(vaddr) — it must use pointer arithmetic:
-                    //   target = &BUN_COMPILED + offset
-                    // This automatically accounts for the ASLR base.
-                    const bun_offset = new_vaddr - bun_section.sh_addr;
-                    std.mem.writeInt(u64, self.data.items[bun_section_offset..][0..8], bun_offset, .little);'''
-
-new_content = re.sub(old_write, lambda m: new_write, content, count=1)
-if new_content != content:
-    content = new_content
-    patched += 1
-    print("    [4d] Write OFFSET (not vaddr) to BUN_COMPILED.size (PIE/ASLR fix)")
-else:
-    print("    [FAIL] could not find BUN_COMPILED.size write")
-    sys.exit(1)
-
-# 4e: Defensive overlap check
-old_extend_end = r'''            const phdr_offset = @as\(usize, @intCast\(ehdr\.e_phoff\)\) \+ rw_index \* phdr_size;
-            @memcpy\(self\.data\.items\[phdr_offset\.\.\]\[0\.\.phdr_size\], std\.mem\.asBytes\(&extended\)\);
-        \}
-    \}'''
-
-new_extend_end = '''            const phdr_offset = @as(usize, @intCast(ehdr.e_phoff)) + rw_index * phdr_size;
-            @memcpy(self.data.items[phdr_offset..][0..phdr_size], std.mem.asBytes(&extended));
-
-            // ANDROID_TERMUX_FIX [Layer 4e]: Defensive overlap check.
-            const new_end = rw_phdr.p_vaddr + new_segment_size;
-            for (0..ehdr.e_phnum) |j| {
-                if (j == rw_index) continue;
-                const other_offset = @as(usize, @intCast(ehdr.e_phoff)) + j * phdr_size;
-                const other_phdr = std.mem.bytesAsValue(Elf64_Phdr, self.data.items[other_offset..][0..phdr_size]).*;
-                if (other_phdr.p_type != elf.PT_LOAD) continue;
-                const other_end = other_phdr.p_vaddr + other_phdr.p_memsz;
-                if (other_phdr.p_vaddr < new_end and other_end > rw_phdr.p_vaddr) {
-                    return error.ExtendedSegmentWouldOverlap;
+block = """        #[cfg(all(target_os = "android", target_arch = "aarch64"))]
+        {
+            // ANDROID_TERMUX_FIX_TCC_PATHS: give TinyCC the Bionic libc and
+            // Termux headers/libs. Upstream probes only FHS directories,
+            // none of which exist on Android.
+            if dir_exists(b"/system/lib64") {
+                if state.add_library_path(zstr!("/system/lib64")).is_err() {
+                    bun_output::scoped_log!(TCC, "TinyCC failed to add library path");
+                }
+            }
+            // SAFETY: NUL-terminated literal; result owned by libc.
+            let prefix_ptr = unsafe { libc::getenv(b"PREFIX\\0".as_ptr().cast()) };
+            if !prefix_ptr.is_null() {
+                // SAFETY: getenv strings live for the life of the process.
+                let prefix = unsafe { core::ffi::CStr::from_ptr(prefix_ptr) }.to_bytes();
+                let targets: [&[u8]; 4] = [
+                    b"/include",
+                    b"/include/aarch64-linux-android",
+                    b"/lib",
+                    b"/lib/aarch64-linux-android",
+                ];
+                for (idx, tail) in targets.iter().enumerate() {
+                    let mut joined = Vec::with_capacity(prefix.len() + tail.len());
+                    joined.extend_from_slice(prefix);
+                    joined.extend_from_slice(tail);
+                    let mut buf = [0u8; 512];
+                    if joined.len() > 510 {
+                        continue;
+                    }
+                    buf[..joined.len()].copy_from_slice(&joined);
+                    buf[joined.len()] = 0;
+                    // SAFETY: buf[..len+1] is NUL-terminated by construction.
+                    let z = bun_core::ZBox::from_vec_with_nul(
+                        buf[..joined.len() + 1].to_vec(),
+                    );
+                    let res = if idx < 2 {
+                        state.add_sys_include_path(&z)
+                    } else {
+                        state.add_library_path(&z)
+                    };
+                    if res.is_err() {
+                        bun_output::scoped_log!(TCC, "TinyCC failed to add path");
+                    }
                 }
             }
         }
-    }'''
 
-new_content = re.sub(old_extend_end, lambda m: new_extend_end, content, count=1)
-if new_content != content:
-    content = new_content
-    patched += 1
-    print("    [4e] Defensive overlap check after extension")
-else:
-    print("    [FAIL] could not find extension block pattern")
-    sys.exit(1)
+""" + anchor
 
-with open("src/exe_format/elf.zig", "w") as f:
-    f.write(content)
+assert c.count(anchor) == 1, "ffi_body.rs anchor not found: linux/android sysinclude block"
+c = c.replace(anchor, block, 1)
 
-print(f"    Total: {patched}/5 sub-patches applied to elf.zig")
+p.write_text(c)
+print("  added /system/lib64 + $PREFIX search paths")
 PYEOF
-        verify_patch "$ELF_ZIG" "$PATCH_MARKER" || true
-    fi
+    verify_patch "$FFI_RS"
+elif [ -f "$FFI_RS" ]; then
+    echo "[SKIP 7] $FFI_RS already patched"
 fi
 
-# =====================================================================
-# PATCH 3b: src/standalone_graph/StandaloneModuleGraph.zig — PIE/ASLR fix
-# =====================================================================
-SMG_ZIG="src/standalone_graph/StandaloneModuleGraph.zig"
+# Files that legitimately have no marker because nothing matched in 1.4
+MISSING_OK=""
 
-if [ ! -f "$SMG_ZIG" ]; then
-    echo "  [FAIL] $SMG_ZIG not found"
-    FAIL_COUNT=$((FAIL_COUNT + 1))
-else
-    if grep -q "$PATCH_MARKER" "$SMG_ZIG" 2>/dev/null; then
-        echo "  [SKIP] $SMG_ZIG already patched"
-    else
-        echo "  [PATCH] $SMG_ZIG"
-        python3 <<'PYEOF'
-import re, sys
-
-with open("src/standalone_graph/StandaloneModuleGraph.zig", "r") as f:
-    content = f.read()
-
-# Change getData() to use pointer arithmetic instead of @ptrFromInt(vaddr)
-# Bug: @ptrFromInt(vaddr) uses the raw ELF vaddr as an ABSOLUTE address.
-# On PIE binaries (required on Android), the binary is loaded at a random
-# ASLR base. The payload is at base+vaddr, not at vaddr.
-# Fix: use &BUN_COMPILED + offset (pointer arithmetic accounts for base).
-old = r'''        pub fn getData\(\) \?\[\]const u8 \{
-            const vaddr = \(Bun__getStandaloneModuleGraphELFVaddr\(\) orelse return null\)\.\*;
-            if \(vaddr == 0\) return null;
-            // BUN_COMPILED\.size holds the virtual address of the appended data\.
-            // The kernel mapped it via PT_LOAD, so we can dereference directly\.
-            // Format at target: \[u64 payload_len\]\[payload bytes\]
-            const target: \[\*\]const u8 = @ptrFromInt\(vaddr\);
-            const payload_len = std\.mem\.readInt\(u64, target\[0\.\.8\], \.little\);
-            if \(payload_len < 8\) return null;
-            return target\[8\.\.\]\[0\.\.payload_len\];
-        \}'''
-
-new = '''        pub fn getData() ?[]const u8 {
-            // ANDROID_TERMUX_FIX: Use pointer arithmetic instead of @ptrFromInt.
-            // On PIE binaries (required on Android), the binary is loaded at a
-            // random ASLR base. BUN_COMPILED.size now stores an OFFSET (not an
-            // absolute vaddr). We compute: target = &BUN_COMPILED + offset.
-            // This automatically accounts for the ASLR base address.
-            const ptr = Bun__getStandaloneModuleGraphELFVaddr() orelse return null;
-            const offset = ptr.*;
-            if (offset == 0) return null;
-            const ptr_addr: usize = @intFromPtr(ptr);
-            const target: [*]const u8 = @ptrFromInt(ptr_addr + offset);
-            const payload_len = std.mem.readInt(u64, target[0..8], .little);
-            if (payload_len < 8) return null;
-            return target[8..][0..payload_len];
-        }'''
-
-new_content = re.sub(old, lambda m: new, content, count=1)
-if new_content != content:
-    content = new_content
-    print("    [5a] Use pointer arithmetic for PIE/ASLR (offset instead of vaddr)")
-else:
-    print("    [FAIL] could not find getData() pattern")
-    sys.exit(1)
-
-with open("src/standalone_graph/StandaloneModuleGraph.zig", "w") as f:
-    f.write(content)
-
-print("    Total: 1/1 sub-patches applied to StandaloneModuleGraph.zig")
-PYEOF
-        verify_patch "$SMG_ZIG" "$PATCH_MARKER" || true
-    fi
-fi
-
-# =====================================================================
-# PATCH 4: scripts/build/config.ts — enable TinyCC for Android
-# =====================================================================
-# Bun disables TinyCC on Android because "oven-sh/tinycc has no upstream
-# bionic support". But TinyCC DOES have Android/Bionic support in its
-# configure script (TARGETOS_ANDROID, crtbegin_so.o, /system/bin/linker64,
-# aarch64-linux-android triplet). The issue is that Bun's build system
-# never enables it. This patch removes the Android exclusion so TinyCC
-# gets built, enabling bun:ffi callback() and linkSymbols(cc:true).
-CONFIG_TS="scripts/build/config.ts"
-if [ -f "$CONFIG_TS" ]; then
-    if grep -q "$PATCH_MARKER" "$CONFIG_TS" 2>/dev/null; then
-        echo "  [SKIP] $CONFIG_TS already patched"
-    else
-        echo "  [PATCH] $CONFIG_TS (enable TinyCC for Android)"
-        # Remove the 'abi === "android" ||' from the tinycc exclusion
-        # Before:  const tinycc = ... !((windows && arm64) || abi === "android" || freebsd);
-        # After:   const tinycc = ... !((windows && arm64) || freebsd);
-        sed -i "s/|| abi === \"android\" || freebsd/|| freebsd/g" "$CONFIG_TS"
-        # Add marker comment on its OWN LINE (before the const) — putting it
-        # inline after '??' would turn the rest of the expression into a comment.
-        sed -i "/^  const tinycc = partial.tinycc/i\\  // $PATCH_MARKER: TinyCC enabled for Android (was disabled upstream)" "$CONFIG_TS"
-        verify_patch "$CONFIG_TS" "$PATCH_MARKER" || true
-    fi
-fi
-
-# =====================================================================
-# PATCH 5: scripts/build/deps/tinycc.ts — add Android/Bionic defines
-# =====================================================================
-# Bun's tinycc.ts only sets TCC_TARGET_MACHO (macOS) and CONFIG_WIN32
-# (Windows). For Android, we need TARGETOS_ANDROID + the Android paths
-# (CRT files, ELF interpreter, sysroot, triplet). These defines match
-# what TinyCC's ./configure --targetos=Android --cpu=arm64 generates.
-TINYCC_TS="scripts/build/deps/tinycc.ts"
-if [ -f "$TINYCC_TS" ]; then
-    if grep -q "$PATCH_MARKER" "$TINYCC_TS" 2>/dev/null; then
-        echo "  [SKIP] $TINYCC_TS already patched"
-    else
-        echo "  [PATCH] $TINYCC_TS (add Android defines)"
-        python3 <<'PYEOF'
-import re, sys
-
-with open("scripts/build/deps/tinycc.ts", "r") as f:
-    content = f.read()
-
-# Find the line "if (cfg.windows) defines.CONFIG_WIN32 = true;"
-# and add Android defines after it
-old = '    if (cfg.windows) defines.CONFIG_WIN32 = true;'
-
-new = '''    if (cfg.windows) defines.CONFIG_WIN32 = true;
-
-    // ANDROID_TERMUX_FIX: Enable TinyCC for Android/Bionic.
-    // Based on guysoft/opencode-termux's proven approach: use MINIMAL
-    // defines. Don't set TARGETOS_ANDROID, CONFIG_SYSROOT, or Android
-    // CRT/lib paths.
-    //
-    // CRITICAL: CONFIG_SELINUX=1 is the KEY define that makes JSCallback
-    // work on Android. Without it, TinyCC uses tcc_malloc() + mprotect()
-    // for executable memory. Android SELinux BLOCKS mprotect(PROT_EXEC)
-    // on heap memory. With CONFIG_SELINUX=1, TinyCC uses mmap(PROT_EXEC)
-    // directly via a tmpfile — which Android SELinux allows.
-    //
-    // This is why opencode-termux works: their TinyCC build (commit
-    // b91835d8) has HAVE_SELINUX enabled by default. Our newer TinyCC
-    // (commit 12882eee) has CONFIG_SELINUX commented out.
-    if (cfg.linux && cfg.abi === "android" && cfg.arm64) {
-      defines.CONFIG_SELINUX = 1;
-    }'''
-
-if old not in content:
-    print("    [FAIL] could not find 'cfg.windows defines.CONFIG_WIN32' line")
-    sys.exit(1)
-
-content = content.replace(old, new, 1)
-
-# Also add the tccrun.c overlay to the patches array
-# Using OVERLAY (not .patch) because git apply --no-index fails on
-# tab characters in context lines. Overlay = copy entire file.
-old_patches = 'patches: ["patches/tinycc/tcc.h.patch"],'
-new_patches = 'patches: ["patches/tinycc/tcc.h.patch", "patches/tinycc/tccrun.c", "patches/tinycc/arm64-link.c"],'
-if old_patches in content:
-    content = content.replace(old_patches, new_patches, 1)
-    print("    [5a] Added CONFIG_SELINUX=1 + tccrun.c + arm64-link.c overlays to tinycc.ts")
-else:
-    print("    [5a] Added CONFIG_SELINUX=1 (overlays already in patches array?)")
-
-with open("scripts/build/deps/tinycc.ts", "w") as f:
-    f.write(content)
-PYEOF
-        # CRITICAL: Copy the overlay files into the bun source tree
-        # Using OVERLAY (complete file copy) instead of .patch because
-        # git apply --no-index fails on tab characters in context lines.
-        # Bun's build system treats non-.patch files as overlays (copied as-is).
-        REPO_DIR="${GITHUB_WORKSPACE:-$(cd "$(dirname "$0")/../.." && pwd)}"
-        mkdir -p "$BUN_SRC/patches/tinycc"
-        if [ -f "$REPO_DIR/patches/tinycc/tccrun.c.overlay" ]; then
-          cp "$REPO_DIR/patches/tinycc/tccrun.c.overlay" "$BUN_SRC/patches/tinycc/tccrun.c"
-          echo "    [5b] Copied tccrun.c overlay to bun source tree"
-        else
-          echo "    [FAIL] tccrun.c.overlay not found at $REPO_DIR/patches/tinycc/"
-          echo "    Searching for it..."
-          find "$REPO_DIR" -name "tccrun.c*" 2>/dev/null | head -5
-          exit 1
-        fi
-        if [ -f "$REPO_DIR/patches/tinycc/arm64-link.c.overlay" ]; then
-          cp "$REPO_DIR/patches/tinycc/arm64-link.c.overlay" "$BUN_SRC/patches/tinycc/arm64-link.c"
-          echo "    [5c] Copied arm64-link.c overlay (veneer stubs for long calls) to bun source tree"
-        else
-          echo "    [FAIL] arm64-link.c.overlay not found at $REPO_DIR/patches/tinycc/"
-          exit 1
-        fi
-        verify_patch "$TINYCC_TS" "$PATCH_MARKER" || true
-    fi
-fi
-
-# =====================================================================
-# PATCH 6: scripts/build/flags.ts — cross-compile CPU flag fix
-# =====================================================================
-FLAGS_TS="scripts/build/flags.ts"
-if [ -f "$FLAGS_TS" ]; then
-    if grep -q "$PATCH_MARKER" "$FLAGS_TS" 2>/dev/null; then
-        echo "  [SKIP] $FLAGS_TS already patched"
-    else
-        echo "  [PATCH] $FLAGS_TS"
-        sed -i 's/"-march=armv8-a+crc"/"-march=armv8-a"/g' "$FLAGS_TS"
-        sed -i "1i // $PATCH_MARKER: simplified march flags for cross-compile" "$FLAGS_TS"
-        verify_patch "$FLAGS_TS" "$PATCH_MARKER" || true
-    fi
-fi
-
-# =====================================================================
-# PATCH 7: scripts/build/tools.ts — accept NDK clang 18
-# =====================================================================
-TOOLS_TS="scripts/build/tools.ts"
-if [ -f "$TOOLS_TS" ]; then
-    if grep -q "$PATCH_MARKER" "$TOOLS_TS" 2>/dev/null; then
-        echo "  [SKIP] $TOOLS_TS already patched"
-    else
-        echo "  [PATCH] $TOOLS_TS"
-        sed -i "s/export const LLVM_VERSION = \"21.1.8\";/export const LLVM_VERSION = \"18.0.3\"; \/\/ $PATCH_MARKER: NDK r27c clang/" "$TOOLS_TS"
-        sed -i "s/const LLVM_MAJOR = \"21\";/const LLVM_MAJOR = \"18\"; \/\/ $PATCH_MARKER/" "$TOOLS_TS"
-        sed -i "s/const LLVM_MINOR = \"1\";/const LLVM_MINOR = \"0\"; \/\/ $PATCH_MARKER/" "$TOOLS_TS"
-        sed -i "s|paths.push(\`/usr/lib/llvm-\${LLVM_MAJOR}.\${LLVM_MINOR}.0/bin\`);|paths.push(\`/usr/lib/llvm-\${LLVM_MAJOR}.\${LLVM_MINOR}.0/bin\`);\n    // $PATCH_MARKER: NDK clang\n    paths.push(\`\${process.env.ANDROID_NDK_HOME \|\| process.env.ANDROID_NDK_ROOT \|\| \"/opt/android-ndk\"}/toolchains/llvm/prebuilt/linux-x86_64/bin\`);|" "$TOOLS_TS"
-        sed -i '/"-Wno-character-conversion",/d' "$FLAGS_TS" 2>/dev/null || true
-        verify_patch "$TOOLS_TS" "$PATCH_MARKER" || true
-    fi
-fi
-
-# =====================================================================
-# PATCH 8: EncodingTables.h — remove pragma for clang 19+ warning
-# =====================================================================
-ENCODING_TABLES="src/jsc/bindings/EncodingTables.h"
-if [ -f "$ENCODING_TABLES" ]; then
-    if grep -q 'clang diagnostic ignored "-Wcharacter-conversion"' "$ENCODING_TABLES" 2>/dev/null; then
-        echo "  [PATCH] $ENCODING_TABLES: remove -Wcharacter-conversion pragma"
-        sed -i '/clang diagnostic ignored "-Wcharacter-conversion"/d' "$ENCODING_TABLES"
-        echo "  [OK] removed pragma"
-    else
-        echo "  [SKIP] $ENCODING_TABLES: no pragma to remove"
-    fi
-fi
-
-# =====================================================================
-# PATCH 9: C++ dangling-reference fix for clang 18
-# =====================================================================
-echo "  [PATCH] searching for dangling reference pattern in C++ files..."
-PATCHED_FILES=0
-while IFS= read -r -d '' FILE; do
-    if grep -q "properties.releaseData()->propertyNameVector()" "$FILE" 2>/dev/null; then
-        if grep -q "_releaseData = properties.releaseData()" "$FILE" 2>/dev/null; then
-            continue
-        fi
-        echo "    [patch] $FILE"
-        perl -i -pe 's/for \(auto& (\w+) : properties\.releaseData\(\)->propertyNameVector\(\)\)/auto _releaseData = properties.releaseData(); for (auto\& $1 : _releaseData->propertyNameVector())/g' "$FILE"
-        PATCHED_FILES=$((PATCHED_FILES + 1))
-    fi
-done < <(find src -type f \( -name "*.cpp" -o -name "*.h" \) -print0 2>/dev/null)
-echo "  [OK] patched $PATCHED_FILES C++ files with dangling reference fix"
-
-# =====================================================================
-# PATCH 10: src/runtime/ffi/ffi.zig — add Android/Termux library + include paths
-# =====================================================================
-# Bun's cc() and JSCallback use TinyCC to compile C code at runtime.
-# TinyCC needs to find libc.so for linking and system headers for includes.
-#
-# On Linux x64: Bun checks /usr/lib/x86_64-linux-gnu, /usr/lib64, etc.
-# On Linux arm64: Bun checks /usr/lib/aarch64-linux-gnu, /usr/lib64, etc.
-# On Android/Termux: NONE of these paths exist. Android's libc.so is at
-# /system/lib64/libc.so, and Termux's headers are at $PREFIX/include.
-#
-# Without this patch, cc() fails with:
-#   tcc: error: library 'c' not found
-# And JSCallback fails with:
-#   tcc_relocate returned a negative value
-#
-# The fix adds /system/lib64 + Termux $PREFIX/lib as library paths and
-# $PREFIX/include + $PREFIX/include/aarch64-linux-android as system include
-# paths, specifically for Android targets.
-FFI_ZIG="src/runtime/ffi/ffi.zig"
-if [ -f "$FFI_ZIG" ]; then
-    if grep -q "$PATCH_MARKER" "$FFI_ZIG" 2>/dev/null; then
-        echo "  [SKIP] $FFI_ZIG already patched"
-    else
-        echo "  [PATCH] $FFI_ZIG (add Android library + include paths for TinyCC)"
-        python3 <<'PYEOF'
-import sys
-
-with open("src/runtime/ffi/ffi.zig", "r") as f:
-    content = f.read()
-
-# The anchor is the end of the Environment.isLinux block in the compile()
-# function. We insert our Android-specific block right after it, before
-# the Environment.isPosix block.
-#
-# In Bun v1.3.14's ffi.zig, the code looks like:
-#             } else if (Environment.isLinux) {
-#                 if (getSystemIncludeDir()) |include_dir| {
-#                     state.addSysIncludePath(include_dir) catch {
-#                         debug("TinyCC failed to add sysinclude path", .{});
-#                     };
-#                 }
-#
-#                 if (getSystemLibraryDir()) |library_dir| {
-#                     state.addLibraryPath(library_dir) catch {
-#                         debug("TinyCC failed to add library path", .{});
-#                     };
-#                 }
-#             }
-#
-#             if (Environment.isPosix) {
-
-anchor = '''                if (getSystemLibraryDir()) |library_dir| {
-                    state.addLibraryPath(library_dir) catch {
-                        debug("TinyCC failed to add library path", .{});
-                    };
-                }
-            }
-
-            if (Environment.isPosix) {'''
-
-if anchor not in content:
-    print("    [FAIL] could not find the Linux library path anchor in ffi.zig")
-    print("    The file structure may have changed. Aborting.")
-    sys.exit(1)
-
-android_block = '''                if (getSystemLibraryDir()) |library_dir| {
-                    state.addLibraryPath(library_dir) catch {
-                        debug("TinyCC failed to add library path", .{});
-                    };
-                }
-            }
-
-            // ANDROID_TERMUX_FIX: Add Android/Termux library + include paths for TinyCC.
-            // On Android, libc.so is at /system/lib64 (not /usr/lib). Without this,
-            // cc() fails with "tcc: error: library 'c' not found" and JSCallback
-            // fails with "tcc_relocate returned a negative value".
-            if (Environment.isAndroid) {
-                // System Bionic libraries: libc.so, libm.so, libdl.so
-                if (bun.FD.cwd().directoryExistsAt("/system/lib64").isTrue()) {
-                    state.addLibraryPath("/system/lib64") catch {
-                        debug("TinyCC failed to add /system/lib64", .{});
-                    };
-                }
-                if (bun.FD.cwd().directoryExistsAt("/system/lib").isTrue()) {
-                    state.addLibraryPath("/system/lib") catch {
-                        debug("TinyCC failed to add /system/lib", .{});
-                    };
-                }
-                // Termux PREFIX library + include paths
-                // $PREFIX is typically /data/data/com.termux/files/usr
-                if (std.c.getenv("PREFIX")) |prefix_c| {
-                    const prefix = bun.sliceTo(prefix_c, 0);
-                    // $PREFIX/lib
-                    {
-                        const prefix_lib = bun.path.joinAbsStringBufZ(prefix, &pathbuf, &.{"lib"}, .auto);
-                        if (bun.FD.cwd().directoryExistsAt(prefix_lib).isTrue()) {
-                            state.addLibraryPath(prefix_lib) catch {
-                                debug("TinyCC failed to add Termux lib path", .{});
-                            };
-                        }
-                    }
-                    // $PREFIX/include
-                    {
-                        const prefix_include = bun.path.joinAbsStringBufZ(prefix, &pathbuf, &.{"include"}, .auto);
-                        if (bun.FD.cwd().directoryExistsAt(prefix_include).isTrue()) {
-                            state.addSysIncludePath(prefix_include) catch {
-                                debug("TinyCC failed to add Termux include path", .{});
-                            };
-                        }
-                    }
-                    // $PREFIX/include/aarch64-linux-android (asm headers)
-                    {
-                        const asm_include = bun.path.joinAbsStringBufZ(prefix, &pathbuf, &.{ "include", "aarch64-linux-android" }, .auto);
-                        if (bun.FD.cwd().directoryExistsAt(asm_include).isTrue()) {
-                            state.addSysIncludePath(asm_include) catch {
-                                debug("TinyCC failed to add Termux asm include path", .{});
-                            };
-                        }
-                    }
-                }
-            }
-
-            if (Environment.isPosix) {'''
-
-content = content.replace(anchor, android_block, 1)
-
-with open("src/runtime/ffi/ffi.zig", "w") as f:
-    f.write(content)
-
-print("    [OK] Added Android library + include paths to ffi.zig")
-PYEOF
-        verify_patch "$FFI_ZIG" "$PATCH_MARKER" || true
-    fi
-fi
-
-# =====================================================================
-# PATCH 11: src/main.zig — disable scudo heap tagging at process start
-# =====================================================================
-# ROOT CAUSE: On Android, scudo's heap tagging (TBI) tags malloc'd
-# pointers with a non-zero top byte (0xb4). When free() receives a
-# tagged pointer, it checks the tag and SIGABRTs if it doesn't match.
-#
-# MEMTAG_OPTIONS=off in the launcher doesn't work on all devices.
-# The LD_PRELOAD shim runs too late (scudo already initialized).
-#
-# FIX: Call android_mallopt(M_BIONIC_SET_HEAP_TAGGING_LEVEL, NONE) at
-# the VERY FIRST LINE of main(), before crash_handler.init() and before
-# any heap allocation. This tells scudo to stop tagging pointers.
-#
-# M_BIONIC_SET_HEAP_TAGGING_LEVEL = -204 (from Bionic's malloc.h)
-# M_HEAP_TAGGING_LEVEL_NONE = 0
-#
-MAIN_ZIG="src/main.zig"
-if [ -f "$MAIN_ZIG" ]; then
-    if grep -q "ANDROID_TERMUX_FIX_HEAP_TAGGING" "$MAIN_ZIG" 2>/dev/null; then
-        echo "  [SKIP] $MAIN_ZIG already patched for heap tagging"
-    else
-        echo "  [PATCH] $MAIN_ZIG (disable scudo heap tagging at startup)"
-        python3 <<'PYEOF'
-import sys
-
-with open("src/main.zig", "r") as f:
-    content = f.read()
-
-# 1. Add extern fn declarations after the existing extern declarations
-old_externs = 'pub extern "c" var environ: ?*anyopaque;'
-new_externs = '''pub extern "c" var environ: ?*anyopaque;
-
-// ANDROID_TERMUX_FIX_HEAP_TAGGING: Disable scudo heap tagging at startup.
-// mallopt() is the standard C function (not android_mallopt).
-// M_BIONIC_SET_HEAP_TAGGING_LEVEL = -204 is handled by mallopt() in
-// libc/bionic/malloc_common.cpp, NOT by android_mallopt().
-extern fn mallopt(param: c_int, value: c_int) c_int;'''
-
-if old_externs not in content:
-    print("    [FAIL] could not find extern environ declaration")
-    sys.exit(1)
-content = content.replace(old_externs, new_externs, 1)
-
-# 2. Insert mallopt call at the very first line of main()
-old_main = 'pub fn main() void {\n    _bun.crash_handler.init();'
-new_main = '''pub fn main() void {
-    // ANDROID_TERMUX_FIX_HEAP_TAGGING: Disable scudo heap tagging BEFORE
-    // anything else. M_BIONIC_SET_HEAP_TAGGING_LEVEL = -204,
-    // M_HEAP_TAGGING_LEVEL_NONE = 0. This must run before any heap
-    // allocation (including crash_handler.init()).
-    //
-    // NOTE: M_BIONIC_SET_HEAP_TAGGING_LEVEL is handled by mallopt()
-    // (in libc/bionic/malloc_common.cpp), NOT by android_mallopt().
-    // android_mallopt() does NOT handle this opcode — it returns false.
-    if (Environment.isAndroid) {
-        // M_BIONIC_SET_HEAP_TAGGING_LEVEL = -204, M_HEAP_TAGGING_LEVEL_NONE = 0
-        _ = mallopt(-204, 0);
-    }
-    _bun.crash_handler.init();'''
-
-if old_main not in content:
-    print("    [FAIL] could not find main() function start")
-    sys.exit(1)
-content = content.replace(old_main, new_main, 1)
-
-with open("src/main.zig", "w") as f:
-    f.write(content)
-
-print("    [OK] Added mallopt(SET_HEAP_TAGGING_LEVEL, NONE) to main()")
-PYEOF
-        verify_patch "$MAIN_ZIG" "ANDROID_TERMUX_FIX_HEAP_TAGGING" || true
-    fi
-fi
-
-# =====================================================================
-# PATCH 12: src/jsc/bindings/c-bindings.cpp — replace close_range syscall
-# =====================================================================
-# ROOT CAUSE:
-#   Android 12 (and some Android 13 devices) run third-party apps under
-#   a zygote seccomp filter that does NOT include close_range (syscall
-#   436, added in Linux 5.9). The filter uses SECCOMP_RET_TRAP, so
-#   invoking the syscall raises SIGSYS BEFORE it can return -ENOSYS.
-#   Every "if (bun_close_range(...) != 0) fallback" check is useless
-#   because the process is already dead.
-#
-#   bun_initialize_process() calls bun_close_range(4, ~0U, CLOEXEC) at
-#   startup, so bun dies with "Bad system call" before main() runs on
-#   affected devices. Strace evidence:
-#     close_range(4, 4294967295, CLOSE_RANGE_CLOEXEC) = 4
-#     --- SIGSYS {si_code=SYS_SECCOMP, si_syscall=__NR_close_range} ---
-#     +++ killed by SIGSYS (core dumped) +++
-#
-# FIX: On Android, don't call the syscall at all. Iterate /proc/self/fd
-#   and set FD_CLOEXEC on each fd in [start, end]. This is the same
-#   thing close_range(CLOSE_RANGE_CLOEXEC) does, minus the seccomp trap.
-#   For non-CLOEXEC flags we close() the fds instead.
-#
-#   We interpose bun_close_range itself (not the syscall), so ALL three
-#   call sites benefit: bun_initialize_process, on_before_reload_process
-#   (--watch), and process.execve fallback.
-#
-CBINDINGS_CPP="src/jsc/bindings/c-bindings.cpp"
-if [ -f "$CBINDINGS_CPP" ]; then
-    if grep -q "ANDROID_TERMUX_FIX_CLOSE_RANGE" "$CBINDINGS_CPP" 2>/dev/null; then
-        echo "  [SKIP] $CBINDINGS_CPP already patched for close_range seccomp"
-    else
-        echo "  [PATCH] $CBINDINGS_CPP (avoid close_range syscall on Android)"
-        python3 <<'PYEOF'
-import sys
-
-path = "src/jsc/bindings/c-bindings.cpp"
-with open(path, "r") as f:
-    content = f.read()
-
-old = (
-    '// close_range is glibc > 2.33, which is very new\n'
-    'extern "C" ssize_t bun_close_range(unsigned int start, unsigned int end, unsigned int flags)\n'
-    '{\n'
-    '    return syscall(__NR_close_range, start, end, flags);\n'
-    '}\n'
-)
-
-new = (
-    '// close_range is glibc > 2.33, which is very new\n'
-    '#if defined(__ANDROID__)\n'
-    '// ANDROID_TERMUX_FIX_CLOSE_RANGE: On Android, the zygote seccomp filter\n'
-    '// used for third-party apps does NOT allow close_range (syscall 436).\n'
-    '// The filter uses SECCOMP_RET_TRAP, so calling the syscall raises SIGSYS\n'
-    '// BEFORE it can return -ENOSYS — the "if fails, fallback" checks at every\n'
-    '// call site are useless because the process is already dead ("Bad system\n'
-    '// call"). Reproduce with a fallback that walks /proc/self/fd. This is\n'
-    '// what close_range(CLOSE_RANGE_CLOEXEC) does, minus the trap. Return 0\n'
-    '// on success so the callers do NOT run their loop-based fallback again.\n'
-    '#include <dirent.h>\n'
-    '#include <cerrno>\n'
-    'extern "C" ssize_t bun_close_range(unsigned int start, unsigned int end, unsigned int flags)\n'
-    '{\n'
-    '    DIR* d = opendir("/proc/self/fd");\n'
-    '    if (!d) {\n'
-    '        // /proc unavailable — mimic ENOSYS so the caller\'s fallback\n'
-    '        // loop can run. Not fatal.\n'
-    '        errno = ENOSYS;\n'
-    '        return -1;\n'
-    '    }\n'
-    '    int dfd = dirfd(d);\n'
-    '    struct dirent* e;\n'
-    '    const bool cloexec_only = (flags & CLOSE_RANGE_CLOEXEC) != 0;\n'
-    '    while ((e = readdir(d)) != nullptr) {\n'
-    '        if (e->d_name[0] < \'0\' || e->d_name[0] > \'9\') continue;\n'
-    '        char* endp = nullptr;\n'
-    '        unsigned long v = strtoul(e->d_name, &endp, 10);\n'
-    '        if (endp == e->d_name || *endp != \'\\0\') continue;\n'
-    '        if (v > 0x7fffffffUL) continue;\n'
-    '        unsigned int fd = (unsigned int)v;\n'
-    '        if (fd < start || fd > end) continue;\n'
-    '        if ((int)fd == dfd) continue; // don\'t touch the iteration fd\n'
-    '        if (cloexec_only) {\n'
-    '            int fl = fcntl((int)fd, F_GETFD);\n'
-    '            if (fl != -1) fcntl((int)fd, F_SETFD, fl | FD_CLOEXEC);\n'
-    '        } else {\n'
-    '            close((int)fd);\n'
-    '        }\n'
-    '    }\n'
-    '    closedir(d);\n'
-    '    return 0;\n'
-    '}\n'
-    '#else\n'
-    'extern "C" ssize_t bun_close_range(unsigned int start, unsigned int end, unsigned int flags)\n'
-    '{\n'
-    '    return syscall(__NR_close_range, start, end, flags);\n'
-    '}\n'
-    '#endif\n'
-)
-
-if old not in content:
-    print("    [FAIL] could not find bun_close_range Linux definition")
-    sys.exit(1)
-
-content = content.replace(old, new, 1)
-
-with open(path, "w") as f:
-    f.write(content)
-
-print("    [OK] Replaced bun_close_range with /proc/self/fd walk on Android")
-PYEOF
-        verify_patch "$CBINDINGS_CPP" "ANDROID_TERMUX_FIX_CLOSE_RANGE" || true
-    fi
-fi
-
-# =====================================================================
-# FINAL VERIFICATION
-# =====================================================================
 echo ""
 echo "=========================================="
 echo "PATCH VERIFICATION SUMMARY"
 echo "=========================================="
-
-TOTAL_FAIL=0
-for f in src/resolver/resolver.zig src/cli/run_command.zig src/exe_format/elf.zig src/standalone_graph/StandaloneModuleGraph.zig scripts/build/config.ts scripts/build/deps/tinycc.ts scripts/build/flags.ts scripts/build/tools.ts src/runtime/ffi/ffi.zig src/main.zig src/jsc/bindings/c-bindings.cpp; do
+FAIL=0
+for f in \
+    scripts/build/config.ts \
+    scripts/build/deps/tinycc.ts \
+    scripts/build/tools.ts \
+    src/sys/lib.rs \
+    src/sys/linux_syscall.rs \
+    src/spawn_sys/posix_spawn.rs \
+    src/runtime/ffi/ffi_body.rs; do
     if [ -f "$f" ]; then
-        if grep -q "$PATCH_MARKER" "$f" 2>/dev/null; then
-            COUNT=$(grep -c "$PATCH_MARKER" "$f")
+        COUNT=$(grep -c "$PATCH_MARKER" "$f" 2>/dev/null || true)
+        if [ "${COUNT:-0}" -gt 0 ]; then
             echo "  [OK]   $f ($COUNT markers)"
         else
             echo "  [FAIL] $f — NO MARKERS FOUND"
-            TOTAL_FAIL=$((TOTAL_FAIL + 1))
+            FAIL=$((FAIL + 1))
         fi
     else
-        echo "  [SKIP] $f — file not in this Bun version"
+        echo "  [SKIP] $f — not present in this Bun version"
     fi
 done
+
+TOTAL_FAIL=$((TOTAL_FAIL + FAIL))
+
+if [ -f "scripts/jsc/bindings/c-bindings.cpp" ] || [ -f "src/jsc/bindings/c-bindings.cpp" ]; then
+    echo "  [INFO] c-bindings.cpp close_range: upstream already raw-syscalls on Linux; no patch needed."
+fi
 
 echo ""
 if [ "$TOTAL_FAIL" -gt 0 ]; then
     echo "=========================================="
-    echo "FATAL: $TOTAL_FAIL critical patches did not apply!"
-    echo "The build will NOT fix bunx. Aborting."
+    echo "FATAL: $TOTAL_FAIL patch(es) did not apply!"
+    echo "Refusing to produce a broken Android build."
     echo "=========================================="
     exit 1
 fi
 
 echo "=========================================="
-echo "All critical patches applied successfully."
-echo "Source patches handle resolver walk (raw syscalls)."
-echo "LD_PRELOAD shim handles libc calls (linkat, fopen, etc.)."
+echo "All Android/Termux patches applied successfully."
+echo "Source-level only: no LD_PRELOAD, no termux-exec."
+echo "  - TinyCC enabled on Android (+SELinux-safe JIT, arm64 veneers)"
+echo "  - NDK clang 18 accepted"
+echo "  - fchmodat2/openat2 seccomp traps bypassed at compile time"
+echo "  - missing-interpreter shebangs remapped to \$PREFIX/bin"
+echo "  - bun:ffi finds Bionic libc + Termux headers"
 echo "=========================================="

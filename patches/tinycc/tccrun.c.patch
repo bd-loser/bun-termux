@@ -1,0 +1,48 @@
+diff --git a/tccrun.c b/tccrun.c
+index c188f47..efdec3c 100644
+--- a/tccrun.c
++++ b/tccrun.c
+@@ -20,6 +20,12 @@
+ 
+ #include "tcc.h"
+ 
++/* ANDROID_TERMUX_FIX: memfd_create(2) via syscall — Bionic only
++   declares memfd_create() at API 30+, and we target lower. */
++#ifdef __ANDROID__
++#include <sys/syscall.h>
++#endif
++
+ /* only native compiler supports -run */
+ #ifdef TCC_IS_NATIVE
+ 
+@@ -115,10 +121,30 @@ static int rt_mem(TCCState *s1, int size)
+ #ifdef CONFIG_SELINUX
+     /* Using mmap instead of malloc */
+     void *prw;
++    /* ANDROID_TERMUX_FIX: Android has no /tmp, so mkstemp() fails and the
++       CONFIG_SELINUX path (which bun:ffi needs — see below) dies. Use an
++       anonymous memfd instead: same shared-fd semantics, no filesystem.
++
++       We deliberately KEEP the original MAP_FIXED two-mapping layout.
++       tcc_relocate() computes ptr_diff = prw - ptr and applies it as
++       sh_addr + ptr_diff; MAP_FIXED guarantees the RW view sits exactly
++       `size` bytes after the RX view, so ptr_diff stays small and the
++       arithmetic holds. Dropping MAP_FIXED lets the kernel scatter the
++       two mappings, ptr_diff becomes huge, and relocation yields wild
++       pointers. MAP_FIXED is not what SELinux blocks here — what it
++       blocks is mprotect(PROT_EXEC) on heap pages, which is exactly why
++       CONFIG_SELINUX maps PROT_EXEC from a shared fd instead. */
++#ifdef __ANDROID__
++    int fd = syscall(SYS_memfd_create, "tccrun", 0);
++    if (fd < 0)
++        return tcc_error_noabort("tccrun: memfd_create failed");
++    ftruncate(fd, size);
++#else
+     char tmpfname[] = "/tmp/.tccrunXXXXXX";
+     int fd = mkstemp(tmpfname);
+     unlink(tmpfname);
+     ftruncate(fd, size);
++#endif
+ 
+     ptr = mmap(NULL, size * 2, PROT_READ|PROT_EXEC, MAP_SHARED, fd, 0);
+     /* mmap RW memory at fixed distance */

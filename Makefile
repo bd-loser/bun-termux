@@ -4,7 +4,7 @@
 SHELL := /data/data/com.termux/files/usr/bin/bash
 .DEFAULT_GOAL := help
 
-PKGVER ?= 1.3.14
+PKGVER ?= 1.4.0
 PKGREL ?= 1
 ARCH ?= aarch64
 

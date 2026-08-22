@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Bun version to build (e.g., 1.3.14)'
+        description: 'Bun version to build (e.g., 1.4.0)'
         required: true
-        default: '1.3.14'
+        default: '1.4.0'
   schedule:
     # Build patched from-source version weekly (Sunday 00:00 UTC)
     # to catch upstream fixes
@@ -19,7 +19,7 @@ permissions:
 jobs:
   build-from-source:
     runs-on: ubuntu-latest
-    timeout-minutes: 120
+    timeout-minutes: 240
     steps:
       - name: Checkout this repo (for patch scripts)
         uses: actions/checkout@v4
@@ -37,45 +37,42 @@ jobs:
           sudo apt-get install -y \
             curl wget git cmake ninja-build pkg-config \
             libssl-dev libcurl4-openssl-dev \
-            golang-go ruby-full \
+            ruby-full \
             xz-utils unzip jq python3 \
-            ccache
+            ccache \
+            clang-18 lld-18 llvm-18
 
-      - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
+      # Bun 1.4 pins its Rust toolchain via rust-toolchain.toml; rustup
+      # auto-installs it on first use inside the checkout (the build step
+      # warms it up explicitly). aarch64-linux-android std comes from
+      # rustup automatically — the build system runs `rustup target add`
+      # for Tier 2 cross targets itself.
+      - name: Install Rust (pinned via rust-toolchain.toml)
+        run: |
+          rustup --version || (curl -sSf https://sh.rustup.rs | sh -s -- -y && echo "$HOME/.cargo/bin" >> $GITHUB_PATH)
 
-      - name: Install Android NDK (provides clang 18 for cross-compilation)
+      - name: Install Android NDK (bionic sysroot + libc++ + compiler-rt)
         uses: nttld/setup-ndk@v1
         id: setup_ndk
         with:
           ndk-version: r27c
           add-to-path: true
 
-      - name: Make NDK clang the default (patches tools.ts to accept v18)
-        env:
-          NDK_ROOT: ${{ steps.setup_ndk.outputs.ndk-path }}
+      # NOTE: unlike the 1.3.x workflow we do NOT make NDK clang the host
+      # compiler. Bun 1.4's build system cross-compiles Android with the
+      # HOST clang driving --target/--sysroot against the NDK sysroot, and
+      # links the NDK's compiler-rt/libunwind into the host clang resource
+      # dir itself (scripts/build/config.ts linkNdkRuntimesIntoClang).
+      # The apply-android-patches.sh PATCH 3 relaxes the LLVM version gate
+      # from 21.x to 18.x so Ubuntu's clang-18 satisfies discovery.
+      - name: Verify host clang 18
         run: |
-          # The patches/tools.ts patch lowers the clang version requirement
-          # from 21.1.x to 18.0.x and adds the NDK's bin dir to search paths.
-          # Make NDK clang available as 'clang' and 'clang++' on PATH.
-          NDK_BIN="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          echo "NDK bin: $NDK_BIN"
-          ls "$NDK_BIN/" | grep -E "^clang" | head -5
-          # The NDK ships aarch64-linux-android28-clang and clang (host)
-          # Symlink NDK's host clang to /usr/local/bin
-          sudo ln -sf "$NDK_BIN/clang" /usr/local/bin/clang
-          sudo ln -sf "$NDK_BIN/clang++" /usr/local/bin/clang++
-          sudo ln -sf "$NDK_BIN/llvm-ar" /usr/local/bin/llvm-ar
-          sudo ln -sf "$NDK_BIN/llvm-ranlib" /usr/local/bin/llvm-ranlib
-          sudo ln -sf "$NDK_BIN/ld.lld" /usr/local/bin/ld.lld
-          sudo ln -sf "$NDK_BIN/llvm-strip" /usr/local/bin/llvm-strip
-          # Verify
-          clang --version
-          clang++ --version
+          clang-18 --version
+          ld.lld-18 --version
 
       - name: Clone Bun source
         env:
-          BUN_VERSION: ${{ github.event.inputs.version || '1.3.14' }}
+          BUN_VERSION: ${{ github.event.inputs.version || '1.4.0' }}
         run: |
           echo "=== Cloning Bun v$BUN_VERSION ==="
           git clone --depth 1 --branch "bun-v$BUN_VERSION" \
@@ -84,144 +81,54 @@ jobs:
           git submodule update --init --recursive --depth 1
           echo "Source size: $(du -sh . | cut -f1)"
 
-      - name: Apply Android/Termux patches (source + build, with strict verification)
+      - name: Apply Android/Termux patches (strictly verified)
         run: |
-          echo "=== Applying patches (hybrid: source + shim) ==="
+          echo "=== Applying patches ==="
           chmod +x scripts/apply-android-patches.sh
-          bash scripts/apply-android-patches.sh /tmp/bun-src
-          # The script itself verifies all patches and exits non-zero on failure.
-          echo ""
-          echo "=== Verify source patches are applied (required for resolver walk) ==="
-          # Source patches ARE needed because Bun's resolver uses raw syscalls
-          # (Zig inline asm) that LD_PRELOAD cannot intercept. The shim handles
-          # libc calls (linkat, fopen, etc.) but NOT the resolver's openat.
-          PATCH_OK=true
-          if grep -q "ANDROID_TERMUX_FIX" /tmp/bun-src/src/resolver/resolver.zig; then
-            echo "  [OK] resolver.zig patched (AccessDenied continue + cache fix)"
-          else
-            echo "  [FAIL] resolver.zig NOT patched — bunx will crash!"
-            PATCH_OK=false
-          fi
-          if grep -q "ANDROID_TERMUX_FIX" /tmp/bun-src/src/cli/run_command.zig; then
-            echo "  [OK] run_command.zig patched (CouldntReadCurrentDirectory fallback)"
-          else
-            echo "  [FAIL] run_command.zig NOT patched"
-            PATCH_OK=false
-          fi
-          if grep -q "ANDROID_TERMUX_FIX" /tmp/bun-src/src/exe_format/elf.zig; then
-            echo "  [OK] elf.zig patched (bun build --compile fix — last PT_LOAD + overlap check)"
-          else
-            echo "  [FAIL] elf.zig NOT patched — bun build --compile will produce broken binaries"
-            PATCH_OK=false
-          fi
-          if grep -q "ANDROID_TERMUX_FIX" /tmp/bun-src/scripts/build/config.ts; then
-            echo "  [OK] config.ts patched (TinyCC enabled for Android — bun:ffi callback support)"
-          else
-            echo "  [FAIL] config.ts NOT patched — bun:ffi callback() will be disabled"
-            PATCH_OK=false
-          fi
-          if grep -q "ANDROID_TERMUX_FIX" /tmp/bun-src/scripts/build/deps/tinycc.ts; then
-            echo "  [OK] tinycc.ts patched (Android/Bionic defines added)"
-          else
-            echo "  [FAIL] tinycc.ts NOT patched — TinyCC won't build correctly for Android"
-            PATCH_OK=false
-          fi
-          if grep -q "ANDROID_TERMUX_FIX" /tmp/bun-src/src/runtime/ffi/ffi.zig; then
-            echo "  [OK] ffi.zig patched (Android library + include paths for TinyCC)"
-          else
-            echo "  [FAIL] ffi.zig NOT patched — cc()/JSCallback will fail with 'library c not found'"
-            PATCH_OK=false
-          fi
-          if grep -q "ANDROID_TERMUX_FIX_HEAP_TAGGING" /tmp/bun-src/src/main.zig; then
-            echo "  [OK] main.zig patched (mallopt disables scudo heap tagging at startup)"
-          else
-            echo "  [FAIL] main.zig NOT patched — FFI will crash with SIGABRT on tagged free()"
-            PATCH_OK=false
-          fi
-          # Verify root_path is ORIGINAL (path[0..1]) — ancestor walking preserved!
-          ROOT_BLOCK=$(grep -A5 "const root_path" /tmp/bun-src/src/resolver/resolver.zig)
-          if echo "$ROOT_BLOCK" | grep -q "path\[0\.\.1\]"; then
-            echo "  [OK] root_path = path[0..1] (ORIGINAL) — ancestor walking preserved (monorepo support!)"
-          else
-            echo "  [FAIL] root_path was changed — should be original path[0..1] for ancestor walking"
-            PATCH_OK=false
-          fi
-          # Verify Layer 1a (AccessDenied => continue) is present
-          if grep -q "error.AccessDenied => {" /tmp/bun-src/src/resolver/resolver.zig; then
-            echo "  [OK] Layer 1a present (AccessDenied => continue in processing loop)"
-          else
-            echo "  [FAIL] Layer 1a missing — EACCES will abort the walk"
-            PATCH_OK=false
-          fi
-          # Verify Layer 1b (cache .err AccessDenied fix) is present
-          if grep -q "err.canonical_error != error.AccessDenied" /tmp/bun-src/src/resolver/resolver.zig; then
-            echo "  [OK] Layer 1b present (cache .err doesn't return AccessDenied)"
-          else
-            echo "  [FAIL] Layer 1b missing — cached EACCES will propagate on subsequent walks"
-            PATCH_OK=false
-          fi
-          if [ "$PATCH_OK" != "true" ]; then
-            echo ""
-            echo "  [FATAL] Source patch verification failed — bunx will crash."
-            exit 1
-          fi
-          echo ""
-          echo "  [SUCCESS] Source patches verified — bunx will work!"
-          echo ""
-          echo "=== Show patched root_path block ==="
-          grep -A5 "const root_path" /tmp/bun-src/src/resolver/resolver.zig
+          BUN_SRC=/tmp/bun-src bash scripts/apply-android-patches.sh
+          # The script verifies every patch landed (marker counts) and
+          # exits non-zero on any failure, so reaching here means all 7
+          # patches applied:
+          #   P1 config.ts       — TinyCC enabled on Android
+          #   P2 deps/tinycc.ts  — CONFIG_SELINUX + tccrun/arm64-link patches
+          #   P3 tools.ts        — LLVM 18 accepted (NDK r27c / Ubuntu clang)
+          #   P4 src/sys/lib.rs  — lchmod without trapped fchmodat2
+          #   P5 linux_syscall.rs— openat2 -> openat (seccomp TRAP bypass)
+          #   P6 posix_spawn.rs  — shebang remap to $PREFIX/bin
+          #   P7 ffi_body.rs     — TinyCC finds Bionic libc + Termux headers
 
       - name: Install Bun for bootstrapping
         env:
-          BUN_VERSION: ${{ github.event.inputs.version || '1.3.14' }}
+          BUN_VERSION: ${{ github.event.inputs.version || '1.4.0' }}
         run: |
           # Bun's build system requires Bun itself for code generation
           echo "=== Installing Bun $BUN_VERSION for bootstrapping ==="
           curl -fsSL https://bun.sh/install | bash
           echo "$HOME/.bun/bin" >> $GITHUB_PATH
 
-      - name: Setup Zig (Bun manages this automatically)
-        run: |
-          # Bun's build script downloads Zig automatically
-          # Just verify it will work
-          echo "Zig will be installed by Bun's build system"
-
       - name: Build Bun for aarch64-linux-android (native Bionic binary)
         env:
           ANDROID_NDK_ROOT: ${{ steps.setup_ndk.outputs.ndk-path }}
-          ANDROID_NDK_HOME: ${{ steps.setup_ndk.outputs.ndk-path }}
           CCACHE_DIR: /tmp/ccache
-          LDFLAGS: "-L${{ steps.setup_ndk.outputs.ndk-path }}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/aarch64-linux-android/28"
         run: |
           mkdir -p /tmp/ccache
           cd /tmp/bun-src
           echo "=== Building Bun for aarch64-linux-android ==="
           echo "NDK: $ANDROID_NDK_ROOT"
           echo "Bun: $(bun --version)"
+          rustup show && rustup target list --installed
           echo "Start: $(date)"
 
-          BUILD_DIR="build/release"
-
-          # Run build and save FULL output (not just tail -100)
-          # so we can see TinyCC compilation and Zig flags
-          bun scripts/build.ts \
-            --profile=release \
-            --abi=android \
-            --arch=aarch64 \
-            --build-dir="$BUILD_DIR" > /tmp/build-output.log 2>&1 || true
+          # Upstream profile: os=linux arch=aarch64 abi=android webkit=prebuilt,
+          # buildType=Release. Sanitizers forced off for android by config.ts.
+          # The build wires CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER,
+          # --target/--sysroot and NDK runtime -L paths itself.
+          bun scripts/build.ts --profile=android-release > /tmp/build-output.log 2>&1 || true
 
           echo "End: $(date)"
           echo ""
           echo "=== Build output (last 200 lines) ==="
           tail -200 /tmp/build-output.log
-          echo ""
-          echo "=== Checking for TinyCC in build output ==="
-          if grep -i "tinycc\|libtcc\|enable_tinycc" /tmp/build-output.log; then
-            echo "[OK] TinyCC was found in build output"
-          else
-            echo "[WARN] TinyCC NOT found in build output — checking if enable_tinycc=true was passed"
-            grep "enable_tinycc" /tmp/build-output.log || echo "[FAIL] enable_tinycc flag not found in build output"
-          fi
           echo ""
           echo "=== Checking for built binary ==="
           find build -name "bun*" -type f 2>/dev/null | head -10
@@ -231,24 +138,21 @@ jobs:
           if [ -z "$BUN_BIN" ]; then
             BUN_BIN=$(find build -name "bun" -type f 2>/dev/null | head -1)
           fi
-          if [ -n "$BUN_BIN" ]; then
-            cp "$BUN_BIN" /tmp/bun-patched
-            echo "Binary copied to /tmp/bun-patched"
+          if [ -z "$BUN_BIN" ]; then
+            echo "[FATAL] no bun binary produced — see log above"
+            exit 1
           fi
+          cp "$BUN_BIN" /tmp/bun-patched
+          echo "Binary copied to /tmp/bun-patched"
 
       - name: Find and verify the built binary
         env:
           ANDROID_NDK_HOME: ${{ steps.setup_ndk.outputs.ndk-path }}
         run: |
           echo "=== Looking for built binary ==="
-          if [ -f /tmp/bun-patched ]; then
-            echo "Binary already copied from build step"
-          else
-            find /tmp/bun-src/build -name "bun*" -type f 2>/dev/null | head -10
+          if [ ! -f /tmp/bun-patched ]; then
             BUN_BIN=$(find /tmp/bun-src/build -name "bun-profile" -type f 2>/dev/null | head -1)
-            if [ -z "$BUN_BIN" ]; then
-              BUN_BIN=$(find /tmp/bun-src/build -name "bun" -type f 2>/dev/null | head -1)
-            fi
+            [ -z "$BUN_BIN" ] && BUN_BIN=$(find /tmp/bun-src/build -name "bun" -type f 2>/dev/null | head -1)
             if [ -z "$BUN_BIN" ]; then
               echo "ERROR: Bun binary not found"
               exit 1
@@ -273,8 +177,9 @@ jobs:
             echo "[OK] TinyCC symbols found in binary ($TCC_COUNT matches)"
             strings /tmp/bun-patched | grep -i "tcc\|tinycc\|libtcc" | head -5
           else
-            echo "[FAIL] No TinyCC symbols in binary — enable_tinycc was false at build time"
+            echo "[FAIL] No TinyCC symbols in binary — tinycc was false at build time"
             echo "  This means callback() and linkSymbols(cc:true) will not work"
+            exit 1
           fi
 
       - name: Verify the binary is Android-native
@@ -284,6 +189,12 @@ jobs:
           if ! file /tmp/bun-patched | grep -q "aarch64"; then
             echo "ERROR: Binary is not aarch64"
             exit 1
+          fi
+          if file /tmp/bun-patched | grep -q "interpreter /system/bin/linker64"; then
+            echo "[OK] Bionic interpreter present"
+          else
+            echo "[WARN] linker64 interpreter string missing — verify manually:"
+            file /tmp/bun-patched
           fi
           echo "=== Binary verification passed ==="
           echo "Native Android (Bionic) binary — runs on Termux via /system/bin/linker64"
@@ -313,38 +224,9 @@ jobs:
           name: bun-patched-binary
           path: runtime/
 
-      - name: Download shim (from latest build-shim run)
-        uses: actions/download-artifact@v4
-        with:
-          name: bun-android-shim
-          path: dist/
-        continue-on-error: true
-
-      - name: Install Android NDK (for shim build if needed)
-        uses: nttld/setup-ndk@v1
-        id: setup_ndk
-        with:
-          ndk-version: r27c
-
-      - name: Build shim if not downloaded
+      - name: Build DEB package (no proot, no shim!)
         env:
-          ANDROID_NDK_HOME: ${{ steps.setup_ndk.outputs.ndk-path }}
-        run: |
-          if [ ! -f dist/libbun-android-fix.so ]; then
-            echo "Shim not found, building it..."
-            NDK_TOOLCHAIN="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
-            CC="$NDK_TOOLCHAIN/bin/aarch64-linux-android29-clang"
-            mkdir -p dist
-            "$CC" -shared -fPIC -O2 -Wall -Wextra -Wno-nonnull-compare \
-              -o dist/libbun-android-fix.so \
-              src/libbun-android-fix.c \
-              -ldl
-            file dist/libbun-android-fix.so
-          fi
-
-      - name: Build DEB package (no proot needed!)
-        env:
-          VERSION: ${{ github.event.inputs.version || '1.3.14' }}
+          VERSION: ${{ github.event.inputs.version || '1.4.0' }}
           ARCH: aarch64
         run: |
           set -e
@@ -354,28 +236,18 @@ jobs:
           TMPUSR="$ROOT/data/data/com.termux/files/usr"
           mkdir -p "$ROOT/DEBIAN" "$TMPUSR/bin" "$TMPUSR/lib/bun-termux"
 
-          # Install the PATCHED Bun binary
+          # Install the PATCHED Bun binary — fully source-level fixes,
+          # no LD_PRELOAD shim, no termux-exec dependency.
           install -m755 runtime/bun-patched "$TMPUSR/lib/bun-termux/bun"
 
-          # Install the LD_PRELOAD shim (still useful for installer hardlinks)
-          if [ -f dist/libbun-android-fix.so ]; then
-            install -m755 dist/libbun-android-fix.so "$TMPUSR/lib/bun-termux/libbun-android-fix.so"
-          fi
-
           # Launcher scripts — install the shared launcher-bun.sh and
-          # launcher-bunx.sh from scripts/. These load the LD_PRELOAD
-          # shim and exec the patched binary.
+          # launcher-bunx.sh from scripts/. These exec the patched binary.
           #
           # CRITICAL: launcher-bunx.sh uses `exec -a "bunx"` to set
-          # argv[0]="bunx" so Bun's isBunX() detection (src/cli/cli.zig)
-          # routes to BunxCommand. Without a bunx launcher, `bunx`
-          # would either be missing or fall through to the official
-          # unpatched ~/.bun/bin/bunx (if installed via curl bun.sh).
-          #
-          # The source-level patches handle the directory walk EACCES:
-          #   1. resolver.zig: root_path = path (cwd) — prevents ancestor walk
-          #   2. resolver.zig: AccessDenied → continue (not return null)
-          #   3. run_command.zig: readDirInfo null fallback — synthesize DirInfo
+          # argv[0]="bunx" so Bun's isBunX() detection routes to
+          # BunxCommand. Without a bunx launcher, `bunx` would either be
+          # missing or fall through to the official unpatched ~/.bun/bin/bunx
+          # (if installed via curl bun.sh).
           install -m755 scripts/launcher-bun.sh  "$TMPUSR/bin/bun"
           install -m755 scripts/launcher-bunx.sh "$TMPUSR/bin/bunx"
 
@@ -400,13 +272,13 @@ jobs:
           Maintainer: bd-loser
           Section: utils
           Priority: optional
-          Description: Android-native Bun runtime (hybrid patches for Termux, bunx FIXED)
-           Bun v$VERSION with source patches (resolver.zig, run_command.zig) for
-           the directory walk + LD_PRELOAD shim for libc calls. No proot, no root.
+          Description: Android-native Bun runtime (source-level patches for Termux)
+           Bun v$VERSION rebuilt from source with 7 source-level patches for
+           Android/Bionic. No proot, no root, no LD_PRELOAD shim.
            Works natively on Termux — including bunx.
-           Source: root_path=cwd, AccessDenied=continue, DirInfo fallback.
-           Shim: linkat copy-on-EACCES, fopen DNS redirect, /tmp translate,
-           execve shebang, /proc/stat fake.
+           Fixes: TinyCC enabled (SELinux-safe JIT), fchmodat2/openat2 seccomp
+           traps bypassed at compile time, shebang remap to \$PREFIX/bin,
+           bun:ffi finds Bionic libc + Termux headers.
           Depends: bash, ncurses, curl
           EOF
           echo "Installed-Size: $(du -sk "$ROOT" | cut -f1)" >> "$ROOT/DEBIAN/control"
@@ -449,8 +321,14 @@ jobs:
             cat "$BUNX_CONTENT"
             exit 1
           fi
+          # Shim must be gone
+          if [ -e "/tmp/deb-check/data/data/com.termux/files/usr/lib/bun-termux/libbun-android-fix.so" ]; then
+            echo "FATAL: LD_PRELOAD shim still packaged — should be removed for 1.4"
+            exit 1
+          fi
           echo "[OK] bun launcher present"
           echo "[OK] bunx launcher present and uses 'exec -a \"bunx\"'"
+          echo "[OK] no shim in package"
           rm -rf /tmp/deb-check
 
       - name: Upload DEB artifact
@@ -478,71 +356,44 @@ jobs:
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ github.event.inputs.version || '1.3.14' }}-patched
-          name: Bun for Termux v${{ github.event.inputs.version || '1.3.14' }} (Source-Patched)
+          tag_name: v${{ github.event.inputs.version || '1.4.0' }}-patched
+          name: Bun for Termux v${{ github.event.inputs.version || '1.4.0' }} (Source-Patched)
           files: dist/*
           generate_release_notes: true
           body: |
-            # Bun for Termux v${{ github.event.inputs.version || '1.3.14' }} — Hybrid (bunx FIXED, monorepo support!)
+            # Bun for Termux v${{ github.event.inputs.version || '1.4.0' }} — Source-level patches only
 
-            This is Bun built from source with **source patches + LD_PRELOAD shim**.
-            **No proot, no root required.** Works natively on Termux — including `bunx`.
-            **Monorepo support works!** (ancestor walking preserved)
+            Bun built from source with **7 source-level patches**. **No proot, no root,
+            no LD_PRELOAD shim, no termux-exec.** Works natively on Termux — including `bunx`.
 
-            ## Architecture: hybrid (source patches + shim)
+            ## Architecture: source-level only (Bun 1.4, Rust)
 
-            Two complementary fix layers are needed because Bun uses two different
-            syscall paths:
+            Every fix is compiled into the binary via `#[cfg(target_os = "android")]`
+            branches or build-config changes. See `scripts/apply-android-patches.sh`.
 
-            **1. Source patches (for the resolver walk)**
-            Bun's directory resolver uses `std.fs.openDirAbsoluteZ` → Zig's
-            `std.os.linux.openat` — a **raw syscall** (inline asm, NOT libc).
-            LD_PRELOAD shims can ONLY intercept libc function calls, not raw syscalls.
-            Therefore source patches are required:
+            **Build system**
+            - `config.ts`: TinyCC enabled on Android (upstream disables it)
+            - `deps/tinycc.ts`: our TinyCC patches (memfd W+X mapping for SELinux,
+              arm64 long-call veneers) + `CONFIG_SELINUX=1`
+            - `tools.ts`: accept LLVM/clang 18 (NDK r27c / Ubuntu)
 
-            - `resolver.zig Layer 1a`: `AccessDenied => continue` instead of `return null`
-              in the processing loop — skips inaccessible ancestors (/, /data) while
-              still processing accessible ones. **Ancestor walking is PRESERVED**
-              (monorepo support works!)
-            - `resolver.zig Layer 1b`: DirEntry cache `.err` branch doesn't return
-              `AccessDenied` — prevents cached EACCES on "/" from propagating on
-              subsequent walks, bypassing Layer 1a
-            - `run_command.zig Layer 2`: synthesize minimal `DirInfo` when `readDirInfo`
-              returns null — final fallback to prevent `CouldntReadCurrentDirectory`
+            **Syscalls Android's seccomp profile traps (SIGSYS, not ENOSYS):**
+            - `src/sys/lib.rs`: `lchmod` uses `fchmodat(AT_SYMLINK_NOFOLLOW)`
+              instead of the trapped `fchmodat2(452)` — unblocks `bun install`
+            - `src/sys/linux_syscall.rs`: resolver walks use `openat` instead of
+              the trapped `openat2(437)`
 
-            **2. LD_PRELOAD shim (for libc calls)**
-            `libbun-android-fix.so` intercepts libc-level calls that the source patches
-            can't reach:
-
-            - `linkat`/`symlinkat`/`renameat` copy-on-EACCES → fixes `bun install`
-            - `fopen` redirect `/etc/resolv.conf` → `$PREFIX/etc/` → fixes DNS
-            - `mkdir`/`symlink` translate `/tmp` → `$TMPDIR` → fixes `bun --bun`
-            - `execve` shebang translation `/usr/bin/` → `$PREFIX/bin/`
-            - `/proc/stat` faking via `memfd_create` → fixes `os.cpus()`
-
-            **3. `bunx` launcher (packaging)**
-            Uses `exec -a "bunx"` to set `argv[0]="bunx"` so Bun's `isBunX()` detection
-            routes to `BunxCommand.exec()`.
-
-            ## What changed from previous versions
-
-            Previous versions had `Layer 1a: root_path = path` which prevented ancestor
-            walking entirely (breaking monorepo support). This has been REPLACED with
-            a two-part fix that preserves ancestor walking:
-
-            - NEW Layer 1a: `AccessDenied => continue` (skips inaccessible ancestors)
-            - NEW Layer 1b: cache `.err` branch doesn't return AccessDenied (cache fix)
-
-            Together, these handle EACCES at both the processing and queueing phases,
-            allowing the walk to complete naturally while skipping inaccessible dirs.
+            **Spawn & FFI**
+            - `posix_spawn.rs`: scripts whose shebang names a missing interpreter
+              (`#!/usr/bin/env node`) are remapped to `$PREFIX/bin/<interp>` with
+              argv rebuilt `[interp, script, ...]` — replaces termux-exec
+            - `ffi_body.rs`: TinyCC finds Bionic libc (`/system/lib64`) and
+              Termux headers/libs (`$PREFIX/include`, `$PREFIX/lib`)
 
             ## Installation
 
             ```bash
-            dpkg -i bun_${{ github.event.inputs.version || '1.3.14' }}-patched_aarch64.deb
-
-            # If network issues (ConnectionRefused):
-            bun-fix-network
+            dpkg -i bun_${{ github.event.inputs.version || '1.4.0' }}-patched_aarch64.deb
 
             # Everything works natively — including bunx!
             bun install
@@ -554,7 +405,8 @@ jobs:
 
             ## Build details
 
-            - Built from `oven-sh/bun` tag `bun-v${{ github.event.inputs.version || '1.3.14' }}`
+            - Built from `oven-sh/bun` tag `bun-v${{ github.event.inputs.version || '1.4.0' }}`
             - Patches applied: see `scripts/apply-android-patches.sh`
-            - Cross-compiled with NDK r27c for `aarch64-unknown-linux-android28`
-            - Build time: ~30-60 minutes in CI
+            - Upstream `android-release` profile (aarch64-linux-android),
+              host clang-18 + NDK r27c bionic sysroot
+            - Build time: ~60-120 minutes in CI
