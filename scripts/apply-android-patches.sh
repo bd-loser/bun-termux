@@ -140,11 +140,24 @@ elif [ -f "$TINYCC_TS" ]; then
     echo "[SKIP 2] $TINYCC_TS already patched"
 fi
 
-# Sanity: the two TinyCC patch files must ship with the repo.
-for tpf in patches/tinycc/tccrun.c.patch patches/tinycc/arm64-link.c.patch; do
-    if [ ! -f "$REPO_DIR/$tpf" ]; then
-        echo "  [FAIL] missing required file in bun-termux repo: $tpf"
+# Ship the TinyCC patch files into the bun source tree.
+# tinycc.ts's `patches:` array resolves paths against cfg.cwd (the bun
+# checkout), and ninja's dep_fetch rule applies them when extracting the
+# vendored tinycc tarball — so the files must physically exist there.
+for tpf in tccrun.c.patch arm64-link.c.patch; do
+    SRC="$REPO_DIR/patches/tinycc/$tpf"
+    DST="$BUN_SRC/patches/tinycc/$tpf"
+    if [ ! -f "$SRC" ]; then
+        echo "  [FAIL] missing required file in bun-termux repo: patches/tinycc/$tpf"
         TOTAL_FAIL=$((TOTAL_FAIL + 1))
+        continue
+    fi
+    mkdir -p "$BUN_SRC/patches/tinycc"
+    if cmp -s "$SRC" "$DST" 2>/dev/null; then
+        echo "  [OK]   patches/tinycc/$tpf already current in bun tree"
+    else
+        cp "$SRC" "$DST"
+        echo "  [OK]   copied patches/tinycc/$tpf into bun tree"
     fi
 done
 
