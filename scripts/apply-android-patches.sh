@@ -234,6 +234,44 @@ elif [ -f "$FLAGS_TS" ]; then
 fi
 
 # =============================================================================
+# PATCH 3c: C++ dangling-reference fix for clang 18
+# =============================================================================
+# BunTestModule.h binds a range-for directly over a temporary's member
+# (properties.releaseData()->propertyNameVector()). Upstream builds with
+# clang 21 where -Wdangling tolerates this; host clang 18 errors under
+# -Werror (-Wdangling). Hoist the owner to a local first.
+echo "[PATCH 3c] src/** — hoist releaseData() temporary out of range-for"
+py_patch <<'PYEOF'
+import pathlib
+import re
+
+pat = re.compile(
+    r"for \(auto& (\w+) : properties\.releaseData\(\)->propertyNameVector\(\)\)"
+)
+
+patched = 0
+for p in pathlib.Path("src").rglob("*"):
+    if p.suffix not in (".cpp", ".h", ".mm") or not p.is_file():
+        continue
+    t = p.read_text()
+    if "properties.releaseData()->propertyNameVector()" not in t:
+        continue
+    new = pat.sub(
+        lambda m: (
+            "auto _termux_release_data = properties.releaseData(); "
+            f"for (auto& {m.group(1)} : _termux_release_data->propertyNameVector())"
+            " /* ANDROID_TERMUX_FIX_DANGLING */"
+        ),
+        t,
+    )
+    p.write_text(new)
+    patched += 1
+
+assert patched >= 1, "no dangling-reference sites found — upstream changed?"
+print(f"  patched {patched} file(s) with dangling-reference fix")
+PYEOF
+
+# =============================================================================
 # PATCH 4: src/sys/lib.rs — lchmod without fchmodat2
 # =============================================================================
 # Upstream implements lchmod via the fchmodat2(452) syscall with a runtime
