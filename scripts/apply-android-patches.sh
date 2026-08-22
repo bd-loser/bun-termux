@@ -199,6 +199,41 @@ elif [ -f "$TOOLS_TS" ]; then
 fi
 
 # =============================================================================
+# PATCH 3b: scripts/build/flags.ts — drop clang-19+ warning flag
+# =============================================================================
+# Upstream suppresses -Wcharacter-conversion, a diagnostic added in clang
+# 19. Host clang 18 treats the unknown -Wno- option as an error under
+# -Werror=-Wunknown-warning-option and the PCH step dies.
+FLAGS_TS="scripts/build/flags.ts"
+if [ -f "$FLAGS_TS" ] && ! grep -q "ANDROID_TERMUX_FIX_NO_CHARCONV" "$FLAGS_TS"; then
+    echo "[PATCH 3b] $FLAGS_TS — remove -Wno-character-conversion"
+    py_patch <<'PYEOF'
+import pathlib
+
+p = pathlib.Path("scripts/build/flags.ts")
+c = p.read_text()
+
+old = """      "-Wno-nullability-completeness",
+      "-Wno-character-conversion",
+      "-Werror","""
+new = """      "-Wno-nullability-completeness",
+      // ANDROID_TERMUX_FIX_NO_CHARCONV: clang 18 doesn't know
+      // -Wcharacter-conversion (added in clang 19); under -Werror the
+      // unknown -Wno- form kills the build.
+      "-Werror","""
+
+assert c.count(old) == 1, "flags.ts anchor not found (or ambiguous): unix Werror block"
+c = c.replace(old, new, 1)
+
+p.write_text(c)
+print("  removed clang-19-only flag from unix block")
+PYEOF
+    verify_patch "$FLAGS_TS"
+elif [ -f "$FLAGS_TS" ]; then
+    echo "[SKIP 3b] $FLAGS_TS already patched"
+fi
+
+# =============================================================================
 # PATCH 4: src/sys/lib.rs — lchmod without fchmodat2
 # =============================================================================
 # Upstream implements lchmod via the fchmodat2(452) syscall with a runtime
