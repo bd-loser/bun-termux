@@ -149,15 +149,15 @@ for tpf in patches/tinycc/tccrun.c.patch patches/tinycc/arm64-link.c.patch; do
 done
 
 # =============================================================================
-# PATCH 3: scripts/build/tools.ts — accept NDK clang (LLVM 18)
+# PATCH 3: scripts/build/tools.ts — accept NDK-era clang (LLVM 18)
 # =============================================================================
-# CI runners get LLVM from apt (llvm.org script pins whatever we ask for),
-# but the C++ side must compile with the NDK's clang for Bionic. NDK r27c
-# ships clang 18.0.2; upstream hard-requires 21.x. Relax the discovery
-# constants so the NDK toolchain satisfies the check.
+# Bun's C/C++ deps are cross-built by the HOST clang driving --target against
+# the NDK sysroot, so discovery must accept whatever clang the runner ships.
+# ubuntu-latest provides clang 18.1.x; upstream hard-requires 21.1.x. Relax
+# the pinned version and widen the acceptance range to the whole 18 major.
 TOOLS_TS="scripts/build/tools.ts"
 if [ -f "$TOOLS_TS" ] && ! grep -q "$PATCH_MARKER" "$TOOLS_TS"; then
-    echo "[PATCH 3] $TOOLS_TS — accept NDK clang 18"
+    echo "[PATCH 3] $TOOLS_TS — accept host clang 18.x"
     py_patch <<'PYEOF'
 import pathlib
 
@@ -166,18 +166,19 @@ c = p.read_text()
 
 subs = [
     ('export const LLVM_VERSION = "21.1.8";',
-     'export const LLVM_VERSION = "18.0.2"; // ANDROID_TERMUX_FIX: NDK r27c'),
+     'export const LLVM_VERSION = "18.1.3"; // ANDROID_TERMUX_FIX: host clang'),
     ('const LLVM_MAJOR = "21";',
      'const LLVM_MAJOR = "18"; // ANDROID_TERMUX_FIX'),
-    ('const LLVM_MINOR = "1";',
-     'const LLVM_MINOR = "0"; // ANDROID_TERMUX_FIX'),
+    ('const LLVM_VERSION_RANGE = `>=${LLVM_MAJOR}.${LLVM_MINOR}.0 <${LLVM_MAJOR}.${LLVM_MINOR}.99`;',
+     '// ANDROID_TERMUX_FIX: accept any 18.x — distros ship varying minors\n'
+     'const LLVM_VERSION_RANGE = `>=${LLVM_MAJOR}.0.0 <${Number(LLVM_MAJOR) + 1}.0.0`;'),
 ]
 for old, new in subs:
     assert c.count(old) == 1, f"tools.ts anchor not found (or ambiguous): {old}"
     c = c.replace(old, new, 1)
 
 p.write_text(c)
-print("  relaxed LLVM version to 18.0.x (NDK)")
+print("  relaxed LLVM requirement to any 18.x")
 PYEOF
     verify_patch "$TOOLS_TS"
 elif [ -f "$TOOLS_TS" ]; then
