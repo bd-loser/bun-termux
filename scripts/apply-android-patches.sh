@@ -215,6 +215,55 @@ for tpf in tccrun.c.patch arm64-link.c.patch; do
 done
 
 # =============================================================================
+# PATCH 2b: scripts/build/fetch-cli.ts — dep patches apply inside git repos
+# =============================================================================
+# Upstream's applyPatch() runs `git apply --no-index -` with cwd=vendor/<dep>.
+# Documented git behavior: when the destination lives INSIDE a repository
+# (the bun checkout always is), git apply resolves the patch's target paths
+# relative to the REPO ROOT, not cwd. Result: git apply writes stray files at
+# the checkout root, exits 0, fetch stamps .ref, and vendor/tinycc stays
+# pristine — every dep patch silently no-ops. GNU patch with -d <dir> is
+# always dir-relative, so use it instead.
+FETCH_TS="scripts/build/fetch-cli.ts"
+if [ -f "$FETCH_TS" ] && ! grep -q "ANDROID_TERMUX_FIX_APPLY_PATCH" "$FETCH_TS"; then
+    echo "[PATCH 2b] $FETCH_TS — applyPatch: git apply -> patch -p1 -d"
+    py_patch <<'PYEOF'
+import pathlib
+
+p = pathlib.Path("scripts/build/fetch-cli.ts")
+c = p.read_text()
+
+old = '''  const result = spawnSync("git", ["apply", "--ignore-whitespace", "--ignore-space-change", "--no-index", "-"], {
+    cwd: dest,
+    input: normalizeLf(patchBody),
+    stdio: ["pipe", "ignore", "pipe"],
+    encoding: "utf8",
+  });'''
+
+new = '''  // ANDROID_TERMUX_FIX_APPLY_PATCH: `git apply --no-index` resolves paths
+  // against the enclosing repo root when dest is inside one, silently
+  // applying nothing while exiting 0. GNU patch with -d is dir-relative.
+  const result = spawnSync(
+    "patch",
+    ["-p1", "--forward", "--no-backup-if-mismatch", "--silent", "-d", dest],
+    {
+      input: normalizeLf(patchBody),
+      stdio: ["pipe", "ignore", "pipe"],
+      encoding: "utf8",
+    },
+  );'''
+
+assert c.count(old) == 1, "fetch-cli.ts anchor not found (or ambiguous): applyPatch spawnSync"
+c = c.replace(old, new, 1)
+p.write_text(c)
+print("  applyPatch now uses patch(1); repo-root escape closed")
+PYEOF
+    verify_patch "$FETCH_TS"
+elif [ -f "$FETCH_TS" ]; then
+    echo "[SKIP 2b] $FETCH_TS already patched"
+fi
+
+# =============================================================================
 # PATCH 3: scripts/build/tools.ts — accept NDK-era clang (LLVM 18)
 # =============================================================================
 # Bun's C/C++ deps are cross-built by the HOST clang driving --target against
