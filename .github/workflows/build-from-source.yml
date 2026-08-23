@@ -58,6 +58,32 @@ jobs:
           ndk-version: r27c
           add-to-path: true
 
+      # Bun's configure tries to link the NDK's compiler-rt builtins +
+      # libunwind into the HOST clang's resource dir so cross links can find
+      # them (scripts/build/config.ts linkNdkRuntimesIntoClang). It warns
+      # and continues on EACCES because that dir is root-owned; do it here
+      # with sudo instead, or the final link dies on
+      # libclang_rt.builtins-aarch64-android.a not found.
+      - name: Link NDK compiler-rt into host clang resource dir
+        env:
+          NDK_ROOT: ${{ steps.setup_ndk.outputs.ndk-path }}
+        run: |
+          set -e
+          RES="$(clang-18 -print-resource-dir)"
+          echo "host clang resource dir: $RES"
+          NDKLIB="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/lib/clang"
+          NDKVER="$(command ls "$NDKLIB")"
+          echo "NDK clang version dir: $NDKVER"
+          SRC="$NDKLIB/$NDKVER/lib/linux"
+          test -f "$SRC/libclang_rt.builtins-aarch64-android.a"
+          test -f "$SRC/aarch64/libunwind.a"
+          sudo mkdir -p "$RES/lib/aarch64-unknown-linux-android28" "$RES/lib/linux/aarch64"
+          sudo ln -sf "$SRC/libclang_rt.builtins-aarch64-android.a" "$RES/lib/aarch64-unknown-linux-android28/libclang_rt.builtins.a"
+          sudo ln -sf "$SRC/aarch64/libunwind.a"                  "$RES/lib/aarch64-unknown-linux-android28/libunwind.a"
+          sudo ln -sf "$SRC/libclang_rt.builtins-aarch64-android.a" "$RES/lib/linux/libclang_rt.builtins-aarch64-android.a"
+          sudo ln -sf "$SRC/aarch64/libunwind.a"                    "$RES/lib/linux/aarch64/libunwind.a"
+          echo "[OK] NDK compiler-rt + libunwind linked into $RES"
+
       # NOTE: unlike the 1.3.x workflow we do NOT make NDK clang the host
       # compiler. Bun 1.4's build system cross-compiles Android with the
       # HOST clang driving --target/--sysroot against the NDK sysroot, and
