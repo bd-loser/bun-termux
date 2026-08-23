@@ -144,12 +144,36 @@ shared fd instead.
 
 ## Remaining before first 1.4 release
 
-- Run the workflow once (`workflow_dispatch` with version=1.4.0) and fix
-  whatever CI-only failures surface (expected: none in patching; possible
-  friction in cargo/NDK env details).
-- On-device smoke test of the produced binary: bun install / bunx cowsay /
-  cc() + JSCallback / shebang script spawn.
-- README still links to `docs/BUILD.md`, which doesn't exist (pre-existing).
+**DONE — v1.4.0-patched is built, released, and verified on-device.**
+
+CI shakeout (runs 1-9) surfaced and fixed, in order:
+1. Ubuntu clang is 18.1.3 — old range capped at <18.0.99. PATCH 3 now pins
+   18.1.x and widens the range to the whole major.
+2. ninja couldn't find our tinycc .patch files — they resolve against the
+   bun tree (cfg.cwd); script now copies them into $BUN_SRC/patches/tinycc.
+3. `-Wno-character-conversion` is clang-19+; under -Werror it killed the
+   PCH step on clang 18. Removed (PATCH 3b).
+4. `BunTestModule.h` range-for over a temporary: clang 18 -Wdangling errors
+   where clang 21 tolerates it. Hoisted the owner (PATCH 3c).
+5. Final link needed NDK compiler-rt/libunwind in the host clang resource
+   dir; configure's automatic link fails EACCES. Workflow sudo-links it.
+6. cc() reported "TinyCC is disabled": TWO more gates besides config.ts —
+   generated build_options.rs ENABLE_TINYCC const and tcc_sys/tcc.rs extern
+   cfg-stubs. Both un-gated (PATCH 1b).
+7. THE BIG ONE: dep patches never reached vendor/. Upstream fetch-cli's
+   applyPatch() runs `git apply --no-index -` with cwd=vendor/<dep>, which
+   sits inside the bun checkout — git resolves patch paths against the REPO
+   ROOT, so patches silently applied to nonexistent root files, exited 0,
+   and .ref got stamped over pristine sources. Fixed by switching
+   fetch-cli.ts to GNU `patch -p1 -d <dest>` (PATCH 2b).
+
+On-device verification (v1.4.0-patched, Android 12 aarch64):
+bun --version ✓ · os.cpus()=8 ✓ · fetch/DNS 200 ✓ · bun add cowsay ✓ ·
+bunx cowsay (shebang remap) ✓ · bun run bin-shim ✓ · dlopen libc ✓ ·
+JSCallback ✓ · bun build --compile + running PIE output ✓ ·
+**cc() int add → 5 ✓** · **C→JS round-trip via JSCallback ptr → 42 ✓**
+(the last two prove TinyCC memfd W^X works under SELinux and arm64 veneers
+trampoline correctly).
 
 ## Working-tree state at migration
 
