@@ -171,6 +171,21 @@ jobs:
           cp "$BUN_BIN" /tmp/bun-patched
           echo "Binary copied to /tmp/bun-patched"
 
+      - name: Diagnose TinyCC vendor state (why aren't our patches in the binary?)
+        if: always()
+        run: |
+          echo "=== .ref stamp ==="
+          cat /tmp/bun-src/vendor/tinycc/.ref 2>/dev/null || echo "no .ref"
+          echo ""
+          echo "=== patched region of vendored tccrun.c ==="
+          command sed -n '105,150p' /tmp/bun-src/vendor/tinycc/tccrun.c 2>/dev/null || echo "vendor/tinycc missing"
+          echo ""
+          echo "=== veneer present in vendored arm64-link.c? ==="
+          command grep -c "android_veneer" /tmp/bun-src/vendor/tinycc/arm64-link.c 2>/dev/null || true
+          echo ""
+          echo "=== compile edge for tccrun.c from build.ninja ==="
+          command grep -m1 -A6 "tccrun.c.o" /tmp/bun-src/build/release/build.ninja 2>/dev/null || echo "build.ninja not found"
+
       - name: Find and verify the built binary
         env:
           ANDROID_NDK_HOME: ${{ steps.setup_ndk.outputs.ndk-path }}
