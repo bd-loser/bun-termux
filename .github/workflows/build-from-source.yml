@@ -174,17 +174,26 @@ jobs:
       - name: Diagnose TinyCC vendor state (why aren't our patches in the binary?)
         if: always()
         run: |
-          echo "=== .ref stamp ==="
-          cat /tmp/bun-src/vendor/tinycc/.ref 2>/dev/null || echo "no .ref"
+          echo "=== dep_fetch rule ==="
+          command grep -B1 -A4 "^rule dep_fetch" /tmp/bun-src/build/release/build.ninja || true
           echo ""
-          echo "=== patched region of vendored tccrun.c ==="
-          command sed -n '105,150p' /tmp/bun-src/vendor/tinycc/tccrun.c 2>/dev/null || echo "vendor/tinycc missing"
+          echo "=== tinycc fetch edge ==="
+          command grep -A10 "^build vendor/tinycc/.ref" /tmp/bun-src/build/release/build.ninja || true
           echo ""
-          echo "=== veneer present in vendored arm64-link.c? ==="
-          command grep -c "android_veneer" /tmp/bun-src/vendor/tinycc/arm64-link.c 2>/dev/null || true
+          echo "=== re-run fetch-cli manually for tinycc ==="
+          cd /tmp/bun-src
+          TARBALLS="$(command find $HOME/.bun/build-cache -maxdepth 2 -type d -name tarballs 2>/dev/null | head -1)"
+          echo "tarball cache dir: $TARBALLS"
+          bun scripts/build/fetch-cli.ts dep tinycc oven-sh/tinycc \
+            05f0fafaa3be31e31d7b4b5c17dc60f62c991171 \
+            /tmp/bun-src/vendor/tinycc "$TARBALLS" \
+            /tmp/bun-src/patches/tinycc/tccrun.c.patch \
+            /tmp/bun-src/patches/tinycc/arm64-link.c.patch || true
+          command grep -c "__ANDROID__" /tmp/bun-src/vendor/tinycc/tccrun.c || true
+          command grep -c "android_veneer" /tmp/bun-src/vendor/tinycc/arm64-link.c || true
           echo ""
           echo "=== compile edge for tccrun.c from build.ninja ==="
-          command grep -m1 -A6 "tccrun.c.o" /tmp/bun-src/build/release/build.ninja 2>/dev/null || echo "build.ninja not found"
+          command grep -m1 -A6 "tccrun.c.o" /tmp/bun-src/build/release/build.ninja 2>/dev/null || true
 
       - name: Find and verify the built binary
         env:
