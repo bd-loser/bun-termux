@@ -94,6 +94,59 @@ elif [ -f "$CONFIG_TS" ]; then
 fi
 
 # =============================================================================
+# PATCH 1b: enable TinyCC at the Rust level
+# =============================================================================
+# config.ts alone isn't enough — two more gates hardcode "no TinyCC on
+# Android" and must agree (see src/tcc_sys/tcc.rs's own comment: "keep this
+# predicate in sync"):
+#
+#   1. scripts/build/buildOptionsRs.ts generates build_options.rs with
+#      ENABLE_TINYCC = !cfg!(any(target_os = "android", freebsd)) — the const
+#      ffi_body.rs checks before every cc()/JSCallback call.
+#   2. src/tcc_sys/tcc.rs cfg-gates the libtcc extern block out on android,
+#      replacing every symbol with an unreachable!() stub.
+GATE_TS="scripts/build/buildOptionsRs.ts"
+if [ -f "$GATE_TS" ] && ! grep -q "$PATCH_MARKER" "$GATE_TS"; then
+    echo "[PATCH 1b] $GATE_TS + src/tcc_sys/tcc.rs — un-gate TinyCC on Android"
+    py_patch <<'PYEOF'
+import pathlib
+
+p = pathlib.Path("scripts/build/buildOptionsRs.ts")
+c = p.read_text()
+
+old = '''    "pub const ENABLE_TINYCC: bool = !cfg!(any(",
+    `    target_os = "android",`,
+    `    target_os = "freebsd",`,
+    "));",'''
+new = '''    "pub const ENABLE_TINYCC: bool = !cfg!(any(",
+    // ANDROID_TERMUX_FIX_TINYCC_GATE: TinyCC IS built on Android here
+    // (config.ts gate flipped; see patches/tinycc/). Only FreeBSD stays out.
+    `    target_os = "freebsd",`,
+    "));",'''
+assert c.count(old) == 1, "buildOptionsRs.ts anchor not found (or ambiguous): ENABLE_TINYCC"
+c = c.replace(old, new, 1)
+p.write_text(c)
+
+p2 = pathlib.Path("src/tcc_sys/tcc.rs")
+c2 = p2.read_text()
+subs = [
+    ('#[cfg(not(any(target_os = "android", target_os = "freebsd")))]',
+     '#[cfg(not(target_os = "freebsd"))] // ANDROID_TERMUX_FIX_TINYCC_GATE'),
+    ('#[cfg(any(target_os = "android", target_os = "freebsd"))]',
+     '#[cfg(target_os = "freebsd")] // ANDROID_TERMUX_FIX_TINYCC_GATE'),
+]
+for old2, new2 in subs:
+    assert c2.count(old2) == 1, f"tcc_sys/tcc.rs anchor not found (or ambiguous): {old2}"
+    c2 = c2.replace(old2, new2, 1)
+p2.write_text(c2)
+print("  ENABLE_TINYCC now true on android; libtcc externs no longer stubbed")
+PYEOF
+    verify_patch "$GATE_TS"
+elif [ -f "$GATE_TS" ]; then
+    echo "[SKIP 1b] $GATE_TS already patched"
+fi
+
+# =============================================================================
 # PATCH 2: scripts/build/deps/tinycc.ts — Android defines + patch wiring
 # =============================================================================
 # 2a: wire our TinyCC source patches into the dependency's patches array.
@@ -241,6 +294,9 @@ fi
 # clang 21 where -Wdangling tolerates this; host clang 18 errors under
 # -Werror (-Wdangling). Hoist the owner to a local first.
 echo "[PATCH 3c] src/** — hoist releaseData() temporary out of range-for"
+if grep -rq "ANDROID_TERMUX_FIX_DANGLING" "$BUN_SRC/src" 2>/dev/null; then
+    echo "  [SKIP] already patched"
+else
 py_patch <<'PYEOF'
 import pathlib
 import re
@@ -270,6 +326,7 @@ for p in pathlib.Path("src").rglob("*"):
 assert patched >= 1, "no dangling-reference sites found — upstream changed?"
 print(f"  patched {patched} file(s) with dangling-reference fix")
 PYEOF
+fi
 
 # =============================================================================
 # PATCH 4: src/sys/lib.rs — lchmod without fchmodat2
