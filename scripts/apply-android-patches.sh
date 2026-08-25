@@ -1,29 +1,7 @@
 #!/usr/bin/env bash
-# =============================================================================
 # apply-android-patches.sh — Bun v1.4.x Android/Termux source patches
-#
-# Rewritten for the Rust rewrite (Bun 1.4). Replaces the Zig-era script.
-#
-# What changed vs the 1.3.14 script:
-#   - DROPPED (upstream fixed): resolver Layers 1a/1b, cli/run_command.zig,
-#     exe_format/elf.zig 4a-4e, StandaloneModuleGraph PIE handling.
-#   - DROPPED (obsolete): EncodingTables.h pragma, C++ dangling-ref perl hack,
-#     runtime/ffi/ffi.zig (file replaced by src/runtime/ffi/ffi_body.rs),
-#     main.zig mallopt, flags.ts -march rewrite (upstream now special-cases
-#     Android arm64 itself).
-#   - DROPPED (already correct in 1.4): c-bindings.cpp close_range — the Linux
-#     branch is already a raw syscall(__NR_close_range) compatible with bionic.
-#   - KEPT/PORTED: config.ts TinyCC enable, deps/tinycc.ts defines + patch
-#     wiring, tools.ts LLVM relaxation, NEW lchmod/openat2 seccomp fixes,
-#     NEW shebang remap, NEW TinyCC Android search paths (ffi_body.rs).
-#   - LD_PRELOAD shim is GONE. Everything is source-level now.
-#
-# Key principle (learned empirically on-device): Android's zygote seccomp
-# filter returns SECCOMP_RET_TRAP for blocked syscalls, which raises SIGSYS
-# instead of setting errno. Any patch relying on runtime ENOSYS/EPERM
-# fallbacks never executes. Every syscall-level fix below is therefore a
-# compile-time #[cfg(target_os = "android")] branch.
-# =============================================================================
+# Android seccomp traps blocked syscalls with SIGSYS, so syscall fallbacks
+# must be selected at compile time rather than after ENOSYS/EPERM.
 set -euo pipefail
 
 PATCH_MARKER="ANDROID_TERMUX_FIX"
@@ -55,16 +33,12 @@ verify_patch() {
     fi
 }
 
-# py_patch <python-body-via-stdin> : runs an exact-anchor python patcher.
-# Each snippet MUST assert() its anchor; a failed assert aborts the script
-# (set -e) so CI fails loudly instead of shipping a half-patched tree.
+# Runs exact-anchor patchers; every snippet must assert its anchors.
 py_patch() {
     python3 -
 }
 
-# =============================================================================
 # PATCH 1: scripts/build/config.ts — enable TinyCC on Android
-# =============================================================================
 # Upstream disables TinyCC on Android ("oven-sh/tinycc has no bionic
 # support"), but our repo carries real fixes against Bun's pinned TinyCC
 # commit (patches/tinycc/*.patch): memfd_create W+X mapping (SELinux-safe)
@@ -93,18 +67,8 @@ elif [ -f "$CONFIG_TS" ]; then
     echo "[SKIP 1] $CONFIG_TS already patched"
 fi
 
-# =============================================================================
 # PATCH 1b: enable TinyCC at the Rust level
-# =============================================================================
-# config.ts alone isn't enough — two more gates hardcode "no TinyCC on
-# Android" and must agree (see src/tcc_sys/tcc.rs's own comment: "keep this
-# predicate in sync"):
-#
-#   1. scripts/build/buildOptionsRs.ts generates build_options.rs with
-#      ENABLE_TINYCC = !cfg!(any(target_os = "android", freebsd)) — the const
-#      ffi_body.rs checks before every cc()/JSCallback call.
-#   2. src/tcc_sys/tcc.rs cfg-gates the libtcc extern block out on android,
-#      replacing every symbol with an unreachable!() stub.
+# The generated ENABLE_TINYCC value and libtcc extern cfg must match config.ts.
 GATE_TS="scripts/build/buildOptionsRs.ts"
 if [ -f "$GATE_TS" ] && ! grep -q "$PATCH_MARKER" "$GATE_TS"; then
     echo "[PATCH 1b] $GATE_TS + src/tcc_sys/tcc.rs — un-gate TinyCC on Android"
@@ -146,9 +110,7 @@ elif [ -f "$GATE_TS" ]; then
     echo "[SKIP 1b] $GATE_TS already patched"
 fi
 
-# =============================================================================
 # PATCH 2: scripts/build/deps/tinycc.ts — Android defines + patch wiring
-# =============================================================================
 # 2a: wire our TinyCC source patches into the dependency's patches array.
 # 2b: CONFIG_SELINUX=1 makes tccrun.c allocate executable memory via
 #     memfd/mmap instead of rw->rx mprotect on heap memory, which Android's
@@ -193,10 +155,7 @@ elif [ -f "$TINYCC_TS" ]; then
     echo "[SKIP 2] $TINYCC_TS already patched"
 fi
 
-# Ship the TinyCC patch files into the bun source tree.
-# tinycc.ts's `patches:` array resolves paths against cfg.cwd (the bun
-# checkout), and ninja's dep_fetch rule applies them when extracting the
-# vendored tinycc tarball — so the files must physically exist there.
+# tinycc.ts resolves patch paths from the Bun checkout.
 for tpf in tccrun.c.patch arm64-link.c.patch; do
     SRC="$REPO_DIR/patches/tinycc/$tpf"
     DST="$BUN_SRC/patches/tinycc/$tpf"
@@ -214,9 +173,7 @@ for tpf in tccrun.c.patch arm64-link.c.patch; do
     fi
 done
 
-# =============================================================================
 # PATCH 2b: scripts/build/fetch-cli.ts — dep patches apply inside git repos
-# =============================================================================
 # Upstream's applyPatch() runs `git apply --no-index -` with cwd=vendor/<dep>.
 # Documented git behavior: when the destination lives INSIDE a repository
 # (the bun checkout always is), git apply resolves the patch's target paths
@@ -263,9 +220,7 @@ elif [ -f "$FETCH_TS" ]; then
     echo "[SKIP 2b] $FETCH_TS already patched"
 fi
 
-# =============================================================================
 # PATCH 3: scripts/build/tools.ts — accept NDK-era clang (LLVM 18)
-# =============================================================================
 # Bun's C/C++ deps are cross-built by the HOST clang driving --target against
 # the NDK sysroot, so discovery must accept whatever clang the runner ships.
 # ubuntu-latest provides clang 18.1.x; upstream hard-requires 21.1.x. Relax
@@ -300,9 +255,7 @@ elif [ -f "$TOOLS_TS" ]; then
     echo "[SKIP 3] $TOOLS_TS already patched"
 fi
 
-# =============================================================================
 # PATCH 3b: scripts/build/flags.ts — drop clang-19+ warning flag
-# =============================================================================
 # Upstream suppresses -Wcharacter-conversion, a diagnostic added in clang
 # 19. Host clang 18 treats the unknown -Wno- option as an error under
 # -Werror=-Wunknown-warning-option and the PCH step dies.
@@ -335,9 +288,7 @@ elif [ -f "$FLAGS_TS" ]; then
     echo "[SKIP 3b] $FLAGS_TS already patched"
 fi
 
-# =============================================================================
 # PATCH 3c: C++ dangling-reference fix for clang 18
-# =============================================================================
 # BunTestModule.h binds a range-for directly over a temporary's member
 # (properties.releaseData()->propertyNameVector()). Upstream builds with
 # clang 21 where -Wdangling tolerates this; host clang 18 errors under
@@ -377,9 +328,7 @@ print(f"  patched {patched} file(s) with dangling-reference fix")
 PYEOF
 fi
 
-# =============================================================================
 # PATCH 4: src/sys/lib.rs — lchmod without fchmodat2
-# =============================================================================
 # Upstream implements lchmod via the fchmodat2(452) syscall with a runtime
 # ENOSYS fallback to fchmodat(AT_SYMLINK_NOFOLLOW). On Android the zygote
 # seccomp filter TRAPS fchmodat2 (SIGSYS, no errno), so every symlink-mode
@@ -471,9 +420,7 @@ elif [ -f "$SYS_LIB_RS" ]; then
     echo "[SKIP 4] $SYS_LIB_RS already patched"
 fi
 
-# =============================================================================
 # PATCH 5: src/sys/linux_syscall.rs — openat2 fallback
-# =============================================================================
 # Same seccomp story as fchmodat2: RESOLVE_BENEATH / RESOLVE_IN_ROOT walks
 # go through openat2(437), which Android traps outright. Route Android to
 # plain openat. We lose kernel-enforced symlink confinement; acceptable on
@@ -563,16 +510,8 @@ elif [ -f "$LSC_RS" ]; then
     echo "[SKIP 5] $LSC_RS already patched"
 fi
 
-# =============================================================================
 # PATCH 6: src/spawn_sys/posix_spawn.rs — shebang interpreter remap
-# =============================================================================
-# Android has no /usr/bin and no /bin. Scripts installed by npm packages
-# (`node_modules/.bin/*`) carry shebangs like `#!/usr/bin/env node` and die
-# with ENOENT at execve. This replaces the old LD_PRELOAD (termux-exec)
-# shim at the source level: when the spawned path is a script whose shebang
-# names a MISSING absolute interpreter, remap /usr/bin:/bin:/usr/sbin:/sbin
-# entries to $PREFIX/bin and rebuild argv accordingly. Existing interpreters
-# are left untouched (kernel handles valid shebangs natively).
+# Remap missing FHS shebang interpreters to $PREFIX/bin and rebuild argv.
 PS_RS="src/spawn_sys/posix_spawn.rs"
 if [ -f "$PS_RS" ] && ! grep -q "ANDROID_TERMUX_FIX_SHEBANG" "$PS_RS"; then
     echo "[PATCH 6] $PS_RS — remap missing-interpreter shebangs"
@@ -586,11 +525,7 @@ helper_anchor = """    #[cfg(unix)]
     pub(crate) fn spawn_z(
         path: &CStr,"""
 
-helper = """    /// ANDROID_TERMUX_FIX_SHEBANG: if `script` names an existing file whose
-    /// first line is a shebang pointing at an absolute interpreter that does
-    /// NOT exist on this system, return the Termux equivalent for the usual
-    /// FHS prefixes (/usr/bin, /bin, /usr/sbin, /sbin -> $PREFIX/bin).
-    /// Returns None whenever the kernel could succeed on its own.
+helper = """    /// Remap missing FHS shebang interpreters to $PREFIX/bin on Android.
     #[cfg(target_os = "android")]
     fn android_shebang_remap(script: &CStr) -> Option<CString> {
         const HDR_MAX: usize = 256;
@@ -673,10 +608,7 @@ hook_anchor = """        let uid = attr.and_then(|a| a.uid);
 hook = """        let uid = attr.and_then(|a| a.uid);
         let gid = attr.and_then(|a| a.gid);
 
-        // ANDROID_TERMUX_FIX_SHEBANG: when the target is a script whose
-        // interpreter is missing, exec the Termux interpreter instead and
-        // rebuild argv as [interp, script, rest...], mirroring what the
-        // kernel's binfmt_script would have done.
+        // ANDROID_TERMUX_FIX_SHEBANG: emulate binfmt_script with the remapped interpreter.
         #[cfg(target_os = "android")]
         let (path_storage, argv_storage): (Option<CString>, Option<Vec<*const c_char>>) =
             match android_shebang_remap(path) {
@@ -724,9 +656,7 @@ elif [ -f "$PS_RS" ]; then
     echo "[SKIP 6] $PS_RS already patched"
 fi
 
-# =============================================================================
 # PATCH 7: src/runtime/ffi/ffi_body.rs — TinyCC search paths for Android
-# =============================================================================
 # Upstream probes FHS locations only (/usr/include[aarch64-linux-gnu],
 # /usr/lib/aarch64-linux-gnu, /usr/lib64, /usr/local). None exist on Android:
 # Bionic libc lives in /system/lib64 and Termux toolchains under $PREFIX.
@@ -804,16 +734,13 @@ elif [ -f "$FFI_RS" ]; then
     echo "[SKIP 7] $FFI_RS already patched"
 fi
 
-# =============================================================================
 # PATCH 8: src/jsc/bindings/c-bindings.cpp — close_range without the syscall
-# =============================================================================
 # Android 12's zygote seccomp allowlist predates close_range (436, Linux
 # 5.9): the filter TRAPS the syscall (SIGSYS, "Bad system call") before it
 # can return ENOSYS, so upstream's best-effort fallbacks never run. This
 # kills bun at startup (bun_close_range(4, ~0U, CLOEXEC) runs during
 # process init). Android 13+ allows it, which is why only 12 users hit it.
-# Fix (same as the proven 1.3-era fix): on __ANDROID__, walk /proc/self/fd
-# and set FD_CLOEXEC / close() per fd — same observable effect, no trap.
+# Walk /proc/self/fd on Android instead of calling the trapped syscall.
 CBINDINGS_CPP="src/jsc/bindings/c-bindings.cpp"
 if [ -f "$CBINDINGS_CPP" ] && ! grep -q "ANDROID_TERMUX_FIX_CLOSE_RANGE" "$CBINDINGS_CPP"; then
     echo "[PATCH 8] $CBINDINGS_CPP — close_range via /proc/self/fd walk"
@@ -885,9 +812,6 @@ elif [ -f "$CBINDINGS_CPP" ]; then
     echo "[SKIP 8] $CBINDINGS_CPP already patched"
 fi
 
-# Files that legitimately have no marker because nothing matched in 1.4
-MISSING_OK=""
-
 echo ""
 echo "=========================================="
 echo "PATCH VERIFICATION SUMMARY"
@@ -916,10 +840,6 @@ for f in \
 done
 
 TOTAL_FAIL=$((TOTAL_FAIL + FAIL))
-
-if [ -f "scripts/jsc/bindings/c-bindings.cpp" ] || [ -f "src/jsc/bindings/c-bindings.cpp" ]; then
-    echo "  [INFO] c-bindings.cpp close_range: upstream already raw-syscalls on Linux; no patch needed."
-fi
 
 echo ""
 if [ "$TOTAL_FAIL" -gt 0 ]; then

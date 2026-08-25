@@ -25,7 +25,6 @@ if [ ! -f /etc/resolv.conf ]; then
     NEEDS_FIX=1
 fi
 
-# Quick connectivity test using curl (which uses Android's resolver)
 if ! curl -sI --max-time 5 https://registry.npmjs.org/@types/bun >/dev/null 2>&1; then
     NEEDS_FIX=1
 fi
@@ -49,8 +48,7 @@ echo "    bunx prettier --version   (bunx is now installed!)"
 echo "    bun-fix-network    (auto-fix network issues if they appear)"
 echo ""
 
-# Verify bunx launcher is installed (the missing piece that caused
-# CouldntReadCurrentDirectory for users with unpatched ~/.bun/bin/bunx)
+# Verify the packaged bunx launcher.
 if [ -x "$PREFIX/bin/bunx" ]; then
     echo "  [OK] bunx launcher installed at $PREFIX/bin/bunx"
 else
@@ -59,16 +57,12 @@ else
 fi
 echo ""
 
-# Warn if an unpatched bunx exists earlier in PATH (e.g. from
-# `curl https://bun.sh/install | bash`, which installs to ~/.bun/bin/bunx).
-# That unpatched bunx does NOT have the resolver/run_command patches and
-# will fail with CouldntReadCurrentDirectory. The fix is to either remove
-# ~/.bun/bin/bunx or ensure $PREFIX/bin comes first in PATH.
+# Warn if another bunx shadows the packaged launcher.
 CONFLICTING_BUNX=""
 IFS=':' read -ra PATH_DIRS <<< "${PATH:-}"
 for dir in "${PATH_DIRS[@]}"; do
     if [ "$dir" = "$PREFIX/bin" ]; then
-        break  # $PREFIX/bin comes first — no conflict possible
+        break
     fi
     if [ -x "$dir/bunx" ] && [ "$dir" != "$PREFIX/bin" ]; then
         CONFLICTING_BUNX="$dir/bunx"

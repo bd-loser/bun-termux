@@ -1,18 +1,5 @@
 #!/usr/bin/env bun
-/**
- * bun:ffi test suite — tests all FFI features on our patched Bionic Bun.
- *
- * Run with:  bun run ffi-test.ts
- *
- * Results:
- *   ✅ dlopen() — load .so files and call functions
- *   ✅ cc() — compile C source files at runtime (TinyCC!)
- *   ✅ C callbacks via cc() (qsort with C-side comparator)
- *
- * TinyCC IS working — cc() compiles C code successfully.
- * For qsort, we declare qsort() extern instead of #include <stdlib.h>
- * because TinyCC can't find system headers on Termux without NDK sysroot.
- */
+/** Exercises dlopen, TinyCC compilation, and C callbacks on Bionic. */
 
 const ffi = require("bun:ffi");
 const { dlopen, cc } = ffi;
@@ -53,7 +40,6 @@ console.log("╚═════════════════════�
 console.log(`  Platform: ${isAndroid ? "Android/Termux" : "Linux"}`);
 console.log("");
 
-// ─── 1. dlopen — load .so files ────────────────────────────────────────
 console.log("📦 Test 1: dlopen() — load shared libraries");
 
 test("load libc and call getpid", () => {
@@ -108,7 +94,6 @@ test("load libc and call strcmp", () => {
   console.log(`     → strcmp OK`);
 });
 
-// ─── 2. cc() — compile C source files (TinyCC) ─────────────────────────
 console.log("");
 console.log("🔗 Test 2: cc() — compile C source files (TinyCC)");
 
@@ -184,7 +169,6 @@ test("cc with qsort (C callback, no JS)", () => {
   console.log(`     → sort_array([5,3,1,4,2]) = [${arr.join(",")}]`);
 });
 
-// ─── Summary ───────────────────────────────────────────────────────────
 console.log("");
 console.log("╔══════════════════════════════════════════════╗");
 console.log("║                  Summary                     ║");

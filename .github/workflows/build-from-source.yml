@@ -8,8 +8,7 @@ on:
         required: true
         default: '1.4.0'
   schedule:
-    # Build patched from-source version weekly (Sunday 00:00 UTC)
-    # to catch upstream fixes
+    # Catch upstream patch drift weekly.
     - cron: '0 0 * * 0'
 
 permissions:
@@ -84,13 +83,7 @@ jobs:
           sudo ln -sf "$SRC/aarch64/libunwind.a"                    "$RES/lib/linux/aarch64/libunwind.a"
           echo "[OK] NDK compiler-rt + libunwind linked into $RES"
 
-      # NOTE: unlike the 1.3.x workflow we do NOT make NDK clang the host
-      # compiler. Bun 1.4's build system cross-compiles Android with the
-      # HOST clang driving --target/--sysroot against the NDK sysroot, and
-      # links the NDK's compiler-rt/libunwind into the host clang resource
-      # dir itself (scripts/build/config.ts linkNdkRuntimesIntoClang).
-      # The apply-android-patches.sh PATCH 3 relaxes the LLVM version gate
-      # from 21.x to 18.x so Ubuntu's clang-18 satisfies discovery.
+      # Bun drives the Android target with host clang; our patch permits clang 18.
       - name: Verify host clang 18
         run: |
           clang-18 --version
@@ -112,22 +105,11 @@ jobs:
           echo "=== Applying patches ==="
           chmod +x scripts/apply-android-patches.sh
           BUN_SRC=/tmp/bun-src bash scripts/apply-android-patches.sh
-          # The script verifies every patch landed (marker counts) and
-          # exits non-zero on any failure, so reaching here means all 7
-          # patches applied:
-          #   P1 config.ts       — TinyCC enabled on Android
-          #   P2 deps/tinycc.ts  — CONFIG_SELINUX + tccrun/arm64-link patches
-          #   P3 tools.ts        — LLVM 18 accepted (NDK r27c / Ubuntu clang)
-          #   P4 src/sys/lib.rs  — lchmod without trapped fchmodat2
-          #   P5 linux_syscall.rs— openat2 -> openat (seccomp TRAP bypass)
-          #   P6 posix_spawn.rs  — shebang remap to $PREFIX/bin
-          #   P7 ffi_body.rs     — TinyCC finds Bionic libc + Termux headers
 
       - name: Install Bun for bootstrapping
         env:
           BUN_VERSION: ${{ github.event.inputs.version || '1.4.0' }}
         run: |
-          # Bun's build system requires Bun itself for code generation
           echo "=== Installing Bun $BUN_VERSION for bootstrapping ==="
           curl -fsSL https://bun.sh/install | bash
           echo "$HOME/.bun/bin" >> $GITHUB_PATH
@@ -145,10 +127,7 @@ jobs:
           rustup show && rustup target list --installed
           echo "Start: $(date)"
 
-          # Upstream profile: os=linux arch=aarch64 abi=android webkit=prebuilt,
-          # buildType=Release. Sanitizers forced off for android by config.ts.
-          # The build wires CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER,
-          # --target/--sysroot and NDK runtime -L paths itself.
+          # Upstream's Android profile configures the NDK cross-linker.
           bun scripts/build.ts --profile=android-release > /tmp/build-output.log 2>&1 || true
 
           echo "End: $(date)"
@@ -159,7 +138,6 @@ jobs:
           echo "=== Checking for built binary ==="
           find build -name "bun*" -type f 2>/dev/null | head -10
 
-          # Copy binary to expected location
           BUN_BIN=$(find build -name "bun-profile" -type f 2>/dev/null | head -1)
           if [ -z "$BUN_BIN" ]; then
             BUN_BIN=$(find build -name "bun" -type f 2>/dev/null | head -1)
@@ -188,14 +166,12 @@ jobs:
           file /tmp/bun-patched
           ls -lh /tmp/bun-patched
 
-          # Strip with NDK's llvm-strip
           NDK_STRIP="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
           if [ -x "$NDK_STRIP" ]; then
             "$NDK_STRIP" --strip-all /tmp/bun-patched || true
             ls -lh /tmp/bun-patched
           fi
 
-          # Check if TinyCC is in the binary
           echo ""
           echo "=== Checking for TinyCC in binary ==="
           TCC_COUNT=$(strings /tmp/bun-patched | grep -ci "tcc\|tinycc\|libtcc")
@@ -262,25 +238,14 @@ jobs:
           TMPUSR="$ROOT/data/data/com.termux/files/usr"
           mkdir -p "$ROOT/DEBIAN" "$TMPUSR/bin" "$TMPUSR/lib/bun-termux"
 
-          # Install the PATCHED Bun binary — fully source-level fixes,
-          # no LD_PRELOAD shim, no termux-exec dependency.
           install -m755 runtime/bun-patched "$TMPUSR/lib/bun-termux/bun"
 
-          # Launcher scripts — install the shared launcher-bun.sh and
-          # launcher-bunx.sh from scripts/. These exec the patched binary.
-          #
-          # CRITICAL: launcher-bunx.sh uses `exec -a "bunx"` to set
-          # argv[0]="bunx" so Bun's isBunX() detection routes to
-          # BunxCommand. Without a bunx launcher, `bunx` would either be
-          # missing or fall through to the official unpatched ~/.bun/bin/bunx
-          # (if installed via curl bun.sh).
+          # Bun selects bunx mode from argv[0].
           install -m755 scripts/launcher-bun.sh  "$TMPUSR/bin/bun"
           install -m755 scripts/launcher-bunx.sh "$TMPUSR/bin/bunx"
 
-          # Network fix script
           install -m755 scripts/fix-bun-network.sh "$TMPUSR/bin/bun-fix-network"
 
-          # Verify both launchers were installed
           for bin in bun bunx; do
             if [ ! -x "$TMPUSR/bin/$bin" ]; then
               echo "FATAL: $TMPUSR/bin/$bin not installed"
@@ -290,7 +255,6 @@ jobs:
           echo "[OK] bun and bunx launchers installed"
           ls -la "$TMPUSR/bin/"
 
-          # Control file
           cat > "$ROOT/DEBIAN/control" <<EOF
           Package: bun
           Version: $VERSION-patched
@@ -309,11 +273,9 @@ jobs:
           EOF
           echo "Installed-Size: $(du -sk "$ROOT" | cut -f1)" >> "$ROOT/DEBIAN/control"
 
-          # Install postinst
           install -m755 packaging/deb/DEBIAN/postinst "$ROOT/DEBIAN/postinst"
           chmod 755 "$ROOT" "$ROOT/DEBIAN"
 
-          # Build
           dpkg-deb --build --root-owner-group "$ROOT" "dist/bun_${VERSION}-patched_${ARCH}.deb"
           rm -rf "$ROOT"
           echo ""
@@ -331,7 +293,6 @@ jobs:
           echo "=== Files in /usr/bin/ ==="
           ls -la /tmp/deb-check/data/data/com.termux/files/usr/bin/
           echo ""
-          # Both bun AND bunx launchers must be present
           for bin in bun bunx; do
             PATH="/tmp/deb-check/data/data/com.termux/files/usr/bin:$PATH"
             if [ ! -x "/tmp/deb-check/data/data/com.termux/files/usr/bin/$bin" ]; then
@@ -339,7 +300,6 @@ jobs:
               exit 1
             fi
           done
-          # Verify bunx launcher uses exec -a (the critical bit)
           BUNX_CONTENT="/tmp/deb-check/data/data/com.termux/files/usr/bin/bunx"
           if ! grep -q 'exec -a "bunx"' "$BUNX_CONTENT"; then
             echo "FATAL: bunx launcher does not use 'exec -a \"bunx\"'"
@@ -347,7 +307,6 @@ jobs:
             cat "$BUNX_CONTENT"
             exit 1
           fi
-          # Shim must be gone
           if [ -e "/tmp/deb-check/data/data/com.termux/files/usr/lib/bun-termux/libbun-android-fix.so" ]; then
             echo "FATAL: LD_PRELOAD shim still packaged — should be removed for 1.4"
             exit 1

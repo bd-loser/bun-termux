@@ -1,5 +1,4 @@
 #!/usr/bin/env bash
-# Package Bun as DEB for Termux
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -27,10 +26,8 @@ fi
 
 echo "Packaging Bun DEB v$VERSION"
 
-# Install binary
 install -m755 "$STAGED_BIN" "$DEB_ROOT$PREFIX/lib/bun-termux/bun"
 
-# Create launcher
 cat > "$DEB_ROOT$PREFIX/bin/bun" << 'LAUNCHER'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -39,22 +36,15 @@ exec grun "$PREFIX/lib/bun-termux/bun" "$@"
 LAUNCHER
 chmod 755 "$DEB_ROOT$PREFIX/bin/bun"
 
-# bunx launcher — uses `exec -a "bunx"` to set argv[0]="bunx" so Bun's
-# isBunX() detection (src/cli/cli.zig, ends-with "bunx") routes to
-# BunxCommand. Without this, `bunx` would either be missing or fall
-# through to an unpatched ~/.bun/bin/bunx (from `curl bun.sh`).
+# Bun selects bunx mode from argv[0].
 cat > "$DEB_ROOT$PREFIX/bin/bunx" << 'LAUNCHER_BUNX'
 #!/usr/bin/env bash
 set -euo pipefail
 PREFIX="${PREFIX:-/data/data/com.termux/files/usr}"
-# `exec -a` sets argv[0]="bunx" while executing the real binary.
-# Required because a plain `exec bun` sets argv[0] to the binary path
-# (ending in "bun", not "bunx"), and Bun's isBunX() check would fail.
 exec -a "bunx" grun "$PREFIX/lib/bun-termux/bun" "$@"
 LAUNCHER_BUNX
 chmod 755 "$DEB_ROOT$PREFIX/bin/bunx"
 
-# Create control file
 cat > "$DEB_ROOT/DEBIAN/control" << EOF
 Package: bun
 Version: $VERSION
@@ -66,11 +56,9 @@ Description: Bun runtime for Termux (glibc-runner wrapper)
 Depends: glibc-runner, bash, ncurses
 EOF
 
-# Calculate installed size
 INSTALLED_SIZE=$(du -sk "$DEB_ROOT" | cut -f1)
 echo "Installed-Size: $INSTALLED_SIZE" >> "$DEB_ROOT/DEBIAN/control"
 
-# Create postinst
 cat > "$DEB_ROOT/DEBIAN/postinst" << 'POSTINST'
 #!/usr/bin/env bash
 set -e
@@ -80,6 +68,5 @@ exit 0
 POSTINST
 chmod 755 "$DEB_ROOT/DEBIAN/postinst"
 
-# Build package
 dpkg-deb --build "$DEB_ROOT" "$OUT_FILE"
 echo "DEB package created: $OUT_FILE"

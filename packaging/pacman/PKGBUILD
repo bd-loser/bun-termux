@@ -1,5 +1,3 @@
-# PKGBUILD for Bun on Termux
-# Uses native Android Bun binary for Termux packaging
 pkgname=bun
 pkgver=1.3.9
 pkgrel=3
@@ -30,7 +28,6 @@ build() {
     mkdir -p "$pkgdir$prefix/lib/bun"
     mkdir -p "$pkgdir$prefix/bin"
 
-    # Install bun binary (native Android binary, no wrapper)
     if [[ -f "$srcdir/bun-linux-aarch64/bun" ]]; then
         install -m755 "$srcdir/bun-linux-aarch64/bun" "$pkgdir$prefix/lib/bun/bun"
     elif [[ -f "$srcdir/bun" ]]; then
@@ -40,7 +37,6 @@ build() {
         return 1
     fi
 
-    # Create launcher script
     cat > "$pkgdir$prefix/bin/bun" <<'LAUNCHER'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -54,10 +50,7 @@ exec grun "$BUN_BIN" "$@"
 LAUNCHER
     chmod 755 "$pkgdir$prefix/bin/bun"
 
-    # bunx launcher — uses `exec -a "bunx"` to set argv[0]="bunx" so
-    # Bun's isBunX() detection (src/cli/cli.zig, ends-with "bunx")
-    # routes to BunxCommand. A plain `exec bun` would set argv[0] to
-    # the binary path (ending in "bun"), failing the isBunX() check.
+    # Bun selects bunx mode from argv[0].
     cat > "$pkgdir$prefix/bin/bunx" <<'LAUNCHER_BUNX'
 #!/usr/bin/env bash
 set -euo pipefail
