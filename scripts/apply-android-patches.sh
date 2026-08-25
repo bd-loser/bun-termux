@@ -804,6 +804,87 @@ elif [ -f "$FFI_RS" ]; then
     echo "[SKIP 7] $FFI_RS already patched"
 fi
 
+# =============================================================================
+# PATCH 8: src/jsc/bindings/c-bindings.cpp — close_range without the syscall
+# =============================================================================
+# Android 12's zygote seccomp allowlist predates close_range (436, Linux
+# 5.9): the filter TRAPS the syscall (SIGSYS, "Bad system call") before it
+# can return ENOSYS, so upstream's best-effort fallbacks never run. This
+# kills bun at startup (bun_close_range(4, ~0U, CLOEXEC) runs during
+# process init). Android 13+ allows it, which is why only 12 users hit it.
+# Fix (same as the proven 1.3-era fix): on __ANDROID__, walk /proc/self/fd
+# and set FD_CLOEXEC / close() per fd — same observable effect, no trap.
+CBINDINGS_CPP="src/jsc/bindings/c-bindings.cpp"
+if [ -f "$CBINDINGS_CPP" ] && ! grep -q "ANDROID_TERMUX_FIX_CLOSE_RANGE" "$CBINDINGS_CPP"; then
+    echo "[PATCH 8] $CBINDINGS_CPP — close_range via /proc/self/fd walk"
+    py_patch <<'PYEOF'
+import pathlib
+
+p = pathlib.Path("src/jsc/bindings/c-bindings.cpp")
+c = p.read_text()
+
+old = """// close_range is glibc > 2.33, which is very new
+extern "C" ssize_t bun_close_range(unsigned int start, unsigned int end, unsigned int flags)
+{
+    return syscall(__NR_close_range, start, end, flags);
+}"""
+
+new = """// close_range is glibc > 2.33, which is very new
+#if defined(__ANDROID__)
+// ANDROID_TERMUX_FIX_CLOSE_RANGE: Android 12's zygote seccomp allowlist
+// predates close_range (436). The filter uses SECCOMP_RET_TRAP, so the
+// syscall raises SIGSYS before returning ENOSYS and every fallback at the
+// call sites is dead code. Walk /proc/self/fd instead — same observable
+// behavior, no trap. Returns 0 so callers skip their own fallback loops.
+#include <dirent.h>
+#include <cerrno>
+extern "C" ssize_t bun_close_range(unsigned int start, unsigned int end, unsigned int flags)
+{
+    DIR* d = opendir("/proc/self/fd");
+    if (!d) {
+        // /proc unavailable — mimic ENOSYS so the caller's fallback can run.
+        errno = ENOSYS;
+        return -1;
+    }
+    int dfd = dirfd(d);
+    struct dirent* e;
+    const bool cloexec_only = (flags & CLOSE_RANGE_CLOEXEC) != 0;
+    while ((e = readdir(d)) != nullptr) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') continue;
+        char* endp = nullptr;
+        unsigned long v = strtoul(e->d_name, &endp, 10);
+        if (endp == e->d_name || *endp != '\\0') continue;
+        if (v > 0x7fffffffUL) continue;
+        unsigned int fd = (unsigned int)v;
+        if (fd < start || fd > end) continue;
+        if ((int)fd == dfd) continue; // don't close the iteration fd
+        if (cloexec_only) {
+            int fl = fcntl((int)fd, F_GETFD);
+            if (fl != -1) fcntl((int)fd, F_SETFD, fl | FD_CLOEXEC);
+        } else {
+            close((int)fd);
+        }
+    }
+    closedir(d);
+    return 0;
+}
+#else
+extern "C" ssize_t bun_close_range(unsigned int start, unsigned int end, unsigned int flags)
+{
+    return syscall(__NR_close_range, start, end, flags);
+}
+#endif"""
+
+assert c.count(old) == 1, "c-bindings.cpp anchor not found (or ambiguous): bun_close_range Linux branch"
+c = c.replace(old, new, 1)
+p.write_text(c)
+print("  bun_close_range now walks /proc/self/fd on Android")
+PYEOF
+    verify_patch "$CBINDINGS_CPP"
+elif [ -f "$CBINDINGS_CPP" ]; then
+    echo "[SKIP 8] $CBINDINGS_CPP already patched"
+fi
+
 # Files that legitimately have no marker because nothing matched in 1.4
 MISSING_OK=""
 
@@ -819,7 +900,8 @@ for f in \
     src/sys/lib.rs \
     src/sys/linux_syscall.rs \
     src/spawn_sys/posix_spawn.rs \
-    src/runtime/ffi/ffi_body.rs; do
+    src/runtime/ffi/ffi_body.rs \
+    src/jsc/bindings/c-bindings.cpp; do
     if [ -f "$f" ]; then
         COUNT=$(grep -c "$PATCH_MARKER" "$f" 2>/dev/null || true)
         if [ "${COUNT:-0}" -gt 0 ]; then

@@ -389,8 +389,17 @@ jobs:
           body: |
             # Bun for Termux v${{ github.event.inputs.version || '1.4.0' }} — Source-level patches only
 
-            Bun built from source with **7 source-level patches**. **No proot, no root,
+            Bun built from source with **source-level patches**. **No proot, no root,
             no LD_PRELOAD shim, no termux-exec.** Works natively on Termux — including `bunx`.
+
+            ## Changes in this rebuild
+
+            - **Android 12 fix**: `close_range(436)` is outside Android 12's zygote
+              seccomp allowlist, so the kernel TRAPPED it (SIGSYS, "Bad system call")
+              at startup — Android 13+ allows it, which is why only 12 was affected.
+              Replaced with a `/proc/self/fd` walk (same behavior, no syscall).
+              Verified as the *only* trapped syscall: full startup + spawn + install
+              syscall surface diffed against the AOSP Android 12 app policy.
 
             ## Architecture: source-level only (Bun 1.4, Rust)
 
