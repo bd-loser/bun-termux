@@ -7,21 +7,38 @@ TMP_DEB="$PREFIX/tmp/bun-termux-latest.deb"
 
 echo "📦 Installing Bun for Termux (aarch64)..."
 
-echo "🔎 Resolving latest release..."
-# Always resolve through the releases API: releases are rebuilt in place on
-# the same tag, so a hardcoded download URL can keep serving a stale deb
-# from GitHub's CDN caches. /releases/latest never points at a prerelease.
-DEB_URL="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
-  | command grep -oE '"browser_download_url":\s*"[^"]+"' \
-  | command grep -oE 'https://[^"]+\.deb' \
-  | command grep 'aarch64' | command head -1 || true)"
+# --- Resolve latest release ---------------------------------------------------
+# Primary: GitHub API. Fallback: web redirect (works when api.github.com
+# is blocked by geo-restrictions / ISP firewalls — 403 from certain regions).
 
-if [ -z "$DEB_URL" ]; then
-  echo "❌ Could not resolve the latest release asset." >&2
+resolve_tag_via_redirect() {
+  local url
+  url="$(curl -fsSI -o /dev/null -w '%{redirect_url}' \
+    "https://github.com/$REPO/releases/latest" 2>/dev/null || true)"
+  printf '%s' "$url" | command grep -oE '/tag/v[^/]+$' | command sed 's|^/tag/||'
+}
+
+echo "🔎 Resolving latest release..."
+TAG="$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
+  | command grep -oE '"tag_name":\s*"[^"]+"' \
+  | command sed -E 's/.*"([^"]+)"/\1/' || true)"
+
+if [ -z "$TAG" ]; then
+  echo "  API unavailable, trying web redirect fallback..." >&2
+  TAG="$(resolve_tag_via_redirect)"
+fi
+
+if [ -z "$TAG" ]; then
+  echo "❌ Could not resolve the latest release." >&2
   echo "   Check https://github.com/$REPO/releases" >&2
   exit 1
 fi
-echo "⬇️  Downloading $(basename "$DEB_URL")..."
+
+VERSION="${TAG#v}"
+DEB="bun_${VERSION}_aarch64.deb"
+DEB_URL="https://github.com/$REPO/releases/download/$TAG/$DEB"
+
+echo "⬇️  Downloading $DEB..."
 curl -fsSL -o "$TMP_DEB" "$DEB_URL" || {
   echo "❌ Download failed." >&2
   exit 1
