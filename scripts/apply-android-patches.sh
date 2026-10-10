@@ -234,20 +234,45 @@ import pathlib
 p = pathlib.Path("scripts/build/tools.ts")
 c = p.read_text()
 
-subs = [
-    ('export const LLVM_VERSION = "21.1.8";',
-     'export const LLVM_VERSION = "18.1.3"; // ANDROID_TERMUX_FIX: host clang'),
-    ('const LLVM_MAJOR = "21";',
-     'const LLVM_MAJOR = "18"; // ANDROID_TERMUX_FIX'),
+subs = (
+    [
+        ('export const LLVM_VERSION = "21.1.8";',
+         'export const LLVM_VERSION = "18.1.3"; // ANDROID_TERMUX_FIX: host clang'),
+        ('const LLVM_MAJOR = "21";',
+         'const LLVM_MAJOR = "18"; // ANDROID_TERMUX_FIX'),
+    ]
+    if 'export const LLVM_VERSION = "21.1.8";' in c
+    else []
+)
+subs.append(
     ('const LLVM_VERSION_RANGE = `>=${LLVM_MAJOR}.${LLVM_MINOR}.0 <${LLVM_MAJOR}.${LLVM_MINOR}.99`;',
      '// ANDROID_TERMUX_FIX: accept any 18.x — distros ship varying minors\n'
      'const LLVM_VERSION_RANGE = `>=${LLVM_MAJOR}.0.0 <${Number(LLVM_MAJOR) + 1}.0.0`;'),
-]
+)
 for old, new in subs:
     assert c.count(old) == 1, f"tools.ts anchor not found (or ambiguous): {old}"
     c = c.replace(old, new, 1)
 
+# 1.4.3+ reads the version from a central pin instead of hardcoding it.
+spec = pathlib.Path("scripts/build/ci-images/spec.ts")
+if 'pins.llvm.version' in c and spec.exists():
+    s = spec.read_text()
+    old_pin = 'llvm: { version: "23.1.1" }'
+    if old_pin in s:
+        assert s.count(old_pin) == 1, "spec.ts llvm pin ambiguous"
+        spec.write_text(
+            s.replace(
+                old_pin,
+                'llvm: { version: "18.1.3" }, // ANDROID_TERMUX_FIX: host clang',
+                1,
+            )
+        )
+        print("  retargeted central llvm pin to 18.1.3")
+    else:
+        raise SystemExit("spec.ts llvm pin not found — upstream moved it again?")
+
 p.write_text(c)
+assert "ANDROID_TERMUX_FIX" in c, "tools.ts marker missing after patch"
 print("  relaxed LLVM requirement to any 18.x")
 PYEOF
     verify_patch "$TOOLS_TS"
@@ -521,8 +546,7 @@ import pathlib
 p = pathlib.Path("src/spawn_sys/posix_spawn.rs")
 c = p.read_text()
 
-helper_anchor = """    #[cfg(unix)]
-    pub(crate) fn spawn_z(
+helper_anchor = """    pub(crate) fn spawn_z(
         path: &CStr,"""
 
 helper = """    /// Remap missing FHS shebang interpreters to $PREFIX/bin on Android.
