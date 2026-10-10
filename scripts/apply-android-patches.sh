@@ -865,34 +865,40 @@ elif [ -f "$CBINDINGS_CPP" ]; then
     echo "[SKIP 8] $CBINDINGS_CPP already patched"
 fi
 
-# PATCH 10: scripts/build/rust.ts — no rustc LLVM bitcode in the link
-# rustc's LLVM (upstream nightly) is always newer than the host clang's. Rust's
-# default embeds bitcode in rlib CGUs, and the final clang/lld link then reads
-# it — clang 18 cannot parse LLVM-23 bitcode ("Unknown attribute kind (102)").
-# Native rust objects keep the link inside one LLVM. Safe because Android
-# builds already have lto off; this only disables cross-crate generics.
-RUST_TS="scripts/build/rust.ts"
-if [ -f "$RUST_TS" ] && ! grep -q "ANDROID_TERMUX_FIX_NO_BITCODE" "$RUST_TS"; then
-    echo "[PATCH 10] $RUST_TS — emit native Rust objects on android (no bitcode)"
+# PATCH 10: scripts/build/flags.ts — no rustc LLVM bitcode in the android link
+# Release rust crates reach the link as ThinLTO bitcode that lld must read
+# (rustLtoInLink = release && !asan, true even with lto off). rustc's LLVM runs
+# ahead of the host clang's (23 vs 18), and clang's lld cannot parse newer
+# bitcode ("Unknown attribute kind (102)"). 1.4.3 removed the old rust-lld
+# workaround, so android compiles rust to native objects instead — consistent
+# with its lto=false, where the whole link is machine code anyway.
+FLAGS_TS_RUST="scripts/build/flags.ts"
+if [ -f "$FLAGS_TS_RUST" ] && ! grep -q "ANDROID_TERMUX_FIX_RUST_LTO" "$FLAGS_TS_RUST"; then
+    echo "[PATCH 10] $FLAGS_TS_RUST — disable rust-in-link bitcode on android"
     py_patch <<'PYEOF'
 import pathlib
 
-p = pathlib.Path("scripts/build/rust.ts")
+p = pathlib.Path("scripts/build/flags.ts")
 c = p.read_text()
-old = '  if (rustflags.length > 0) env.CARGO_ENCODED_RUSTFLAGS = rustflags.join("\\x1f");'
-new = ('  // ANDROID_TERMUX_FIX_NO_BITCODE: rustc LLVM is newer than host clang LLVM; '
-       'rlib bitcode cannot be read at link time, so emit native objects.\n'
-       '  if (triple.includes("-android")) rustflags.push("-Cembed-bitcode=no");\n' + old)
+old = """export function rustLtoInLink(c: Config): boolean {
+  return c.release && !c.asan;
+}"""
+new = """export function rustLtoInLink(c: Config): boolean {
+  // ANDROID_TERMUX_FIX_RUST_LTO: rustc's LLVM is newer than the host clang's,
+  // so rustc's bitcode cannot take part in the link; android links machine code.
+  if (c.abi === "android") return false;
+  return c.release && !c.asan;
+}"""
 if old in c:
-    assert c.count(old) == 1, "rust.ts anchor not found (or ambiguous): CARGO_ENCODED_RUSTFLAGS"
+    assert c.count(old) == 1, "flags.ts anchor not found (or ambiguous): rustLtoInLink"
     c = c.replace(old, new, 1)
     p.write_text(c)
-    print("  added -Cembed-bitcode=no for android rust targets")
+    print("  rust crates compile to native objects on android")
 else:
-    print("  CARGO_ENCODED_RUSTFLAGS anchor missing — nothing to do")
+    print("  rustLtoInLink anchor missing — nothing to do")
 PYEOF
-elif [ -f "$RUST_TS" ]; then
-    echo "[SKIP 10] $RUST_TS already patched"
+elif [ -f "$FLAGS_TS_RUST" ]; then
+    echo "[SKIP 10] $FLAGS_TS_RUST already patched"
 fi
 
 echo ""
