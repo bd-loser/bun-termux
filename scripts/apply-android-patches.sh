@@ -865,6 +865,47 @@ elif [ -f "$CBINDINGS_CPP" ]; then
     echo "[SKIP 8] $CBINDINGS_CPP already patched"
 fi
 
+# PATCH 9: pin the Rust nightly to one whose LLVM bitcode host clang 18 can
+# read. 1.4.3 moved to nightly-2026-09-15 (LLVM 23.1.1); its rlibs carry a
+# bitcode attribute kind (102) that clang 18 rejects at link time. 1.4.2's
+# nightly-2026-07-20 (LLVM 21) linked fine and is the newest such nightly.
+echo "[PATCH 9] rust-toolchain.toml + ci-images/spec.ts — pin Rust nightly to 2026-07-20"
+py_patch <<'PYEOF'
+import pathlib
+import re
+
+NIGHTLY = "nightly-2026-07-20"
+marker = "ANDROID_TERMUX_FIX_RUST_NIGHTLY"
+
+rt = pathlib.Path("rust-toolchain.toml")
+if rt.exists() and marker not in rt.read_text():
+    t = rt.read_text()
+    m = re.search(r'channel = "nightly-[\d-]+"', t)
+    if m:
+        assert t.count(m.group(0)) == 1, "rust-toolchain.toml channel ambiguous"
+        t = t.replace(
+            m.group(0),
+            f'channel = "{NIGHTLY}" # {marker}: host clang 18 must read this LLVM bitcode',
+            1,
+        )
+        rt.write_text(t)
+        print(f"  rust-toolchain.toml channel pinned to {NIGHTLY}")
+
+spec = pathlib.Path("scripts/build/ci-images/spec.ts")
+if spec.exists() and marker not in spec.read_text():
+    s = spec.read_text()
+    m = re.search(r'channel: "nightly-[\d-]+"', s)
+    if m:
+        assert s.count(m.group(0)) == 1, "spec.ts rust channel ambiguous"
+        s = s.replace(
+            m.group(0),
+            f'channel: "{NIGHTLY}", // {marker}: host clang 18 must read this LLVM bitcode',
+            1,
+        )
+        spec.write_text(s)
+        print(f"  ci-images/spec.ts rust channel pinned to {NIGHTLY}")
+PYEOF
+
 echo ""
 echo "=========================================="
 echo "PATCH VERIFICATION SUMMARY"
