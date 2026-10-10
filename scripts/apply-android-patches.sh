@@ -908,8 +908,12 @@ echo "=========================================="
 FAIL=0
 for f in \
     scripts/build/config.ts \
+    scripts/build/buildOptionsRs.ts \
     scripts/build/deps/tinycc.ts \
     scripts/build/tools.ts \
+    scripts/build/flags.ts \
+    scripts/build/fetch-cli.ts \
+    scripts/build/ci-images/spec.ts \
     src/sys/lib.rs \
     src/sys/linux_syscall.rs \
     src/spawn_sys/posix_spawn.rs \
@@ -943,8 +947,8 @@ echo "=========================================="
 echo "All Android/Termux patches applied successfully."
 echo "Source-level only: no LD_PRELOAD, no termux-exec."
 echo "  - TinyCC enabled on Android (+SELinux-safe JIT, arm64 veneers)"
-echo "  - NDK clang 18 accepted"
-echo "  - fchmodat2/openat2 seccomp traps bypassed at compile time"
+echo "  - NDK clang 18 accepted; rust links machine code (no cross-LLVM bitcode)"
+echo "  - fchmodat2/openat2/close_range seccomp traps bypassed at compile time"
 echo "  - missing-interpreter shebangs remapped to \$PREFIX/bin"
 echo "  - bun:ffi finds Bionic libc + Termux headers"
 echo "=========================================="
