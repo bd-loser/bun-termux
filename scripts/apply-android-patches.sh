@@ -280,6 +280,35 @@ elif [ -f "$TOOLS_TS" ]; then
     echo "[SKIP 3] $TOOLS_TS already patched"
 fi
 
+# PATCH 3d: scripts/build/config.ts — skip the clang/rustc LLVM major-match gate
+# 1.4.3 added a fatal check that clang's and rustc's LLVM must be the same
+# major. Ubuntu ships clang 18 while rustc's LLVM follows upstream's pinned
+# nightly (23.x). Our Android builds link this exact combination since the
+# beginning, so skip the gate for android.
+CONFIG_TS_GATE="scripts/build/config.ts"
+if [ -f "$CONFIG_TS_GATE" ] && ! grep -q "ANDROID_TERMUX_FIX_CLANG_RUSTC_LLVM" "$CONFIG_TS_GATE"; then
+    echo "[PATCH 3d] $CONFIG_TS_GATE — skip clang/rustc LLVM major-match gate on android"
+    py_patch <<'PYEOF'
+import pathlib
+
+p = pathlib.Path("scripts/build/config.ts")
+c = p.read_text()
+old = '  if (clangMajor !== undefined && rustLlvmMajor !== undefined && clangMajor !== rustLlvmMajor) {'
+new = ('  // ANDROID_TERMUX_FIX_CLANG_RUSTC_LLVM: host clang 18 with rustc\'s newer\n'
+       '  // LLVM is the combination every Android build here links; skip the gate.\n'
+       '  if (clangMajor !== undefined && rustLlvmMajor !== undefined && clangMajor !== rustLlvmMajor && abi !== "android") {')
+if old in c:
+    assert c.count(old) == 1, "config.ts anchor not found (or ambiguous): llvm major-match gate"
+    c = c.replace(old, new, 1)
+    p.write_text(c)
+    print("  disabled clang/rustc LLVM major-match gate on android")
+else:
+    print("  no major-match gate in this Bun version — nothing to do")
+PYEOF
+elif [ -f "$CONFIG_TS_GATE" ]; then
+    echo "[SKIP 3d] $CONFIG_TS_GATE already patched"
+fi
+
 # PATCH 3b: scripts/build/flags.ts — drop clang-19+ warning flag
 # Upstream suppresses -Wcharacter-conversion, a diagnostic added in clang
 # 19. Host clang 18 treats the unknown -Wno- option as an error under
