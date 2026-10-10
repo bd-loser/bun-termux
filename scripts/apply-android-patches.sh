@@ -865,46 +865,35 @@ elif [ -f "$CBINDINGS_CPP" ]; then
     echo "[SKIP 8] $CBINDINGS_CPP already patched"
 fi
 
-# PATCH 9: pin the Rust nightly to one whose LLVM bitcode host clang 18 can
-# read. 1.4.3 moved to nightly-2026-09-15 (LLVM 23.1.1); its rlibs carry a
-# bitcode attribute kind (102) that clang 18 rejects at link time. 1.4.2's
-# nightly-2026-07-20 (LLVM 21) linked fine and is the newest such nightly.
-echo "[PATCH 9] rust-toolchain.toml + ci-images/spec.ts — pin Rust nightly to 2026-07-20"
-py_patch <<'PYEOF'
+# PATCH 10: scripts/build/rust.ts — no rustc LLVM bitcode in the link
+# rustc's LLVM (upstream nightly) is always newer than the host clang's. Rust's
+# default embeds bitcode in rlib CGUs, and the final clang/lld link then reads
+# it — clang 18 cannot parse LLVM-23 bitcode ("Unknown attribute kind (102)").
+# Native rust objects keep the link inside one LLVM. Safe because Android
+# builds already have lto off; this only disables cross-crate generics.
+RUST_TS="scripts/build/rust.ts"
+if [ -f "$RUST_TS" ] && ! grep -q "ANDROID_TERMUX_FIX_NO_BITCODE" "$RUST_TS"; then
+    echo "[PATCH 10] $RUST_TS — emit native Rust objects on android (no bitcode)"
+    py_patch <<'PYEOF'
 import pathlib
-import re
 
-NIGHTLY = "nightly-2026-07-20"
-marker = "ANDROID_TERMUX_FIX_RUST_NIGHTLY"
-
-rt = pathlib.Path("rust-toolchain.toml")
-if rt.exists() and marker not in rt.read_text():
-    t = rt.read_text()
-    m = re.search(r'channel = "nightly-[\d-]+"', t)
-    if m:
-        assert t.count(m.group(0)) == 1, "rust-toolchain.toml channel ambiguous"
-        t = t.replace(
-            m.group(0),
-            f'channel = "{NIGHTLY}" # {marker}: host clang 18 must read this LLVM bitcode',
-            1,
-        )
-        rt.write_text(t)
-        print(f"  rust-toolchain.toml channel pinned to {NIGHTLY}")
-
-spec = pathlib.Path("scripts/build/ci-images/spec.ts")
-if spec.exists() and marker not in spec.read_text():
-    s = spec.read_text()
-    m = re.search(r'channel: "nightly-[\d-]+"', s)
-    if m:
-        assert s.count(m.group(0)) == 1, "spec.ts rust channel ambiguous"
-        s = s.replace(
-            m.group(0),
-            f'channel: "{NIGHTLY}", // {marker}: host clang 18 must read this LLVM bitcode',
-            1,
-        )
-        spec.write_text(s)
-        print(f"  ci-images/spec.ts rust channel pinned to {NIGHTLY}")
+p = pathlib.Path("scripts/build/rust.ts")
+c = p.read_text()
+old = '  if (rustflags.length > 0) env.CARGO_ENCODED_RUSTFLAGS = rustflags.join("\\x1f");'
+new = ('  // ANDROID_TERMUX_FIX_NO_BITCODE: rustc LLVM is newer than host clang LLVM; '
+       'rlib bitcode cannot be read at link time, so emit native objects.\n'
+       '  if (triple.includes("-android")) rustflags.push("-Cembed-bitcode=no");\n' + old)
+if old in c:
+    assert c.count(old) == 1, "rust.ts anchor not found (or ambiguous): CARGO_ENCODED_RUSTFLAGS"
+    c = c.replace(old, new, 1)
+    p.write_text(c)
+    print("  added -Cembed-bitcode=no for android rust targets")
+else:
+    print("  CARGO_ENCODED_RUSTFLAGS anchor missing — nothing to do")
 PYEOF
+elif [ -f "$RUST_TS" ]; then
+    echo "[SKIP 10] $RUST_TS already patched"
+fi
 
 echo ""
 echo "=========================================="
