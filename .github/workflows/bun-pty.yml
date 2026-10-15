@@ -1,0 +1,151 @@
+name: Build bun-pty for Android (Bionic)
+
+# Builds the native side of bun-pty (https://github.com/sursaone/bun-pty) as a
+# Bionic shared library for aarch64. opencode-bionic's patch kit embeds this
+# into opencode's compiled binary so the terminal (PTY) feature works on
+# Termux — the npm-published prebuilt requires glibc (libpthread.so.0) and
+# cannot dlopen on Android.
+#
+# Future native dependencies for opencode support should follow this pattern:
+# a small workflow reusing ./.github/actions/android-rust-toolchain.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'bun-pty version to build (e.g., 0.4.8)'
+        required: true
+        default: '0.4.8'
+      repo:
+        description: 'Upstream bun-pty repo'
+        required: false
+        default: 'sursaone/bun-pty'
+      ref:
+        description: 'Upstream ref (default: v<version>)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+env:
+  RUST_TARGET: aarch64-linux-android
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout this repo (for the toolchain action)
+        uses: actions/checkout@v4
+
+      - name: Set up Android Rust toolchain
+        uses: ./.github/actions/android-rust-toolchain
+        with:
+          rust-target: ${{ env.RUST_TARGET }}
+
+      - name: Clone bun-pty
+        env:
+          PTY_VERSION: ${{ inputs.version || '0.4.8' }}
+          PTY_REPO: ${{ inputs.repo || 'sursaone/bun-pty' }}
+          PTY_REF: ${{ inputs.ref }}
+        run: |
+          set -e
+          REF="${PTY_REF:-v$PTY_VERSION}"
+          if ! git clone --depth 1 --branch "$REF" "https://github.com/$PTY_REPO.git" /tmp/bun-pty-src; then
+            echo "::warning::tag $REF not found on $PTY_REPO — building from default branch"
+            git clone --depth 1 "https://github.com/$PTY_REPO.git" /tmp/bun-pty-src
+          fi
+          cd /tmp/bun-pty-src
+          echo "bun-pty source at $(git rev-parse --short HEAD)"
+          test -f rust-pty/Cargo.toml
+
+      - name: Build librust_pty (${{ env.RUST_TARGET }})
+        working-directory: /tmp/bun-pty-src/rust-pty
+        run: |
+          set -e
+          cargo build --release --target "$RUST_TARGET"
+          SO="target/$RUST_TARGET/release/librust_pty.so"
+          test -f "$SO" || { echo "FATAL: $SO not produced"; exit 1; }
+          echo "SO=$SO" >> "$GITHUB_ENV"
+
+      - name: Verify Bionic compatibility
+        run: |
+          set -e
+          test -n "$ANDROID_NDK_HOME" || { echo "FATAL: ANDROID_NDK_HOME not set"; exit 1; }
+          READELF="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          echo "=== ELF header ==="
+          "$READELF" -h "$SO" | grep -E "Class|Machine|Type"
+          echo "=== DT_NEEDED ==="
+          "$READELF" -d "$SO" | grep NEEDED || true
+          if ! "$READELF" -h "$SO" | grep -q "AArch64"; then
+            echo "FATAL: not an AArch64 shared object"; exit 1
+          fi
+          NEEDED="$("$READELF" -d "$SO" | grep -o 'Shared library: \[[^]]*\]' || true)"
+          for bad in libpthread.so.0 libc.so.6 libdl.so.2 libutil.so.1 ld-linux; do
+            if echo "$NEEDED" | grep -q "$bad"; then
+              echo "FATAL: glibc dependency detected ($bad) — this library would fail to dlopen on Bionic"
+              exit 1
+            fi
+          done
+          if ! echo "$NEEDED" | grep -q "libc.so"; then
+            echo "FATAL: expected libc.so (Bionic) in DT_NEEDED"; exit 1
+          fi
+          echo "[OK] Bionic-only DT_NEEDED"
+
+      - name: Package artifact
+        run: |
+          set -e
+          mkdir -p dist
+          NDK_STRIP="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          test -x "$NDK_STRIP" || NDK_STRIP="$(command -v llvm-strip-18 || command -v strip)"
+          cp "$SO" dist/librust_pty_arm64_bionic.so
+          "$NDK_STRIP" --strip-all dist/librust_pty_arm64_bionic.so || true
+          ( cd dist && sha256sum librust_pty_arm64_bionic.so > SHA256SUMS )
+          ls -la dist/
+          cat dist/SHA256SUMS
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: librust_pty_bionic
+          path: dist/
+          retention-days: 30
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: librust_pty_bionic
+          path: dist/
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PTY_VERSION: ${{ inputs.version || '0.4.8' }}
+          PTY_REPO: ${{ inputs.repo || 'sursaone/bun-pty' }}
+        run: |
+          set -e
+          TAG="bun-pty-v$PTY_VERSION"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $TAG exists — replacing assets"
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+              dist/librust_pty_arm64_bionic.so dist/SHA256SUMS
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "bun-pty $PTY_VERSION (Bionic aarch64)" \
+              --notes "Native PTY library for Bun on Android, rebuilt for Bionic.
+          Source: $PTY_REPO @ v$PTY_VERSION.
+          DT_NEEDED is Bionic-only (libc.so) — loads on Termux where the npm
+          prebuilt fails with: library \"libpthread.so.0\" not found."
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "bun-pty $PTY_VERSION (Bionic aarch64)" \
+              --notes "Native PTY library for Bun on Android, rebuilt for Bionic.
+          Source: $PTY_REPO @ v$PTY_VERSION.
+          DT_NEEDED is Bionic-only (libc.so) — loads on Termux where the npm
+          prebuilt fails with: library \"libpthread.so.0\" not found." \
+              dist/librust_pty_arm64_bionic.so dist/SHA256SUMS
+          fi

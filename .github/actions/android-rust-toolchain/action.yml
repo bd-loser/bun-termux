@@ -1,0 +1,93 @@
+name: 'Android Rust toolchain (Bionic)'
+description: 'Rustup + Android NDK wired for cargo cross-compiles targeting aarch64-linux-android (Bionic). Shared by all native-dependency workflows.'
+inputs:
+  rust-target:
+    description: 'Rust target triple to install'
+    required: false
+    default: 'aarch64-linux-android'
+  api-level:
+    description: 'Android API level for the NDK clang wrapper'
+    required: false
+    default: '24'
+  rust-channel:
+    description: 'rustup channel for the host toolchain'
+    required: false
+    default: 'stable'
+  ndk-version:
+    description: 'NDK version for nttld/setup-ndk'
+    required: false
+    default: 'r27c'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Install base toolchain
+      shell: bash
+      run: |
+        set -e
+        sudo apt-get update -y
+        sudo apt-get install -y clang-18 lld-18 llvm-18 jq
+
+    - name: Install Rust (${{ inputs.rust-channel }})
+      shell: bash
+      run: |
+        set -e
+        if ! command -v rustup >/dev/null 2>&1; then
+          curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain "${{ inputs.rust-channel }}"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+        fi
+        rustup target add "${{ inputs.rust-target }}"
+        rustup show
+        rustup target list --installed
+
+    - name: Install Android NDK
+      uses: nttld/setup-ndk@v1
+      id: ndk
+      with:
+        ndk-version: ${{ inputs.ndk-version }}
+        add-to-path: true
+
+    # Rust's precompiled aarch64-linux-android std expects libclang_rt.builtins
+    # + libunwind inside the *host* clang resource dir (same plumbing Bun's own
+    # Android build needs — see build-from-source.yml).
+    - name: Link NDK compiler-rt into host clang resource dir
+      env:
+        NDK_ROOT: ${{ steps.ndk.outputs.ndk-path }}
+      shell: bash
+      run: |
+        set -e
+        RES="$(clang-18 -print-resource-dir)"
+        NDKLIB="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/lib/clang"
+        NDKVER="$(command ls "$NDKLIB")"
+        SRC="$NDKLIB/$NDKVER/lib/linux"
+        test -f "$SRC/libclang_rt.builtins-aarch64-android.a"
+        test -f "$SRC/aarch64/libunwind.a"
+        sudo mkdir -p "$RES/lib/aarch64-unknown-linux-android28" "$RES/lib/linux/aarch64"
+        sudo ln -sf "$SRC/libclang_rt.builtins-aarch64-android.a" "$RES/lib/aarch64-unknown-linux-android28/libclang_rt.builtins.a"
+        sudo ln -sf "$SRC/aarch64/libunwind.a"                  "$RES/lib/aarch64-unknown-linux-android28/libunwind.a"
+        sudo ln -sf "$SRC/libclang_rt.builtins-aarch64-android.a" "$RES/lib/linux/libclang_rt.builtins-aarch64-android.a"
+        sudo ln -sf "$SRC/aarch64/libunwind.a"                    "$RES/lib/linux/aarch64/libunwind.a"
+        echo "[OK] NDK compiler-rt + libunwind linked into $RES"
+
+    - name: Export cargo Android link environment
+      env:
+        NDK_ROOT: ${{ steps.ndk.outputs.ndk-path }}
+        RUST_TARGET: ${{ inputs.rust-target }}
+        API_LEVEL: ${{ inputs.api-level }}
+      shell: bash
+      run: |
+        set -e
+        BIN="$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin"
+        TARGET_UPPER="$(echo "$RUST_TARGET" | tr 'a-z-' 'A-Z_')"
+        LINKER="$BIN/${RUST_TARGET%%-*}-linux-android${API_LEVEL}-clang"
+        test -x "$LINKER" || { echo "FATAL: linker $LINKER missing"; exit 1; }
+        {
+          echo "ANDROID_NDK_HOME=$NDK_ROOT"
+          echo "CARGO_TARGET_${TARGET_UPPER}_LINKER=$LINKER"
+          echo "CARGO_TARGET_${TARGET_UPPER}_AR=$BIN/llvm-ar"
+          echo "CC_aarch64_linux_android=$LINKER"
+          echo "AR_aarch64_linux_android=$BIN/llvm-ar"
+          echo "RANLIB=$BIN/llvm-ranlib"
+        } >> "$GITHUB_ENV"
+        echo "[OK] cargo env exported (linker: $LINKER)"
