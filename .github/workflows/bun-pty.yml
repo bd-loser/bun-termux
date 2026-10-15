@@ -74,6 +74,9 @@ jobs:
           termios = { git = "https://github.com/bd-loser/termios-rs", tag = "v0.2.3" }
           EOF
           tail -5 Cargo.toml
+          # Cargo.lock pins termios 0.2.2 from crates.io; patches never override
+          # a locked version — re-resolve termios onto the patched source.
+          cargo update -p termios || cargo update
 
       - name: Build librust_pty (${{ env.RUST_TARGET }})
         working-directory: /tmp/bun-pty-src/rust-pty
