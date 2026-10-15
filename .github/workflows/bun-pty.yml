@@ -60,6 +60,21 @@ jobs:
           echo "bun-pty source at $(git rev-parse --short HEAD)"
           test -f rust-pty/Cargo.toml
 
+      - name: Patch termios for Android
+        working-directory: /tmp/bun-pty-src/rust-pty
+        run: |
+          set -e
+          # portable-pty -> serial -> serial-unix -> termios 0.2.2, which predates
+          # Android support (target_os = "android" is unhandled). Upstream added
+          # the Bionic module on master but never released it under 0.2.x; our
+          # fork (bd-loser/termios-rs, v0.2.3) backports it with an unchanged API.
+          cat >> Cargo.toml <<'EOF'
+
+          [patch.crates-io]
+          termios = { git = "https://github.com/bd-loser/termios-rs", tag = "v0.2.3" }
+          EOF
+          tail -5 Cargo.toml
+
       - name: Build librust_pty (${{ env.RUST_TARGET }})
         working-directory: /tmp/bun-pty-src/rust-pty
         run: |
