@@ -85,7 +85,7 @@ jobs:
           cargo build --release --target "$RUST_TARGET"
           SO="target/$RUST_TARGET/release/librust_pty.so"
           test -f "$SO" || { echo "FATAL: $SO not produced"; exit 1; }
-          echo "SO=$SO" >> "$GITHUB_ENV"
+          echo "SO=$(realpath "$SO")" >> "$GITHUB_ENV"
 
       - name: Verify Bionic compatibility
         run: |
