@@ -1,0 +1,175 @@
+name: Build opencode-pty for Android (Bionic)
+
+# Builds the persistent-pty service of upstream OpenCode (anomalyco/opencode-pty)
+# as an Android aarch64 binary. opencode-bionic's patch kit embeds it into the
+# compiled opencode binary so the resident/background terminal feature works on
+# Termux — the official linux-arm64 wheels (gnu/musl) cannot run there: the gnu
+# wheel links glibc, and the musl wheel hardcodes its Unix socket under /tmp,
+# which does not exist on Android's read-only rootfs.
+#
+# Same pattern as bun-pty.yml: reuse ./.github/actions/android-rust-toolchain,
+# apply our patches, verify the ELF, publish a release asset.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'opencode-pty version to build (e.g., 0.2.0)'
+        required: true
+        default: '0.2.0'
+      repo:
+        description: 'Upstream opencode-pty repo'
+        required: false
+        default: 'anomalyco/opencode-pty'
+      ref:
+        description: 'Upstream ref (default: v<version>; must be an exact tag — the patch anchors to it)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+env:
+  RUST_TARGET: aarch64-linux-android
+  ZIG_VERSION: 0.16.0
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout this repo (for the toolchain action + patches)
+        uses: actions/checkout@v4
+
+      - name: Set up Android Rust toolchain
+        uses: ./.github/actions/android-rust-toolchain
+        with:
+          rust-target: ${{ env.RUST_TARGET }}
+
+      - name: Install Zig
+        run: |
+          set -e
+          # Resolve the exact tarball from ziglang's index (file names drift
+          # across releases, hand-written URLs 404).
+          URL=$(curl -fsSL https://ziglang.org/download/index.json | jq -r --arg v "$ZIG_VERSION" '.[$v]["x86_64-linux"].tarball')
+          test -n "$URL" && test "$URL" != "null" || { echo "FATAL: no zig $ZIG_VERSION tarball in index"; exit 1; }
+          mkdir -p /opt/zig
+          curl -fsSL "$URL" | tar xJ -C /opt/zig --strip-components=1
+          export PATH="/opt/zig:$PATH"
+          echo "PATH=$PATH" >> "$GITHUB_ENV"
+          zig version
+          echo "ZIG_EXE=$(command -v zig)" >> "$GITHUB_ENV"
+
+      - name: Clone opencode-pty
+        env:
+          PTY_VERSION: ${{ inputs.version || '0.2.0' }}
+          PTY_REPO: ${{ inputs.repo || 'anomalyco/opencode-pty' }}
+          PTY_REF: ${{ inputs.ref }}
+        run: |
+          set -e
+          REF="${PTY_REF:-v$PTY_VERSION}"
+          # The patch anchors to v$PTY_VERSION's source: no default-branch fallback.
+          git clone --depth 1 --branch "$REF" "https://github.com/$PTY_REPO.git" /tmp/opencode-pty-src
+          cd /tmp/opencode-pty-src
+          echo "opencode-pty source at $(git rev-parse --short HEAD)"
+          test -f build.rs
+          test -f Cargo.toml
+
+      - name: Apply Android/Bionic patches
+        working-directory: /tmp/opencode-pty-src
+        run: |
+          set -e
+          git apply --stat  "$GITHUB_WORKSPACE/patches/opencode-pty/0001-android-aarch64.patch"
+          git apply --check "$GITHUB_WORKSPACE/patches/opencode-pty/0001-android-aarch64.patch"
+          git apply         "$GITHUB_WORKSPACE/patches/opencode-pty/0001-android-aarch64.patch"
+          echo "[OK] patches applied"
+
+      - name: Build opencode-pty (${{ env.RUST_TARGET }})
+        working-directory: /tmp/opencode-pty-src
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
+        run: |
+          set -e
+          # build.rs adds -Dtarget only when HOST != TARGET; HOST is not exported
+          # by cargo on the runner, so the zig cross-compile engages by default.
+          cargo build --release --target "$RUST_TARGET"
+          BIN="target/$RUST_TARGET/release/opencode-pty"
+          test -f "$BIN" || BIN="target/$RUST_TARGET/release/opencode-pty-bin"
+          test -f "$BIN" || { echo "FATAL: opencode-pty binary not produced"; ls -la "target/$RUST_TARGET/release/" | head -20; exit 1; }
+          echo "BIN=$(realpath "$BIN")" >> "$GITHUB_ENV"
+
+      - name: Verify Bionic compatibility
+        run: |
+          set -e
+          test -n "$ANDROID_NDK_HOME" || { echo "FATAL: ANDROID_NDK_HOME not set"; exit 1; }
+          READELF="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
+          echo "=== ELF header ==="
+          "$READELF" -h "$BIN" | grep -E "Class|Machine|Type"
+          echo "=== DT_NEEDED ==="
+          "$READELF" -d "$BIN" | grep NEEDED || echo "(static — no NEEDED)"
+          if ! "$READELF" -h "$BIN" | grep -q "AArch64"; then
+            echo "FATAL: not an AArch64 executable"; exit 1
+          fi
+          NEEDED="$("$READELF" -d "$BIN" | grep -o 'Shared library: \[[^]]*\]' || true)"
+          for bad in libpthread.so.0 libc.so.6 libdl.so.2 libutil.so.1 ld-linux libm.so.6; do
+            if echo "$NEEDED" | grep -q "$bad"; then
+              echo "FATAL: glibc dependency detected ($bad) — would not spawn on Bionic"; exit 1
+            fi
+          done
+          echo "[OK] Bionic-compatible DT_NEEDED"
+
+      - name: Package artifact
+        run: |
+          set -e
+          mkdir -p dist
+          NDK_STRIP="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+          test -x "$NDK_STRIP" || NDK_STRIP="$(command -v llvm-strip-18 || command -v strip)"
+          cp "$BIN" dist/opencode-pty-android-aarch64
+          chmod 0755 dist/opencode-pty-android-aarch64
+          "$NDK_STRIP" --strip-all dist/opencode-pty-android-aarch64 || true
+          ( cd dist && sha256sum opencode-pty-android-aarch64 > SHA256SUMS )
+          ls -la dist/
+          cat dist/SHA256SUMS
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-pty_bionic
+          path: dist/
+          retention-days: 30
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: opencode-pty_bionic
+          path: dist/
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PTY_VERSION: ${{ inputs.version || '0.2.0' }}
+          PTY_REPO: ${{ inputs.repo || 'anomalyco/opencode-pty' }}
+        run: |
+          set -e
+          TAG="opencode-pty-v$PTY_VERSION"
+          NOTES="Persistent PTY service for OpenCode on Android, built for Bionic (aarch64).
+          Source: $PTY_REPO @ v$PTY_VERSION + opencode-bionic patches:
+          - socket dir honors OPENCODE_PTY_SOCKET_DIR / TMPDIR / XDG_RUNTIME_DIR
+            (upstream hardcodes /tmp, which is read-only on Android)
+          - zig cross-compile target mapping for aarch64-linux-android
+          Run \`opencode-pty --version\` to verify (expect 0.2.0 protocol 7)."
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "release $TAG exists — replacing assets"
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+              dist/opencode-pty-android-aarch64 dist/SHA256SUMS
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "opencode-pty $PTY_VERSION (Bionic aarch64)" --notes "$NOTES"
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "opencode-pty $PTY_VERSION (Bionic aarch64)" --notes "$NOTES" \
+              dist/opencode-pty-android-aarch64 dist/SHA256SUMS
+          fi

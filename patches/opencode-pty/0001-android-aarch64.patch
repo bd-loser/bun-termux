@@ -1,0 +1,42 @@
+diff --git a/build.rs b/build.rs
+index 27dfb57..a145664 100644
+--- a/build.rs
++++ b/build.rs
+@@ -104,6 +104,10 @@ fn main() {
+             "aarch64-unknown-linux-gnu" => "aarch64-linux-gnu",
+             "x86_64-unknown-linux-musl" => "x86_64-linux-musl",
+             "aarch64-unknown-linux-musl" => "aarch64-linux-musl",
++            // Android is not an upstream publish target, but the service
++            // cross-compiles for it the same way; zig's android libc handles
++            // the API level via the triple's default.
++            "aarch64-linux-android" => "aarch64-linux-android",
+             "x86_64-apple-darwin" => "x86_64-macos",
+             "aarch64-apple-darwin" => "aarch64-macos",
+             "x86_64-pc-windows-msvc" => "x86_64-windows-msvc",
+diff --git a/src/daemon.rs b/src/daemon.rs
+index 4062ed2..0242517 100644
+--- a/src/daemon.rs
++++ b/src/daemon.rs
+@@ -349,11 +349,18 @@ mod unix {
+     }
+ 
+     // Sockets stay in /tmp so their paths fit sun_path; temp cleaners skip sockets.
++    // On Android the rootfs is read-only and /tmp does not exist, so allow the
++    // launcher to point the socket directory at a writable location first.
+     fn socket_root() -> PathBuf {
+-        PathBuf::from("/tmp").join(format!(
+-            "opencode-pty-{}",
+-            nix::unistd::Uid::effective().as_raw()
+-        ))
++        let uid = nix::unistd::Uid::effective().as_raw();
++        for key in ["OPENCODE_PTY_SOCKET_DIR", "TMPDIR", "XDG_RUNTIME_DIR"] {
++            if let Some(dir) = std::env::var_os(key) {
++                if !dir.is_empty() {
++                    return PathBuf::from(dir).join(format!("opencode-pty-{uid}"));
++                }
++            }
++        }
++        PathBuf::from("/tmp").join(format!("opencode-pty-{uid}"))
+     }
+ 
+     fn socket_file(root: &Path, canonical_directory: &Path) -> PathBuf {
