@@ -50,6 +50,7 @@ jobs:
           mkdir -p /opt/zig
           curl -fsSL "$URL" | tar xJ -C /opt/zig --strip-components=1
           export PATH="/opt/zig:$PATH"
+          echo "PATH=$PATH" >> "$GITHUB_ENV"
           zig version
 
       - name: Clone opencode-pty
