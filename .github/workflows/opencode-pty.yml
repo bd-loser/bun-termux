@@ -88,6 +88,21 @@ jobs:
           git apply         "$GITHUB_WORKSPACE/patches/opencode-pty/0001-android-aarch64.patch"
           echo "[OK] patches applied"
 
+      - name: Configure musl linker (rust-lld)
+        working-directory: /tmp/opencode-pty-src
+        run: |
+          set -e
+          # Without a linker override rustc shells out to `cc`, which chokes on
+          # the self-contained musl CRT objects ("file in wrong format"). The
+          # toolchain ships rust-lld for the host; point the musl target at it.
+          mkdir -p .cargo
+          RUST_LLD=$(find ~/.rustup/toolchains -path "*bin/rust-lld" | head -1)
+          test -x "$RUST_LLD" || { echo "FATAL: rust-lld not found"; exit 1; }
+          cat > .cargo/config.toml <<TOML
+          [target.aarch64-unknown-linux-musl]
+          linker = "$RUST_LLD"
+          TOML
+
       - name: Build opencode-pty (static musl)
         working-directory: /tmp/opencode-pty-src
         run: |
