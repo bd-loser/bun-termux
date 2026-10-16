@@ -109,6 +109,38 @@ jobs:
           test -f "$BIN" || { echo "FATAL: opencode-pty binary not produced"; ls -la "target/$RUST_TARGET/release/" | head -20; exit 1; }
           echo "BIN=$(realpath "$BIN")" >> "$GITHUB_ENV"
 
+      - name: Fix Bionic TLS alignment
+        run: |
+          set -e
+          # Bionic's aarch64 loader rejects any executable whose PT_TLS
+          # alignment is < 64 ("TLS segment is underaligned"). The merged TLS
+          # template lands at offset/vaddr 0x40 — already 64-byte aligned
+          # physically — so raising the header's p_align to 64 is exactly the
+          # fix the loader wants, with no layout change.
+          python3 - "$BIN" <<'PYTLS'
+          import struct, sys
+          path = sys.argv[1]
+          data = bytearray(open(path, "rb").read())
+          e_phoff = struct.unpack_from("<Q", data, 0x20)[0]
+          e_phentsize, e_phnum = struct.unpack_from("<HH", data, 0x36)
+          fixed = False
+          for i in range(e_phnum):
+              off = e_phoff + i * e_phentsize
+              p_type = struct.unpack_from("<I", data, off)[0]
+              if p_type == 6:  # PT_TLS
+                  align = struct.unpack_from("<Q", data, off + 0x30)[0]
+                  offset = struct.unpack_from("<Q", data, off + 0x08)[0]
+                  vaddr = struct.unpack_from("<Q", data, off + 0x10)[0]
+                  assert offset % 64 == 0 and vaddr % 64 == 0, "TLS template not 64-aligned; header bump unsafe"
+                  if align < 64:
+                      struct.pack_into("<Q", data, off + 0x30, 64)
+                      fixed = True
+                      print("PT_TLS align %d -> 64" % align)
+          if not fixed:
+              print("PT_TLS already 64-aligned; nothing to do")
+          open(path, "wb").write(bytes(data))
+          PYTLS
+
       - name: Verify Bionic compatibility
         run: |
           set -e
