@@ -75,6 +75,17 @@ jobs:
           test -f build.rs
           test -f Cargo.toml
 
+      - name: Install pinned toolchain target
+        working-directory: /tmp/opencode-pty-src
+        run: |
+          set -e
+          # rust-toolchain.toml pins its own channel; targets are per-toolchain,
+          # so the android target must be added to THAT channel explicitly.
+          RVER=$(awk -F'"' '/^channel/{print $2}' rust-toolchain.toml)
+          test -n "$RVER" || { echo "FATAL: no pinned channel found"; exit 1; }
+          rustup toolchain install "$RVER" --profile minimal --target "$RUST_TARGET"
+          rustup target list --toolchain "$RVER" | grep -F "$RUST_TARGET"
+
       - name: Apply Android/Bionic patches
         working-directory: /tmp/opencode-pty-src
         run: |
