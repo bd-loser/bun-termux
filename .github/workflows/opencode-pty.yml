@@ -1,14 +1,13 @@
-name: Build opencode-pty for Android (Bionic)
+name: Build opencode-pty for Android (static musl)
 
 # Builds the persistent-pty service of upstream OpenCode (anomalyco/opencode-pty)
-# as an Android aarch64 binary. opencode-bionic's patch kit embeds it into the
-# compiled opencode binary so the resident/background terminal feature works on
-# Termux — the official linux-arm64 wheels (gnu/musl) cannot run there: the gnu
-# wheel links glibc, and the musl wheel hardcodes its Unix socket under /tmp,
-# which does not exist on Android's read-only rootfs.
+# as a STATIC aarch64 musl binary. The kernel execs it directly — no Bionic
+# loader involved, so no glibc/musl/TLS constraints (the official gnu wheel
+# links glibc, the official musl wheel hardcodes its Unix socket under /tmp,
+# which is read-only on Android; our patch routes the socket through
+# OPENCODE_PTY_SOCKET_DIR / TMPDIR instead).
 #
-# Same pattern as bun-pty.yml: reuse ./.github/actions/android-rust-toolchain,
-# apply our patches, verify the ELF, publish a release asset.
+# Same pattern as bun-pty.yml: apply our patches, verify the ELF, publish.
 
 on:
   workflow_dispatch:
@@ -30,7 +29,7 @@ permissions:
   contents: write
 
 env:
-  RUST_TARGET: aarch64-linux-android
+  RUST_TARGET: aarch64-unknown-linux-musl
   ZIG_VERSION: 0.16.0
 
 jobs:
@@ -38,13 +37,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - name: Checkout this repo (for the toolchain action + patches)
+      - name: Checkout this repo (for patches)
         uses: actions/checkout@v4
-
-      - name: Set up Android Rust toolchain
-        uses: ./.github/actions/android-rust-toolchain
-        with:
-          rust-target: ${{ env.RUST_TARGET }}
 
       - name: Install Zig
         run: |
@@ -56,9 +50,7 @@ jobs:
           mkdir -p /opt/zig
           curl -fsSL "$URL" | tar xJ -C /opt/zig --strip-components=1
           export PATH="/opt/zig:$PATH"
-          echo "PATH=$PATH" >> "$GITHUB_ENV"
           zig version
-          echo "ZIG_EXE=$(command -v zig)" >> "$GITHUB_ENV"
 
       - name: Clone opencode-pty
         env:
@@ -80,13 +72,13 @@ jobs:
         run: |
           set -e
           # rust-toolchain.toml pins its own channel; targets are per-toolchain,
-          # so the android target must be added to THAT channel explicitly.
+          # so the musl target must be added to THAT channel explicitly.
           RVER=$(awk -F'"' '/^channel/{print $2}' rust-toolchain.toml)
           test -n "$RVER" || { echo "FATAL: no pinned channel found"; exit 1; }
           rustup toolchain install "$RVER" --profile minimal --target "$RUST_TARGET"
           rustup target list --toolchain "$RVER" | grep -F "$RUST_TARGET"
 
-      - name: Apply Android/Bionic patches
+      - name: Apply Android patches
         working-directory: /tmp/opencode-pty-src
         run: |
           set -e
@@ -95,81 +87,49 @@ jobs:
           git apply         "$GITHUB_WORKSPACE/patches/opencode-pty/0001-android-aarch64.patch"
           echo "[OK] patches applied"
 
-      - name: Build opencode-pty (${{ env.RUST_TARGET }})
+      - name: Build opencode-pty (static musl)
         working-directory: /tmp/opencode-pty-src
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_HOME }}
         run: |
           set -e
-          # build.rs adds -Dtarget only when HOST != TARGET; HOST is not exported
-          # by cargo on the runner, so the zig cross-compile engages by default.
+          # HOST env is not exported on runners, so build.rs always engages the
+          # zig cross-compile; the ghostty target for musl is already mapped.
           cargo build --release --target "$RUST_TARGET"
           BIN="target/$RUST_TARGET/release/opencode-pty"
-          test -f "$BIN" || BIN="target/$RUST_TARGET/release/opencode-pty-bin"
           test -f "$BIN" || { echo "FATAL: opencode-pty binary not produced"; ls -la "target/$RUST_TARGET/release/" | head -20; exit 1; }
           echo "BIN=$(realpath "$BIN")" >> "$GITHUB_ENV"
 
-      - name: Fix Bionic TLS alignment
+      - name: Verify static aarch64
         run: |
           set -e
-          # Bionic's aarch64 loader rejects any executable whose PT_TLS
-          # alignment is < 64 ("TLS segment is underaligned"). The merged TLS
-          # template lands at offset/vaddr 0x40 — already 64-byte aligned
-          # physically — so raising the header's p_align to 64 is exactly the
-          # fix the loader wants, with no layout change.
-          python3 - "$BIN" <<'PYTLS'
+          python3 - "$BIN" <<'PY'
           import struct, sys
-          path = sys.argv[1]
-          data = bytearray(open(path, "rb").read())
+          data = open(sys.argv[1], "rb").read()
+          assert data[:4] == b"\x7fELF", "not an ELF"
+          assert data[4] == 2 and data[5] == 1, "not 64-bit little-endian"
+          machine = struct.unpack_from("<H", data, 0x12)[0]
+          assert machine == 183, "not AArch64"
+          interp = None
           e_phoff = struct.unpack_from("<Q", data, 0x20)[0]
-          e_phentsize, e_phnum = struct.unpack_from("<HH", data, 0x36)
-          fixed = False
-          for i in range(e_phnum):
-              off = e_phoff + i * e_phentsize
+          phentsize, phnum = struct.unpack_from("<HH", data, 0x36)
+          for i in range(phnum):
+              off = e_phoff + i * phentsize
               p_type = struct.unpack_from("<I", data, off)[0]
-              if p_type == 6:  # PT_TLS
-                  align = struct.unpack_from("<Q", data, off + 0x30)[0]
-                  offset = struct.unpack_from("<Q", data, off + 0x08)[0]
-                  vaddr = struct.unpack_from("<Q", data, off + 0x10)[0]
-                  assert offset % 64 == 0 and vaddr % 64 == 0, "TLS template not 64-aligned; header bump unsafe"
-                  if align < 64:
-                      struct.pack_into("<Q", data, off + 0x30, 64)
-                      fixed = True
-                      print("PT_TLS align %d -> 64" % align)
-          if not fixed:
-              print("PT_TLS already 64-aligned; nothing to do")
-          open(path, "wb").write(bytes(data))
-          PYTLS
-
-      - name: Verify Bionic compatibility
-        run: |
-          set -e
-          test -n "$ANDROID_NDK_HOME" || { echo "FATAL: ANDROID_NDK_HOME not set"; exit 1; }
-          READELF="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-readelf"
-          echo "=== ELF header ==="
-          "$READELF" -h "$BIN" | grep -E "Class|Machine|Type"
-          echo "=== DT_NEEDED ==="
-          "$READELF" -d "$BIN" | grep NEEDED || echo "(static — no NEEDED)"
-          if ! "$READELF" -h "$BIN" | grep -q "AArch64"; then
-            echo "FATAL: not an AArch64 executable"; exit 1
-          fi
-          NEEDED="$("$READELF" -d "$BIN" | grep -o 'Shared library: \[[^]]*\]' || true)"
-          for bad in libpthread.so.0 libc.so.6 libdl.so.2 libutil.so.1 ld-linux libm.so.6; do
-            if echo "$NEEDED" | grep -q "$bad"; then
-              echo "FATAL: glibc dependency detected ($bad) — would not spawn on Bionic"; exit 1
-            fi
-          done
-          echo "[OK] Bionic-compatible DT_NEEDED"
+              if p_type == 3:  # PT_INTERP
+                  po = struct.unpack_from("<Q", data, off + 8)[0]
+                  interp = data[po:data.index(b"\x00", po)].decode()
+          assert interp is None, f"unexpected interpreter: {interp} (want fully static)"
+          print("[OK] static aarch64 ELF, no interpreter — kernel-loadable on Android")
+          PY
 
       - name: Package artifact
         run: |
           set -e
           mkdir -p dist
-          NDK_STRIP="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
-          test -x "$NDK_STRIP" || NDK_STRIP="$(command -v llvm-strip-18 || command -v strip)"
+          NDK_STRIP="
+          $(command -v llvm-strip-18 || command -v llvm-strip || command -v strip)"
           cp "$BIN" dist/opencode-pty-android-aarch64
           chmod 0755 dist/opencode-pty-android-aarch64
-          "$NDK_STRIP" --strip-all dist/opencode-pty-android-aarch64 || true
+          "$NDK_STRIP" --strip-all dist/opencode-pty-android-aarch64 2>/dev/null || "$NDK_STRIP" dist/opencode-pty-android-aarch64 || true
           ( cd dist && sha256sum opencode-pty-android-aarch64 > SHA256SUMS )
           ls -la dist/
           cat dist/SHA256SUMS
@@ -177,7 +137,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: opencode-pty_bionic
+          name: opencode-pty_static_musl
           path: dist/
           retention-days: 30
 
@@ -188,7 +148,7 @@ jobs:
       - name: Download artifact
         uses: actions/download-artifact@v4
         with:
-          name: opencode-pty_bionic
+          name: opencode-pty_static_musl
           path: dist/
 
       - name: Publish release
@@ -199,20 +159,21 @@ jobs:
         run: |
           set -e
           TAG="opencode-pty-v$PTY_VERSION"
-          NOTES="Persistent PTY service for OpenCode on Android, built for Bionic (aarch64).
+          NOTES="Persistent PTY service for OpenCode on Android (static musl, aarch64).
           Source: $PTY_REPO @ v$PTY_VERSION + opencode-bionic patches:
           - socket dir honors OPENCODE_PTY_SOCKET_DIR / TMPDIR / XDG_RUNTIME_DIR
             (upstream hardcodes /tmp, which is read-only on Android)
-          - zig cross-compile target mapping for aarch64-linux-android
+          - built fully static: the kernel execs it directly on Android, no
+            glibc and no Bionic loader constraints.
           Run \`opencode-pty --version\` to verify (expect 0.2.0 protocol 7)."
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             echo "release $TAG exists — replacing assets"
             gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
               dist/opencode-pty-android-aarch64 dist/SHA256SUMS
             gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --title "opencode-pty $PTY_VERSION (Bionic aarch64)" --notes "$NOTES"
+              --title "opencode-pty $PTY_VERSION (static musl aarch64)" --notes "$NOTES"
           else
             gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --title "opencode-pty $PTY_VERSION (Bionic aarch64)" --notes "$NOTES" \
+              --title "opencode-pty $PTY_VERSION (static musl aarch64)" --notes "$NOTES" \
               dist/opencode-pty-android-aarch64 dist/SHA256SUMS
           fi
