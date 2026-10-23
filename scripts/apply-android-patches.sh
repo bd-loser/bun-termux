@@ -254,10 +254,12 @@ for old, new in subs:
     c = c.replace(old, new, 1)
 
 # 1.4.3+ reads the version from a central pin instead of hardcoding it.
+# 1.4.3: single-line `llvm: { version: "23.1.1" }`; 1.4.4+: multi-line with sha256.
 spec = pathlib.Path("scripts/build/ci-images/spec.ts")
 if 'pins.llvm.version' in c and spec.exists():
     s = spec.read_text()
     old_pin = 'llvm: { version: "23.1.1" }'
+    old_pin_ml = 'llvm: {\n    version: "23.1.1",'
     if old_pin in s:
         assert s.count(old_pin) == 1, "spec.ts llvm pin ambiguous"
         spec.write_text(
@@ -268,6 +270,15 @@ if 'pins.llvm.version' in c and spec.exists():
             )
         )
         print("  retargeted central llvm pin to 18.1.3")
+    elif old_pin_ml in s:
+        s = s.replace(
+            old_pin_ml,
+            'llvm: {\n    // ANDROID_TERMUX_FIX: host clang\n    version: "18.1.3",',
+            1,
+        )
+        assert 'version: "18.1.3"' in s, "spec.ts llvm pin rewrite failed"
+        spec.write_text(s)
+        print("  retargeted central llvm pin to 18.1.3 (multi-line form)")
     else:
         raise SystemExit("spec.ts llvm pin not found — upstream moved it again?")
 
@@ -424,7 +435,8 @@ old = """        #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
             }
         }"""
 
-new = """        #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
+if old in c:
+    new = """        #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
         {
             // ANDROID_TERMUX_FIX_LCHMOD: Android's zygote seccomp profile
             // returns SECCOMP_RET_TRAP for fchmodat2, raising SIGSYS instead
@@ -463,13 +475,23 @@ new = """        #[cfg(not(any(target_os = "macos", target_os = "freebsd")))]
                 }
             }
         }"""
-
-assert c.count(old) == 1, "sys/lib.rs anchor not found (or ambiguous): lchmod block"
-c = c.replace(old, new, 1)
-p.write_text(c)
-print("  split lchmod into android (fchmodat) / other (fchmodat2)")
+    assert c.count(old) == 1, "sys/lib.rs anchor not found (or ambiguous): lchmod block"
+    c = c.replace(old, new, 1)
+    p.write_text(c)
+    print("  split lchmod into android (fchmodat) / other (fchmodat2)")
+elif "lchmod_no_fchmodat2" in c or "is_android_kernel" in c:
+    print("  upstream now avoids fchmodat2 on Android kernels — nothing to do")
+else:
+    raise SystemExit("sys/lib.rs lchmod anchor gone and no upstream fallback found")
 PYEOF
-    verify_patch "$SYS_LIB_RS"
+    if grep -q "ANDROID_TERMUX_FIX_LCHMOD" "$SYS_LIB_RS" 2>/dev/null; then
+        verify_patch "$SYS_LIB_RS"
+    elif grep -q "lchmod_no_fchmodat2" "$SYS_LIB_RS" 2>/dev/null; then
+        echo "  [OK]   $SYS_LIB_RS (upstream android fallback)"
+    else
+        echo "  [FAIL] $SYS_LIB_RS — no marker and no upstream fallback"
+        TOTAL_FAIL=$((TOTAL_FAIL + 1))
+    fi
 elif [ -f "$SYS_LIB_RS" ]; then
     echo "[SKIP 4] $SYS_LIB_RS already patched"
 fi
@@ -551,15 +573,29 @@ inroot_new = """    retry(|| {
     })
     .map(own_fd)"""
 
-assert c.count(beneath_old) == 1, "linux_syscall.rs anchor not found: openat2_beneath"
-c = c.replace(beneath_old, beneath_new, 1)
-assert c.count(inroot_old) == 1, "linux_syscall.rs anchor not found: openat2_in_root"
-c = c.replace(inroot_old, inroot_new, 1)
+if "is_android_kernel" in c:
+    # Upstream's runtime guard + the SIGSYS->ENOSYS handler supersede the
+    # compile-time split; keep the tree closer to upstream when it handles it.
+    print("  upstream now guards openat2 on Android kernels — nothing to do")
+elif beneath_old in c and inroot_old in c:
+    assert c.count(beneath_old) == 1, "linux_syscall.rs anchor not found: openat2_beneath"
+    c = c.replace(beneath_old, beneath_new, 1)
+    assert c.count(inroot_old) == 1, "linux_syscall.rs anchor not found: openat2_in_root"
+    c = c.replace(inroot_old, inroot_new, 1)
 
-p.write_text(c)
-print("  patched openat2_beneath + openat2_in_root")
+    p.write_text(c)
+    print("  patched openat2_beneath + openat2_in_root")
+else:
+    raise SystemExit("linux_syscall.rs anchors gone and no upstream fallback found")
 PYEOF
-    verify_patch "$LSC_RS"
+    if grep -q "ANDROID_TERMUX_FIX_OPENAT2" "$LSC_RS" 2>/dev/null; then
+        verify_patch "$LSC_RS"
+    elif grep -q "is_android_kernel" "$LSC_RS" 2>/dev/null; then
+        echo "  [OK]   $LSC_RS (upstream android guard)"
+    else
+        echo "  [FAIL] $LSC_RS — no marker and no upstream guard"
+        TOTAL_FAIL=$((TOTAL_FAIL + 1))
+    fi
 elif [ -f "$LSC_RS" ]; then
     echo "[SKIP 5] $LSC_RS already patched"
 fi
@@ -906,23 +942,28 @@ echo "=========================================="
 echo "PATCH VERIFICATION SUMMARY"
 echo "=========================================="
 FAIL=0
-for f in \
-    scripts/build/config.ts \
-    scripts/build/buildOptionsRs.ts \
-    scripts/build/deps/tinycc.ts \
-    scripts/build/tools.ts \
-    scripts/build/flags.ts \
-    scripts/build/fetch-cli.ts \
-    scripts/build/ci-images/spec.ts \
-    src/sys/lib.rs \
-    src/sys/linux_syscall.rs \
-    src/spawn_sys/posix_spawn.rs \
-    src/runtime/ffi/ffi_body.rs \
-    src/jsc/bindings/c-bindings.cpp; do
+for spec in \
+    "scripts/build/config.ts::::" \
+    "scripts/build/buildOptionsRs.ts::::" \
+    "scripts/build/deps/tinycc.ts::::" \
+    "scripts/build/tools.ts::::" \
+    "scripts/build/flags.ts::::" \
+    "scripts/build/fetch-cli.ts::::" \
+    "scripts/build/ci-images/spec.ts::::" \
+    "src/sys/lib.rs::lchmod_no_fchmodat2::" \
+    "src/sys/linux_syscall.rs::is_android_kernel::" \
+    "src/spawn_sys/posix_spawn.rs::::" \
+    "src/runtime/ffi/ffi_body.rs::::" \
+    "src/jsc/bindings/c-bindings.cpp::is_android_kernel::"; do
+    f="${spec%%::*}"
+    rest="${spec#*::}"
+    alt1="${rest%%::*}"
     if [ -f "$f" ]; then
         COUNT=$(grep -c "$PATCH_MARKER" "$f" 2>/dev/null || true)
         if [ "${COUNT:-0}" -gt 0 ]; then
             echo "  [OK]   $f ($COUNT markers)"
+        elif [ -n "$alt1" ] && grep -q "$alt1" "$f" 2>/dev/null; then
+            echo "  [OK]   $f (upstream android fix)"
         else
             echo "  [FAIL] $f — NO MARKERS FOUND"
             FAIL=$((FAIL + 1))
